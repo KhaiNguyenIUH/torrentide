@@ -1992,7 +1992,15 @@ pub async fn fetch_metadata(
 ) -> Result<Vec<u8>> {
     let node = DhtNode::new(None).await?;
     node.bootstrap(routers).await;
+    fetch_metadata_with_node(&node, infohash, timeout).await
+}
 
+/// Like [`fetch_metadata`] on an already running, bootstrapped node.
+pub async fn fetch_metadata_with_node(
+    node: &DhtNode,
+    infohash: InfoHash,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     let mut peers = node.get_peers(infohash).await?;
     peers.sort_unstable();
     peers.dedup();

@@ -61,6 +61,8 @@ pub struct TorrentSummary {
     /// Peers with at least one piece of the torrent.
     pub seeders_known: u32,
     pub leecher_known: u32,
+    /// Cumulative bytes uploaded for this torrent, including earlier runs.
+    pub uploaded: u64,
     /// Per-file progress, in torrent file order. Empty for magnet links until
     /// metadata arrives.
     pub files: Vec<FileSummary>,
@@ -85,6 +87,7 @@ impl Default for TorrentSummary {
             trackers: vec![],
             seeders_known: 0,
             leecher_known: 0,
+            uploaded: 0,
             files: vec![],
         }
     }
@@ -171,6 +174,8 @@ pub enum Command {
     /// Shut the engine down gracefully; `Engine::run` returns `Ok` with the
     /// torrent marked [`DownloadState::Stopped`].
     Stop,
+    /// Change the connection cap while running.
+    SetMaxPeers(usize),
 }
 
 /// Stable identifier of a torrent within a session: its infohash in hex.

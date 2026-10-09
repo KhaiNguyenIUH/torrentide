@@ -21,11 +21,28 @@ use torrust::state::{Level, UiState};
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run the multi-torrent session (the default when no subcommand is given)
+    Session {
+        /// Print a summary line every few seconds instead of starting the TUI
+        #[arg(long)]
+        no_tui: bool,
+    },
+
+    /// Hand a .torrent or magnet link to the running session, or queue it
+    Add {
+        /// Path to a .torrent file, or a magnet: URI
+        source: String,
+
+        /// Directory to save into (default: the session's download directory)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
     /// Download a torrent to a directory
     Download {
         /// Path to a .torrent file, or a magnet: URI
@@ -101,13 +118,28 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Command::Session { no_tui: false });
     let uses_tui = matches!(
-        cli.command,
-        Command::Download { no_tui: false, .. } | Command::Import { no_tui: false, start: true, .. }
+        command,
+        Command::Session { no_tui: false }
+            | Command::Download { no_tui: false, .. }
+            | Command::Import { no_tui: false, start: true, .. }
     );
     init_tracing(uses_tui);
 
-    match cli.command {
+    match command {
+        Command::Session { no_tui } => {
+            let settings = torrust::store::Store::open().load_settings();
+            torrust::session::Session::run(settings, !no_tui).await
+        }
+        Command::Add { source, output } => {
+            use torrust::ipc::Delivery;
+            match torrust::ipc::send_add(&source, output.as_deref()).await? {
+                Delivery::Delivered => println!("added to running session"),
+                Delivery::Queued => println!("queued; it will start next time torrust runs"),
+            }
+            Ok(())
+        }
         Command::Download {
             source,
             output,

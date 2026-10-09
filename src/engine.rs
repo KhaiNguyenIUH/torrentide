@@ -17,7 +17,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tokio::sync::{mpsc, RwLock};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot, RwLock};
+
+use crate::dht::DhtNode;
+use crate::peer::wire::Handshake;
+use crate::ratelimit::Limits;
 
 use crate::metainfo::{Magnet, Metainfo, SocketAddrLite};
 use crate::peer::connection::{FromPeer, BLOCK_SIZE};
@@ -46,10 +51,61 @@ const DHT_LOOKUP_INTERVAL: Duration = Duration::from_secs(60);
 /// to 16 KiB in memory, so this bounds our worst-case buffering.
 const MAX_IN_FLIGHT: usize = 200;
 
+/// How often a session engine re-runs tit-for-tat choking.
+const RECHOKE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Knobs a session sets per torrent. The default is the single-torrent CLI
+/// behaviour: finish and return, own listener, own DHT node, auto-unchoke.
+pub struct EngineOptions {
+    /// Keep uploading after the download completes instead of returning.
+    pub seed_after_complete: bool,
+    /// Stop seeding once uploaded / size reaches this; 0 means never.
+    pub ratio_target: f64,
+    /// Bytes uploaded in earlier runs, so the ratio survives restarts.
+    pub uploaded_so_far: u64,
+    pub limits: Limits,
+    pub max_peers: usize,
+    pub auto_unchoke: bool,
+    pub dht: Option<Arc<DhtNode>>,
+    /// False keeps this torrent off the DHT entirely.
+    pub dht_enabled: bool,
+    /// Peers the session listener already handshook for this torrent. When
+    /// set the engine does not bind a listener of its own.
+    pub inbound: Option<mpsc::UnboundedReceiver<(TcpStream, Handshake)>>,
+    /// Port announced to trackers, the DHT and peers.
+    pub port: u16,
+    /// File selection to restore; ignored if its length does not match.
+    pub wanted_files: Option<Vec<bool>>,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        EngineOptions {
+            seed_after_complete: false,
+            ratio_target: 0.0,
+            uploaded_so_far: 0,
+            limits: Limits::default(),
+            max_peers: crate::peer::pool::MAX_PEERS,
+            auto_unchoke: true,
+            dht: None,
+            dht_enabled: true,
+            inbound: None,
+            port: LOCAL_PORT,
+            wanted_files: None,
+        }
+    }
+}
+
+/// Whether cumulative uploads have reached the ratio target.
+pub fn ratio_reached(uploaded: u64, total_length: u64, target: f64) -> bool {
+    target > 0.0 && total_length > 0 && uploaded as f64 / total_length as f64 >= target
+}
+
 pub struct Engine {
     pub meta: Arc<Metainfo>,
     pub state: Arc<RwLock<UiState>>,
     commands: mpsc::UnboundedReceiver<Command>,
+    opts: EngineOptions,
 }
 
 impl Engine {
@@ -64,10 +120,20 @@ impl Engine {
         state: Arc<RwLock<UiState>>,
         commands: mpsc::UnboundedReceiver<Command>,
     ) -> Self {
+        Self::with_options(meta, state, commands, EngineOptions::default())
+    }
+
+    pub fn with_options(
+        meta: Arc<Metainfo>,
+        state: Arc<RwLock<UiState>>,
+        commands: mpsc::UnboundedReceiver<Command>,
+        opts: EngineOptions,
+    ) -> Self {
         Engine {
             meta,
             state,
             commands,
+            opts,
         }
     }
 
@@ -78,6 +144,12 @@ impl Engine {
                 .context("preparing download directory")?,
         );
         let mut scheduler = Scheduler::new(&self.meta);
+        let port = self.opts.port;
+        let mut inbound = self.opts.inbound.take();
+        let mut wanted = match self.opts.wanted_files.take() {
+            Some(w) if w.len() == self.meta.files.iter().count() && w.iter().any(|x| *x) => w,
+            _ => vec![true; self.meta.files.iter().count()],
+        };
 
         self.log(Level::Info, format!("preparing {}", download_dir.display()))
             .await;
@@ -94,6 +166,10 @@ impl Engine {
         )
         .await;
 
+        if wanted.iter().any(|w| !*w) {
+            scheduler.set_excluded(&crate::scheduler::excluded_pieces(&self.meta, &wanted));
+        }
+
         let summary = TorrentSummary {
             name: self.meta.name.clone(),
             infohash: self.meta.infohash.to_hex(),
@@ -106,11 +182,8 @@ impl Engine {
             state: DownloadState::Downloading,
             download_dir: download_dir.display().to_string(),
             trackers: self.meta.announce_list.clone(),
-            files: file_summaries(
-                &self.meta,
-                &scheduler,
-                &vec![true; self.meta.files.iter().count()],
-            ),
+            uploaded: self.opts.uploaded_so_far,
+            files: file_summaries(&self.meta, &scheduler, &wanted),
             ..Default::default()
         };
         self.state.write().await.torrent = Some(summary);
@@ -135,14 +208,14 @@ impl Engine {
         let mut pool = PeerPool::new(
             Arc::clone(&self.meta),
             seeder,
-            LOCAL_PORT,
+            port,
             peer_tx,
-            crate::ratelimit::Limits::default(),
-            crate::peer::pool::MAX_PEERS,
-            true,
+            self.opts.limits.clone(),
+            self.opts.max_peers,
+            self.opts.auto_unchoke,
         );
 
-        if can_seed {
+        if can_seed && inbound.is_none() {
             let (listen_tx, mut listen_rx) =
                 mpsc::unbounded_channel::<(SocketAddr, FromPeer)>();
             tokio::spawn(async move {
@@ -156,7 +229,7 @@ impl Engine {
             match crate::peer::pool::listen(
                 Arc::clone(&self.meta),
                 pool.seeder().cloned(),
-                LOCAL_PORT,
+                port,
                 listen_tx,
             )
             .await
@@ -185,10 +258,10 @@ impl Engine {
         let mut announce_in_flight = false;
 
         // BEP 27: private torrents must never touch the DHT.
-        let (dht_tx, mut dht_rx) = if self.meta.private {
+        let (dht_tx, mut dht_rx) = if self.meta.private || !self.opts.dht_enabled {
             (None, None)
         } else {
-            let (tx, rx) = spawn_dht_lookups(self.meta.infohash);
+            let (tx, rx) = spawn_dht_lookups(self.meta.infohash, self.opts.dht.clone(), port);
             (Some(tx), Some(rx))
         };
         let mut dht_in_flight = false;
@@ -212,7 +285,9 @@ impl Engine {
         // file starts wanted and the user can skip any subset (but not all —
         // toggling the last wanted file off is refused).
         let mut paused = false;
-        let mut wanted = vec![true; self.meta.files.iter().count()];
+        let mut seeding = false;
+        let mut last_rechoke = Instant::now();
+        let uploaded_so_far = self.opts.uploaded_so_far;
 
         let mut ticker = tokio::time::interval(Duration::from_millis(50));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -225,6 +300,15 @@ impl Engine {
                 Some((addr, ev)) = peer_rx.recv() => {
                     handle_peer_event(&mut scheduler, &storage, &self.meta, &ev);
                     pool.on_event(addr, ev).await;
+                }
+
+                Some((stream, hs)) = async {
+                    match inbound.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    pool.adopt_inbound(stream, hs).await;
                 }
 
                 Some((peers, errors)) = announce_rx.recv() => {
@@ -281,14 +365,18 @@ impl Engine {
                                 }
                             }
                             Command::Stop => {
+                                let total = uploaded_so_far + pool.total_uploaded().await;
                                 if let Some(t) = &mut self.state.write().await.torrent {
                                     t.state = DownloadState::Stopped;
                                     t.download_rate = 0.0;
                                     t.upload_rate = 0.0;
+                                    t.uploaded = total;
                                 }
+                                pool.disconnect_all().await;
                                 self.log(Level::Info, "stopped").await;
                                 return Ok(());
                             }
+                            Command::SetMaxPeers(n) => pool.set_max_peers(n),
                             Command::ToggleFile(i) => {
                                 apply_file_toggle(
                                     &self.meta,
@@ -305,7 +393,7 @@ impl Engine {
                     // ---- periodically refill the request pipeline ----
                     // A pause stops new requests. Blocks already on the wire
                     // still land and verify, so resuming never loses data.
-                    if !paused && last_fill.elapsed() >= PIPELINE_INTERVAL {
+                    if !paused && !seeding && last_fill.elapsed() >= PIPELINE_INTERVAL {
                         last_fill = Instant::now();
                         let mut rarity: HashMap<u32, u32> = HashMap::new();
                         for p in 0..self.meta.piece_count() as u32 {
@@ -338,7 +426,7 @@ impl Engine {
                             let res = tracker::announce_all(
                                 &meta.announce_list,
                                 &meta,
-                                LOCAL_PORT,
+                                port,
                                 uploaded,
                                 downloaded,
                                 left,
@@ -368,7 +456,10 @@ impl Engine {
                         if n > 0 {
                             self.log(Level::Debug, format!("reaped {n} dead peers")).await;
                         }
-                        if pool.connected() < crate::peer::MIN_PEERS && !self.meta.announce_list.is_empty() {
+                        if !seeding
+                            && pool.connected() < crate::peer::MIN_PEERS
+                            && !self.meta.announce_list.is_empty()
+                        {
                             // Re-announce promptly while we are still short of
                             // peers. The previous arithmetic here set the
                             // elapsed time to `interval - 5s`, which is short
@@ -419,6 +510,12 @@ impl Engine {
                         }
                     }
 
+                    // ---- tit-for-tat choking (session engines) ----
+                    if !self.opts.auto_unchoke && last_rechoke.elapsed() >= RECHOKE_INTERVAL {
+                        last_rechoke = Instant::now();
+                        pool.rechoke(seeding).await;
+                    }
+
                     // ---- publish stats to the TUI ----
                     if last_stats.elapsed() >= STATS_INTERVAL {
                         last_stats = Instant::now();
@@ -447,33 +544,59 @@ impl Engine {
                         let peers = snapshot_peers(&pool).await;
                         let connected = peers.len() as u32;
 
+                        let total_up = uploaded_so_far + uploaded;
+                        let reached = seeding
+                            && ratio_reached(total_up, self.meta.total_length, self.opts.ratio_target);
+
                         let mut st = self.state.write().await;
                         if let Some(t) = &mut st.torrent {
+                            t.uploaded = total_up;
                             t.downloaded = downloaded;
                             t.verified_pieces = scheduler.block_map().verified_count();
                             t.progress = scheduler.progress();
                             t.download_rate = current_rate;
                             t.upload_rate = upload_rate;
                             t.eta_secs = eta;
-                            if paused {
+                            if reached {
+                                t.state = DownloadState::Stopped;
+                                t.upload_rate = 0.0;
+                            } else if paused {
                                 t.state = DownloadState::Paused;
                             } else if t.state == DownloadState::Paused {
-                                t.state = DownloadState::Downloading;
+                                t.state = if seeding {
+                                    DownloadState::Seeding
+                                } else {
+                                    DownloadState::Downloading
+                                };
                             }
                             t.files = file_summaries(&self.meta, &scheduler, &wanted);
                         }
                         st.peers = peers;
                         let _ = connected;
+                        drop(st);
+                        if reached {
+                            pool.disconnect_all().await;
+                            self.log(
+                                Level::Info,
+                                format!("ratio reached ({:.2}), stopping", self.opts.ratio_target),
+                            )
+                            .await;
+                            return Ok(());
+                        }
                     }
 
                     // ---- completion check ----
-                    if scheduler.is_complete() {
+                    if !seeding && scheduler.is_complete() {
                         // Publish the final figures BEFORE logging completion:
                         // the TUI renders log and stats from the same snapshot,
                         // so logging first would let a frame show "complete"
                         // next to a stale 99.x% gauge.
                         if let Some(t) = &mut self.state.write().await.torrent {
-                            t.state = DownloadState::Complete;
+                            t.state = if self.opts.seed_after_complete {
+                                DownloadState::Seeding
+                            } else {
+                                DownloadState::Complete
+                            };
                             t.progress = 1.0;
                             // The stats branch runs every 500ms, which the
                             // download can beat. Publish final figures here so
@@ -492,7 +615,11 @@ impl Engine {
                             ),
                         )
                         .await;
-                        return Ok(());
+                        if !self.opts.seed_after_complete {
+                            return Ok(());
+                        }
+                        seeding = true;
+                        last_rechoke = Instant::now() - RECHOKE_INTERVAL;
                     }
                 }
             }
@@ -546,11 +673,13 @@ impl Engine {
 /// engine's in-flight flag) and is retried on the next request.
 fn spawn_dht_lookups(
     infohash: crate::metainfo::InfoHash,
+    shared: Option<Arc<DhtNode>>,
+    port: u16,
 ) -> (mpsc::UnboundedSender<()>, mpsc::UnboundedReceiver<Vec<SocketAddr>>) {
     let (req_tx, mut req_rx) = mpsc::unbounded_channel::<()>();
     let (res_tx, res_rx) = mpsc::unbounded_channel::<Vec<SocketAddr>>();
     tokio::spawn(async move {
-        let mut node: Option<crate::dht::DhtNode> = None;
+        let mut node: Option<Arc<DhtNode>> = shared;
         while req_rx.recv().await.is_some() {
             if node.is_none() {
                 match crate::dht::DhtNode::new(None).await {
@@ -561,7 +690,7 @@ fn spawn_dht_lookups(
                             .collect();
                         let up = n.bootstrap(&routers).await;
                         tracing::debug!(routers_up = up, "dht bootstrapped");
-                        node = Some(n);
+                        node = Some(Arc::new(n));
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "could not start DHT node");
@@ -573,12 +702,9 @@ fn spawn_dht_lookups(
             let Some(n) = node.as_ref() else { continue };
             match n.get_peers(infohash).await {
                 Ok(addrs) => {
-                    let ok = !addrs.is_empty();
                     let _ = res_tx.send(addrs);
-                    if ok {
-                        if let Err(e) = n.announce(infohash, LOCAL_PORT).await {
-                            tracing::debug!(error = %e, "dht announce failed");
-                        }
+                    if let Err(e) = n.announce(infohash, port).await {
+                        tracing::debug!(error = %e, "dht announce failed");
                     }
                 }
                 Err(e) => {
@@ -760,6 +886,9 @@ pub fn build_seeder(
 async fn fetch_magnet_metadata(
     magnet: &Magnet,
     state: &Arc<RwLock<UiState>>,
+    port: u16,
+    dht_enabled: bool,
+    shared_dht: Option<&DhtNode>,
 ) -> Result<Vec<u8>> {
     const PEER_PHASE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -770,7 +899,7 @@ async fn fetch_magnet_metadata(
         let (peers, errors) = crate::tracker::announce_all(
             &magnet.trackers,
             &placeholder_meta(magnet),
-            LOCAL_PORT,
+            port,
             0,
             0,
             0,
@@ -804,6 +933,17 @@ async fn fetch_magnet_metadata(
     }
 
     // ---- 2. the DHT ----
+    if !dht_enabled {
+        let mut st = state.write().await;
+        st.log(
+            Level::Error,
+            format!(
+                "could not fetch metadata (tried {tried} peers); the DHT is disabled in settings"
+            ),
+        );
+        anyhow::bail!("fetching metadata for magnet link: no peer supplied it and the DHT is off");
+    }
+
     state
         .write()
         .await
@@ -814,7 +954,12 @@ async fn fetch_magnet_metadata(
         .map(|s| (*s).to_owned())
         .collect();
 
-    match crate::dht::fetch_metadata(magnet.infohash, &routers, Duration::from_secs(60)).await {
+    let timeout = Duration::from_secs(60);
+    let fetched = match shared_dht {
+        Some(node) => crate::dht::fetch_metadata_with_node(node, magnet.infohash, timeout).await,
+        None => crate::dht::fetch_metadata(magnet.infohash, &routers, timeout).await,
+    };
+    match fetched {
         Ok(info) => Ok(info),
         Err(e) => {
             let mut st = state.write().await;
@@ -860,6 +1005,20 @@ pub async fn run_magnet(
     state: Arc<RwLock<UiState>>,
     commands: mpsc::UnboundedReceiver<Command>,
 ) -> Result<()> {
+    run_magnet_with_options(magnet, download_dir, state, commands, EngineOptions::default(), None).await
+}
+
+/// [`run_magnet`] with session options. The fetched raw `info` dict is sent
+/// on `info_sink` so the caller can persist it. A `Stop` while the metadata
+/// is still being located ends the run with the torrent marked stopped.
+pub async fn run_magnet_with_options(
+    magnet: Magnet,
+    download_dir: PathBuf,
+    state: Arc<RwLock<UiState>>,
+    mut commands: mpsc::UnboundedReceiver<Command>,
+    opts: EngineOptions,
+    info_sink: Option<oneshot::Sender<Vec<u8>>>,
+) -> Result<()> {
     {
         let mut st = state.write().await;
         st.torrent = Some(TorrentSummary {
@@ -874,7 +1033,33 @@ pub async fn run_magnet(
         st.log(Level::Info, "magnet link: locating peers for metadata");
     }
 
-    let raw_info = fetch_magnet_metadata(&magnet, &state).await?;
+    let fetch = fetch_magnet_metadata(
+        &magnet,
+        &state,
+        opts.port,
+        opts.dht_enabled,
+        opts.dht.as_deref(),
+    );
+    let wait_stop = async {
+        while let Some(cmd) = commands.recv().await {
+            if cmd == Command::Stop {
+                return;
+            }
+        }
+        std::future::pending::<()>().await
+    };
+    let raw_info = tokio::select! {
+        r = fetch => r?,
+        _ = wait_stop => {
+            if let Some(t) = &mut state.write().await.torrent {
+                t.state = DownloadState::Stopped;
+            }
+            return Ok(());
+        }
+    };
+    if let Some(tx) = info_sink {
+        let _ = tx.send(raw_info.clone());
+    }
 
     // Re-encode the fetched info dict so it round-trips through Metainfo, and
     // confirm the hash matches what the magnet claimed.
@@ -904,7 +1089,7 @@ pub async fn run_magnet(
     meta.announce_list.sort();
     meta.announce_list.dedup();
 
-    let engine = Engine::new(Arc::new(meta), state, commands);
+    let engine = Engine::with_options(Arc::new(meta), state, commands, opts);
     engine.run(download_dir).await
 }
 
@@ -928,6 +1113,14 @@ fn bencode_dict_with_info(info: Vec<u8>) -> crate::bencode::Value {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn ratio_reached_needs_target_and_size() {
+        assert!(!ratio_reached(1000, 100, 0.0));
+        assert!(!ratio_reached(1000, 0, 1.0));
+        assert!(!ratio_reached(199, 100, 2.0));
+        assert!(ratio_reached(200, 100, 2.0));
+    }
 
     #[test]
     fn block_request_key_roundtrip() {

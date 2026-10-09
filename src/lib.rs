@@ -10,19 +10,23 @@
 //! - [`scheduler`] — piece selection, rarest-first with endgame
 //! - [`engine`] — orchestration
 //! - [`state`] — snapshots published to the UI
+//! - [`session`] — multi-torrent session, with [`store`] persistence and [`ipc`] hand-off
 //! - [`tui`] — the terminal interface
 
 pub mod bencode;
 pub mod dht;
 pub mod engine;
 pub mod import;
+pub mod ipc;
 pub mod metainfo;
 pub mod peer;
 pub mod portmap;
 pub mod ratelimit;
 pub mod scheduler;
+pub mod session;
 pub mod state;
 pub mod storage;
+pub mod store;
 pub mod tracker;
 pub mod tui;
 

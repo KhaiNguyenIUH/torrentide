@@ -53,6 +53,11 @@ pub struct PeerPool {
     /// counters die with the peer, so without this the cumulative total we
     /// report to trackers would shrink every time a peer is reaped.
     retired_uploaded: u64,
+    /// Bumped by every `set_seeder`; a dial remembers the value it started at
+    /// so a peer that connected across a change gets the Haves its initial
+    /// bitfield may have missed.
+    seeder_gen: u64,
+    dial_gen: HashMap<SocketAddr, u64>,
 }
 
 impl PeerPool {
@@ -83,6 +88,8 @@ impl PeerPool {
             events,
             connecting: 0,
             retired_uploaded: 0,
+            seeder_gen: 0,
+            dial_gen: HashMap::new(),
         }
     }
 
@@ -107,6 +114,7 @@ impl PeerPool {
         }
         *self.shared.write().unwrap() = seeder.clone();
         self.seeder = seeder;
+        self.seeder_gen += 1;
     }
 
     pub fn set_max_peers(&mut self, n: usize) {
@@ -182,6 +190,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
             break;
         }
         self.connecting += 1;
+        self.dial_gen.insert(addr, self.seeder_gen);
 
         let seeder = Arc::clone(&seeder);
         let events = self.events.clone();
@@ -312,15 +321,26 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
         match ev {
             FromPeer::Connected(handle) => {
                 self.connecting = self.connecting.saturating_sub(1);
+                let dialed_at = self.dial_gen.remove(&addr);
                 if self.peers.len() >= self.max_peers {
                     tracing::debug!(peer = %addr, "pool full, dropping new connection");
                     return;
+                }
+                if dialed_at.is_some_and(|g| g != self.seeder_gen) {
+                    if let Some(s) = &self.seeder {
+                        for i in 0..self.piece_count as u32 {
+                            if s.bitfield.has(i) {
+                                let _ = handle.tx.send(ToPeer::Have(i));
+                            }
+                        }
+                    }
                 }
                 self.peers.insert(addr, *handle);
                 tracing::info!(peer = %addr, "connected");
             }
             FromPeer::ConnectFailed(addr, why) => {
                 self.connecting = self.connecting.saturating_sub(1);
+                self.dial_gen.remove(&addr);
                 tracing::debug!(peer = %addr, error = %why, "connect failed");
             }
             FromPeer::Bitfield(bf) => {

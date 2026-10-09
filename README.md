@@ -31,6 +31,20 @@ The binary is `target/release/torrust`.
 - `magnet`: prints what a magnet URI contains.
 - `import`: adopts another client's files for the same torrent (stop that client first). It tolerates the `.!qB` suffix and no-subfolder layouts, transfers the files into `-o` by copy, move or hard-link, and verifies them unless `--no-verify`. With `--start` it begins downloading right after.
 
+## Session mode
+
+    torrust                      # multi-torrent TUI
+    torrust session --no-tui     # headless, prints a summary every few seconds; Ctrl-C quits
+    torrust add <file.torrent|magnet:?...> [-o DIR]
+
+`torrust` with no subcommand runs a persistent session: many torrents at once behind one listening port and one DHT node. Finished torrents keep seeding until the ratio target (default 2.0; 0 seeds forever) is reached, then stop. The ratio is cumulative across restarts and applies to torrents started after you change it.
+
+- `torrust add` hands a torrent to the running session over a Unix socket (`torrust.sock` in the data directory). With no session running (or on Windows) it is queued and starts the next time `torrust` runs.
+- Settings, torrents and their state live in the data directory: `~/Library/Application Support/torrust` on macOS, `$XDG_DATA_HOME/torrust` (or `~/.local/share/torrust`) on Linux, `%APPDATA%\torrust` on Windows. Set `TORRUST_HOME` to use another directory.
+- Speed limits (bytes per second, 0 = unlimited) can be set globally and per torrent. Uploads use tit-for-tat choking: 4 unchoke slots plus one optimistic, re-evaluated every 10 s.
+- The listen port (default 6881, falling back to a free port if busy) is forwarded through the router with NAT-PMP, then UPnP, when port forwarding is on. Changes to the port, DHT and forwarding settings apply after a restart.
+- `scripts/macos` and `scripts/linux` install handlers that open `magnet:` links and `.torrent` files with `torrust add`.
+
 ## TUI keys
 
 | Key | Action |
