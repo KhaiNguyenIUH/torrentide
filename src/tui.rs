@@ -32,7 +32,7 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::RwLock;
 
 use crate::state::{
-    human_bytes, now_hms, Command, DownloadState, FileSummary, Level, LogEntry, PeerSummary,
+    human_bytes, now_hms, Command, DownloadState, FilePriority, FileSummary, Level, LogEntry, PeerSummary,
     SessionCommand, SessionState, Settings, TorrentId, TorrentSummary, TorrentView, UiState,
 };
 
@@ -126,6 +126,8 @@ fn state_style(state: DownloadState) -> Style {
         DownloadState::Error => error_style(),
         DownloadState::Paused => warn_style(),
         DownloadState::Stopped => muted_style(),
+        DownloadState::Queued => Style::default().fg(Color::LightBlue),
+        DownloadState::Checking => warn_style(),
         _ => heading_style(),
     }
 }
@@ -213,13 +215,13 @@ fn peer_cells(peer: &PeerSummary) -> [String; 5] {
 }
 
 /// The four cells of a file table row, in column order: path, size, progress
-/// bar, and wanted flag.
+/// bar, and priority.
 fn file_cells(file: &FileSummary, bar_width: usize) -> [String; 4] {
     [
         file.path.clone(),
         file.human_size(),
         file_bar(file.progress(), bar_width),
-        if file.wanted { "[x]".to_string() } else { "[ ]".to_string() },
+        file.priority.label().to_string(),
     ]
 }
 
@@ -881,8 +883,8 @@ fn render_files(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
         return;
     }
     let inner_width = usize::from(area.width.saturating_sub(2));
-    // Path | size | bar | want columns; the bar takes what is left.
-    let bar_width = inner_width.saturating_sub(52).max(10);
+    // Path | size | bar | priority columns; the bar takes what is left.
+    let bar_width = inner_width.saturating_sub(55).max(10);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style())
@@ -897,7 +899,7 @@ fn render_files(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
         Cell::from("File"),
         Cell::from("Size"),
         Cell::from("Progress"),
-        Cell::from("Want"),
+        Cell::from("Priority"),
     ])
     .style(heading_style());
 
@@ -905,12 +907,12 @@ fn render_files(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
         .files
         .iter()
         .map(|file| {
-            let [path, size, progress, want] = file_cells(file, bar_width);
+            let [path, size, progress, priority] = file_cells(file, bar_width);
             let row = Row::new(vec![
                 Cell::from(truncate_line(&path, inner_width)),
                 Cell::from(size),
                 Cell::from(progress),
-                Cell::from(want),
+                Cell::from(priority),
             ]);
             if file.wanted {
                 row
@@ -924,7 +926,7 @@ fn render_files(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
         Constraint::Min(16),
         Constraint::Length(10),
         Constraint::Length(bar_width.min(40) as u16),
-        Constraint::Length(5),
+        Constraint::Length(8),
     ];
     let table = Table::new(rows, widths)
         .header(header)
@@ -1126,34 +1128,38 @@ pub fn run_tui(state: Arc<RwLock<UiState>>) -> Result<()> {
 
 /// Key bindings advertised in the session footer and help overlay. The most
 /// used keys come first because the footer is clipped on narrow terminals.
-const SESSION_KEYS: [(&str, &str); 15] = [
+const SESSION_KEYS: [(&str, &str); 17] = [
     ("a", "add"),
     ("s", "start/stop"),
     ("p", "pause"),
     ("d", "remove"),
     ("l", "limits"),
     ("o", "settings"),
+    ("R", "force recheck"),
+    ("[ / ]", "queue up/down"),
     ("tab/1-6", "panel"),
     ("j/k", "torrents"),
     ("J/K", "files"),
     ("space", "skip file"),
+    ("+ / -", "file priority"),
     ("PgUp/PgDn", "log"),
     ("?", "keys"),
     ("q", "quit"),
-    ("Enter", "confirm"),
-    ("Esc", "cancel"),
+    ("Enter/Esc", "confirm/cancel"),
 ];
 
 /// Footer hints: the global keys only; the modal keys live in the help overlay.
-const SESSION_FOOTER_KEYS: [(&str, &str); 9] = [
+const SESSION_FOOTER_KEYS: [(&str, &str); 11] = [
     ("a", "add"),
     ("s", "start/stop"),
     ("p", "pause"),
     ("d", "remove"),
-    ("l", "limits"),
-    ("o", "settings"),
     ("?", "keys"),
     ("q", "quit"),
+    ("R", "recheck"),
+    ("[/]", "queue"),
+    ("l", "limits"),
+    ("o", "settings"),
     ("tab", "panel"),
 ];
 
@@ -1236,15 +1242,30 @@ const TABLE_HEADERS: [&str; 10] = [
     "#", "Name", "Size", "Done", "Status", "\u{2193}", "\u{2191}", "ETA", "Peers", "Ratio",
 ];
 
+/// Queue number for the `#` column: 1-based, blank for a stopped torrent.
+fn queue_cell(view: &TorrentView) -> String {
+    view.queue_position.map(|p| (p + 1).to_string()).unwrap_or_default()
+}
+
+/// Peers cell: connected peers, then the tracker-reported swarm as
+/// `(seeders/leechers)`, e.g. `3 (41/12)`.
+fn swarm_cell(view: &TorrentView) -> String {
+    let connected = view.ui.peers.len();
+    match view.ui.torrent.as_ref() {
+        Some(t) => format!("{connected} ({}/{})", t.seeders_known, t.leecher_known),
+        None => connected.to_string(),
+    }
+}
+
 /// The ten cells of a torrent table row, in [`TABLE_HEADERS`] order.
-fn torrent_cells(index: usize, view: &TorrentView) -> [String; 10] {
+fn torrent_cells(view: &TorrentView) -> [String; 10] {
     let summary = view.ui.torrent.as_ref();
     let size = match summary {
         Some(t) if t.total_length > 0 => compact_bytes(t.total_length),
         _ => "?".to_string(),
     };
     [
-        (index + 1).to_string(),
+        queue_cell(view),
         view_name(view),
         size,
         percent(summary.map(|t| t.progress).unwrap_or(0.0)),
@@ -1252,7 +1273,7 @@ fn torrent_cells(index: usize, view: &TorrentView) -> [String; 10] {
         compact_rate(summary.map(|t| t.download_rate).unwrap_or(0.0)),
         compact_rate(summary.map(|t| t.upload_rate).unwrap_or(0.0)),
         compact_eta(summary.and_then(|t| t.eta_secs)),
-        view.ui.peers.len().to_string(),
+        swarm_cell(view),
         format!("{:.2}", view.ratio),
     ]
 }
@@ -1273,10 +1294,12 @@ fn column_width(column: usize) -> Constraint {
     match column {
         0 => Constraint::Length(3),
         1 => Constraint::Min(8),
-        2 | 3 => Constraint::Length(6),
+        2 => Constraint::Length(5),
+        3 => Constraint::Length(6),
         4 => Constraint::Length(11),
-        5 | 6 => Constraint::Length(8),
-        7 => Constraint::Length(7),
+        5 | 6 => Constraint::Length(7),
+        7 => Constraint::Length(6),
+        8 => Constraint::Length(9),
         _ => Constraint::Length(5),
     }
 }
@@ -1467,6 +1490,14 @@ impl Form {
 }
 
 /// Parse a KiB/s field into bytes per second; 0 means unlimited.
+/// Next priority up or down the Skip < Low < Normal < High ladder, clamped.
+fn step_priority(current: FilePriority, up: bool) -> FilePriority {
+    const LADDER: [FilePriority; 4] =
+        [FilePriority::Skip, FilePriority::Low, FilePriority::Normal, FilePriority::High];
+    let at = LADDER.iter().position(|p| *p == current).unwrap_or(2);
+    LADDER[if up { (at + 1).min(3) } else { at.saturating_sub(1) }]
+}
+
 fn parse_kib(label: &str, text: &str) -> Result<u64, String> {
     let kib: u64 = text
         .trim()
@@ -1509,13 +1540,16 @@ fn settings_form(settings: &Settings) -> Form {
             Field::number("Max peers per torrent", settings.max_peers.to_string()),
             Field::toggle("DHT", settings.dht),
             Field::toggle("Port forwarding", settings.port_forwarding),
+            Field::number("Max active downloads (0 = any)", settings.max_active_downloads.to_string()),
+            Field::number("Max active torrents (0 = any)", settings.max_active_torrents.to_string()),
         ],
     )
 }
 
 /// Validate the settings form. Nothing is sent to the session unless every
-/// field parses, so a typo can never reach the engine as a bad value.
-fn parse_settings(form: &Form) -> Result<Settings, String> {
+/// field parses, so a typo can never reach the engine as a bad value. Values
+/// the form does not edit are carried over from `base`.
+fn parse_settings(form: &Form, base: &Settings) -> Result<Settings, String> {
     let f = &form.fields;
     let dir = clean_input(&f[0].input.text);
     if dir.is_empty() {
@@ -1533,6 +1567,18 @@ fn parse_settings(form: &Form) -> Result<Settings, String> {
         Ok(n) if n > 0 => n,
         _ => return Err("Max peers: enter a whole number, 1 or more".to_string()),
     };
+    let max_active_downloads = f[8]
+        .input
+        .text
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "Max active downloads: enter a whole number, 0 or more".to_string())?;
+    let max_active_torrents = f[9]
+        .input
+        .text
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "Max active torrents: enter a whole number, 0 or more".to_string())?;
     Ok(Settings {
         download_dir: PathBuf::from(dir),
         listen_port,
@@ -1542,6 +1588,9 @@ fn parse_settings(form: &Form) -> Result<Settings, String> {
         max_peers,
         dht: f[6].on,
         port_forwarding: f[7].on,
+        max_active_downloads,
+        max_active_torrents,
+        ..base.clone()
     })
 }
 
@@ -1748,6 +1797,18 @@ impl SessionApp {
         }
     }
 
+    fn step_file_priority(&mut self, up: bool) {
+        let Some(id) = self.current().map(|row| row.id.clone()) else { return };
+        let Some(file) = self.view.file_selected.and_then(|i| self.view.files.get_mut(i)) else {
+            return;
+        };
+        let priority = step_priority(file.priority, up);
+        file.priority = priority;
+        file.wanted = priority != FilePriority::Skip;
+        let index = file.index;
+        self.send(SessionCommand::Torrent(id, Command::SetFilePriority(index, priority)));
+    }
+
     fn set_tab(&mut self, tab: Tab) {
         self.tab = tab;
         self.view.log_scroll = 0;
@@ -1790,6 +1851,19 @@ impl SessionApp {
                     .map(|f| f.index);
                 if let (Some(row), Some(index)) = (self.current(), file) {
                     self.send(SessionCommand::Torrent(row.id.clone(), Command::ToggleFile(index)));
+                }
+            }
+            KeyCode::Char(c @ ('+' | '=' | '-')) if self.tab == Tab::Files => {
+                self.step_file_priority(c != '-');
+            }
+            KeyCode::Char('R') => {
+                if let Some(row) = self.current() {
+                    self.send(SessionCommand::Torrent(row.id.clone(), Command::Recheck));
+                }
+            }
+            KeyCode::Char(c @ ('[' | ']')) => {
+                if let Some(row) = self.current() {
+                    self.send(SessionCommand::MoveQueue { id: row.id.clone(), up: c == '[' });
                 }
             }
             KeyCode::Char('a') => {
@@ -1895,7 +1969,7 @@ impl SessionApp {
             },
             Modal::Settings(mut form) => match form.on_key(&key) {
                 FormAction::Cancel => Modal::None,
-                FormAction::Submit => match parse_settings(&form) {
+                FormAction::Submit => match parse_settings(&form, &self.settings) {
                     Ok(settings) => {
                         self.send(SessionCommand::SetSettings(settings));
                         Modal::None
@@ -2006,9 +2080,8 @@ fn render_torrent_table(frame: &mut Frame, area: Rect, state: &SessionState, app
     let rows: Vec<Row> = state
         .torrents
         .iter()
-        .enumerate()
-        .map(|(i, view)| {
-            let cells = torrent_cells(i, view);
+        .map(|view| {
+            let cells = torrent_cells(view);
             let status_style = state_style(view_state(view));
             Row::new(columns.iter().map(|&c| {
                 let cell = Cell::from(cells[c].clone());
@@ -2068,6 +2141,19 @@ fn general_lines(view: &TorrentView) -> Vec<Line<'static>> {
     };
     vec![
         kv("Name", view_name(view)),
+        kv(
+            "Queue",
+            view.queue_position.map(|p| format!("#{}", p + 1)).unwrap_or_else(|| "-".to_string()),
+        ),
+        kv(
+            "Seeds/Peers",
+            format!(
+                "{} connected   (tracker: {} seeds, {} peers)",
+                view.ui.peers.len(),
+                t.seeders_known,
+                t.leecher_known
+            ),
+        ),
         kv("Size", t.human_size()),
         kv("Saved to", t.download_dir.clone()),
         kv("Infohash", t.infohash.clone()),
@@ -2095,15 +2181,6 @@ fn general_lines(view: &TorrentView) -> Vec<Line<'static>> {
             ),
         ),
         kv("Trackers", t.trackers.len().to_string()),
-        kv(
-            "Peers",
-            format!(
-                "{} connected   ({} seeders, {} leechers)",
-                view.ui.peers.len(),
-                t.seeders_known,
-                t.leecher_known
-            ),
-        ),
     ]
 }
 
@@ -2650,11 +2727,11 @@ mod tests {
     fn file_cells_mark_unwanted_files() {
         let wanted = file(0, "a.bin", 100);
         let [_, _, _, w] = file_cells(&wanted, 20);
-        assert_eq!(w, "[x]");
+        assert_eq!(w, "normal");
         let mut skipped = file(1, "b.bin", 100);
-        skipped.wanted = false;
+        skipped.priority = FilePriority::Skip;
         let [_, _, _, s] = file_cells(&skipped, 20);
-        assert_eq!(s, "[ ]");
+        assert_eq!(s, "skip");
     }
 
     #[test]
@@ -2669,6 +2746,7 @@ mod tests {
             length,
             downloaded: 0,
             wanted: true,
+            priority: FilePriority::Normal,
         }
     }
 
@@ -2932,8 +3010,8 @@ mod session_tests {
                     state,
                     trackers: vec!["http://tracker.example/announce".to_string()],
                     files: vec![
-                        FileSummary { index: 0, path: "a.bin".into(), length: 10, downloaded: 5, wanted: true },
-                        FileSummary { index: 1, path: "b.bin".into(), length: 10, downloaded: 0, wanted: true },
+                        FileSummary { index: 0, path: "a.bin".into(), length: 10, downloaded: 5, wanted: true, priority: FilePriority::Normal },
+                        FileSummary { index: 1, path: "b.bin".into(), length: 10, downloaded: 0, wanted: true, priority: FilePriority::Normal },
                     ],
                     ..TorrentSummary::default()
                 }),
@@ -2954,6 +3032,7 @@ mod session_tests {
             download_limit: 100 * 1024,
             upload_limit: 0,
             added_at: 0,
+            queue_position: None,
         }
     }
 
@@ -2999,7 +3078,11 @@ mod session_tests {
 
     #[test]
     fn row_cells_describe_a_torrent() {
-        let cells = torrent_cells(2, &view("x", DownloadState::Seeding));
+        let mut v = view("x", DownloadState::Seeding);
+        v.queue_position = Some(2);
+        v.ui.torrent.as_mut().unwrap().seeders_known = 41;
+        v.ui.torrent.as_mut().unwrap().leecher_known = 12;
+        let cells = torrent_cells(&v);
         assert_eq!(cells[0], "3");
         assert_eq!(cells[1], "name-x");
         assert_eq!(cells[2], "3.0G");
@@ -3008,14 +3091,16 @@ mod session_tests {
         assert_eq!(cells[5], "1.5M/s");
         assert_eq!(cells[6], "-");
         assert_eq!(cells[7], "1h02m");
-        assert_eq!(cells[8], "1");
+        assert_eq!(cells[8], "1 (41/12)");
         assert_eq!(cells[9], "1.25");
     }
 
     #[test]
     fn row_cells_survive_missing_metadata() {
         let bare = TorrentView { ui: UiState::default(), ..view("x", DownloadState::Connecting) };
-        let cells = torrent_cells(0, &bare);
+        let cells = torrent_cells(&bare);
+        assert_eq!(cells[0], "");
+        assert_eq!(cells[8], "0");
         assert_eq!(cells[1], PENDING_NAME);
         assert_eq!(cells[2], "?");
         assert_eq!(cells[4], "connecting");
@@ -3266,6 +3351,7 @@ mod session_tests {
             max_peers: 30,
             dht: true,
             port_forwarding: false,
+            ..Settings::default()
         };
         let (mut app, mut rx) = app_with(&state);
         app.on_key(ch('o'));
@@ -3296,7 +3382,7 @@ mod session_tests {
         let set = |idx: usize, text: &str| {
             let mut form = base.clone();
             form.fields[idx].input = TextInput::new(text);
-            parse_settings(&form)
+            parse_settings(&form, &Settings::default())
         };
         assert!(set(0, "  ").is_err());
         assert!(set(1, "0").is_err());
@@ -3309,7 +3395,134 @@ mod session_tests {
         assert!(set(5, "0").is_err());
         assert_eq!(set(4, "0").unwrap().ratio_target, 0.0);
         assert_eq!(set(1, "6881").unwrap().listen_port, 6881);
-        assert!(parse_settings(&base).is_ok());
+        assert!(parse_settings(&base, &Settings::default()).is_ok());
+        assert!(set(8, "-1").is_err());
+        assert!(set(8, "x").is_err());
+        assert!(set(9, "1.5").is_err());
+        assert!(set(9, "").is_err());
+        assert_eq!(set(8, "0").unwrap().max_active_downloads, 0);
+        assert_eq!(set(9, "12").unwrap().max_active_torrents, 12);
+    }
+
+    #[test]
+    fn settings_form_carries_unedited_values() {
+        let base = Settings { max_active_downloads: 5, max_active_torrents: 0, ..Settings::default() };
+        let form = settings_form(&base);
+        assert_eq!(parse_settings(&form, &base).unwrap(), base);
+        let mut edited = form.clone();
+        edited.fields[8].input = TextInput::new("2");
+        edited.fields[9].input = TextInput::new("4");
+        let parsed = parse_settings(&edited, &base).unwrap();
+        assert_eq!((parsed.max_active_downloads, parsed.max_active_torrents), (2, 4));
+        assert_eq!(parsed.ratio_target, base.ratio_target);
+    }
+
+    #[test]
+    fn state_styles_and_labels_for_queue_and_check() {
+        assert_ne!(state_style(DownloadState::Queued), state_style(DownloadState::Downloading));
+        assert_eq!(state_style(DownloadState::Checking).fg, Some(Color::Yellow));
+        let cells = torrent_cells(&view("x", DownloadState::Queued));
+        assert_eq!(cells[4], "queued");
+        let cells = torrent_cells(&view("x", DownloadState::Checking));
+        assert_eq!(cells[4], "checking");
+    }
+
+    #[test]
+    fn priority_steps_clamp() {
+        use FilePriority::*;
+        assert_eq!(step_priority(Normal, true), High);
+        assert_eq!(step_priority(High, true), High);
+        assert_eq!(step_priority(Normal, false), Low);
+        assert_eq!(step_priority(Low, false), Skip);
+        assert_eq!(step_priority(Skip, false), Skip);
+        assert_eq!(step_priority(Skip, true), Low);
+    }
+
+    #[test]
+    fn r_sends_recheck() {
+        let (mut app, mut rx) = app_with(&session(&["a", "b"]));
+        app.on_key(ch('j'));
+        app.on_key(ch('R'));
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::Torrent("b".into(), Command::Recheck));
+    }
+
+    #[test]
+    fn plus_and_minus_set_file_priority() {
+        let (mut app, mut rx) = app_with(&session(&["a"]));
+        app.on_key(ch('+'));
+        assert!(rx.try_recv().is_err());
+        app.on_key(ch('3'));
+        app.on_key(ch('J'));
+        let sent = |rx: &mut UnboundedReceiver<SessionCommand>| rx.try_recv().unwrap();
+        let cmd = |p| SessionCommand::Torrent("a".into(), Command::SetFilePriority(1, p));
+        app.on_key(ch('+'));
+        assert_eq!(sent(&mut rx), cmd(FilePriority::High));
+        app.on_key(ch('='));
+        assert_eq!(sent(&mut rx), cmd(FilePriority::High));
+        app.on_key(ch('-'));
+        app.on_key(ch('-'));
+        app.on_key(ch('-'));
+        assert_eq!(sent(&mut rx), cmd(FilePriority::Normal));
+        assert_eq!(sent(&mut rx), cmd(FilePriority::Low));
+        assert_eq!(sent(&mut rx), cmd(FilePriority::Skip));
+        app.on_key(ch('-'));
+        assert_eq!(sent(&mut rx), cmd(FilePriority::Skip));
+        app.on_key(ch(' '));
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::Torrent("a".into(), Command::ToggleFile(1)));
+    }
+
+    #[test]
+    fn brackets_move_the_queue() {
+        let (mut app, mut rx) = app_with(&session(&["a", "b"]));
+        app.on_key(ch('['));
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::MoveQueue { id: "a".into(), up: true });
+        app.on_key(ch(']'));
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::MoveQueue { id: "a".into(), up: false });
+    }
+
+    #[test]
+    fn settings_form_edits_queue_limits() {
+        let (mut app, mut rx) = app_with(&session(&["a"]));
+        app.on_key(ch('o'));
+        for _ in 0..9 {
+            app.on_key(key(KeyCode::Tab));
+        }
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(ch('0'));
+        app.on_key(key(KeyCode::Enter));
+        match rx.try_recv().unwrap() {
+            SessionCommand::SetSettings(s) => {
+                assert_eq!(s.max_active_torrents, 0);
+                assert_eq!(s.max_active_downloads, Settings::default().max_active_downloads);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queued_and_checking_render_at_small_sizes() {
+        let mut state = session(&["a", "b", "c"]);
+        for (v, st, pos) in [
+            (0, DownloadState::Queued, Some(0)),
+            (1, DownloadState::Checking, Some(1)),
+            (2, DownloadState::Stopped, None),
+        ] {
+            state.torrents[v].ui.torrent.as_mut().unwrap().state = st;
+            state.torrents[v].queue_position = pos;
+        }
+        for (w, h) in [(80, 24), (40, 12)] {
+            let mut app = SessionApp::new();
+            for tab in Tab::ALL {
+                app.set_tab(tab);
+                draw(w, h, &state, &mut app);
+            }
+        }
+        let mut app = SessionApp::new();
+        let screen = draw(80, 24, &state, &mut app);
+        assert!(screen.contains("queued") && screen.contains("checking"), "{screen}");
+        assert!(screen.contains("Queue"), "{screen}");
+        app.set_tab(Tab::Files);
+        assert!(draw(80, 24, &state, &mut app).contains("Priority"));
     }
 
     #[test]

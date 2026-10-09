@@ -1,15 +1,43 @@
 //! Tracker clients: HTTP(S) announce per BEP 3 and the two-step UDP protocol
-//! from BEP 15.
+//! from BEP 15, plus scrape for swarm counts.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 use crate::bencode;
 use crate::metainfo::{InfoHash, Metainfo, SocketAddrLite};
+
+/// Lifecycle event reported to a tracker. Regular re-announces carry none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    Started,
+    Completed,
+    Stopped,
+}
+
+impl Event {
+    fn http_name(self) -> &'static str {
+        match self {
+            Event::Started => "started",
+            Event::Completed => "completed",
+            Event::Stopped => "stopped",
+        }
+    }
+}
+
+/// BEP 15 event codes: none 0, completed 1, started 2, stopped 3.
+fn udp_event_code(event: Option<Event>) -> i32 {
+    match event {
+        None => 0,
+        Some(Event::Completed) => 1,
+        Some(Event::Started) => 2,
+        Some(Event::Stopped) => 3,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AnnounceResult {
@@ -19,6 +47,18 @@ pub struct AnnounceResult {
     pub peers: Vec<SocketAddrLite>,
     /// Human-readable tracker warnings, e.g. "torrent not registered".
     pub warning: Option<String>,
+    /// Swarm counts when the tracker volunteered them (`complete` /
+    /// `incomplete`, or the seeders/leechers fields of a UDP reply).
+    pub seeders: Option<u32>,
+    pub leechers: Option<u32>,
+}
+
+/// Swarm statistics from a scrape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrapeResult {
+    pub complete: u32,
+    pub incomplete: u32,
+    pub downloaded: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -33,10 +73,22 @@ pub enum TrackerError {
     Unreachable(String),
 }
 
-/// Announce to a tracker URL, dispatching on scheme.
 /// BEP 15 magic constant sent as the connection id of a connect request.
 const UDP_PROTOCOL_ID: i64 = 0x0417_2710_1980;
 
+struct AnnounceParams {
+    infohash: InfoHash,
+    port: u16,
+    uploaded: u64,
+    downloaded: u64,
+    left: u64,
+    event: Option<Event>,
+    numwant: usize,
+    compact: bool,
+}
+
+/// Announce to a tracker URL, dispatching on scheme.
+#[allow(clippy::too_many_arguments)]
 pub async fn announce(
     url: &str,
     infohash: InfoHash,
@@ -44,17 +96,65 @@ pub async fn announce(
     uploaded: u64,
     downloaded: u64,
     left: u64,
+    event: Option<Event>,
     numwant: usize,
     compact: bool,
 ) -> Result<AnnounceResult, TrackerError> {
+    let params = AnnounceParams {
+        infohash,
+        port,
+        uploaded,
+        downloaded,
+        left,
+        event,
+        numwant,
+        compact,
+    };
     if url.starts_with("udp://") {
-        announce_udp(url, infohash, port, uploaded, downloaded, left, numwant).await
+        announce_udp(url, &params).await
     } else if url.starts_with("http://") || url.starts_with("https://") {
-        announce_http(url, infohash, port, uploaded, downloaded, left, numwant, compact)
-            .await
+        announce_http(url, &params).await
     } else {
         Err(TrackerError::UnsupportedScheme(url.to_owned()))
     }
+}
+
+/// Ask a tracker for swarm counts without announcing.
+pub async fn scrape(url: &str, infohash: InfoHash) -> Result<ScrapeResult, TrackerError> {
+    if url.starts_with("udp://") {
+        scrape_udp(url, infohash).await
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        let scrape = scrape_url(url)
+            .ok_or_else(|| TrackerError::BadResponse("tracker url has no scrape form".into()))?;
+        let sep = if scrape.contains('?') { '&' } else { '?' };
+        let full = format!("{scrape}{sep}info_hash={}", percent_encode(&infohash.0));
+        let body = http_fetch(&full).await?;
+        parse_scrape_response(&body, infohash)
+    } else {
+        Err(TrackerError::UnsupportedScheme(url.to_owned()))
+    }
+}
+
+/// Derive the HTTP scrape URL from an announce URL: by convention the last
+/// path segment must start with `announce`, and that prefix becomes `scrape`.
+/// Anything else (a passkey-only path, a bare host) has no scrape form.
+pub fn scrape_url(announce: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(announce).ok()?;
+    let path = parsed.path().to_owned();
+    let (dir, last) = path.rsplit_once('/')?;
+    let rest = last.strip_prefix("announce")?;
+    parsed.set_path(&format!("{dir}/scrape{rest}"));
+    Some(parsed.to_string())
+}
+
+/// Everything [`announce_all`] learned from the trackers that answered.
+#[derive(Debug, Clone, Default)]
+pub struct AnnounceOutcome {
+    pub peers: Vec<SocketAddrLite>,
+    pub errors: Vec<String>,
+    /// Largest seeder / leecher counts any tracker reported.
+    pub seeders: Option<u32>,
+    pub leechers: Option<u32>,
 }
 
 /// Ask every tracker for peers concurrently, swallowing individual failures.
@@ -64,6 +164,11 @@ pub async fn announce(
 /// Trackers are contacted in parallel so one that hangs until its timeout
 /// costs only its own wait, not the sum of all of them. `uploaded` is the real
 /// cumulative byte count; private trackers use it for ratio accounting.
+///
+/// Swarm counts come from the announce reply when it carries them; only a
+/// tracker that left them out is scraped. Across trackers the largest count
+/// wins, since each one only sees the peers that announced to it. A `Stopped`
+/// announce asks for no peers and skips the scrape.
 pub async fn announce_all(
     urls: &[String],
     meta: &Metainfo,
@@ -71,7 +176,9 @@ pub async fn announce_all(
     uploaded: u64,
     downloaded: u64,
     left: u64,
-) -> (Vec<SocketAddrLite>, Vec<String>) {
+    event: Option<Event>,
+) -> AnnounceOutcome {
+    let stopping = event == Some(Event::Stopped);
     let results = futures::future::join_all(urls.iter().filter(|u| !u.is_empty()).map(|url| async move {
         let res = announce(
             url,
@@ -80,16 +187,30 @@ pub async fn announce_all(
             uploaded,
             downloaded,
             left,
-            200,
+            event,
+            if stopping { 0 } else { 200 },
             true,
         )
         .await;
+        let res = match res {
+            Ok(mut r) if !stopping && (r.seeders.is_none() || r.leechers.is_none()) => {
+                match scrape(url, meta.infohash).await {
+                    Ok(s) => {
+                        r.seeders = r.seeders.or(Some(s.complete));
+                        r.leechers = r.leechers.or(Some(s.incomplete));
+                    }
+                    Err(e) => tracing::debug!(tracker = %url, error = %e, "scrape failed"),
+                }
+                Ok(r)
+            }
+            other => other,
+        };
         (url, res)
     }))
     .await;
 
     let mut found: HashSet<SocketAddrLite> = HashSet::new();
-    let mut errors = Vec::new();
+    let mut out = AnnounceOutcome::default();
     for (url, res) in results {
         match res {
             Ok(r) => {
@@ -97,42 +218,57 @@ pub async fn announce_all(
                     tracing::warn!(tracker = %url, warning = %w, "tracker warning");
                 }
                 found.extend(r.peers);
+                out.seeders = out.seeders.max(r.seeders);
+                out.leechers = out.leechers.max(r.leechers);
             }
             Err(e) => {
                 tracing::debug!(tracker = %url, error = %e, "announce failed");
-                errors.push(format!("{url}: {e}"));
+                out.errors.push(format!("{url}: {e}"));
             }
         }
     }
+    out.peers = found.into_iter().collect();
+    out
+}
 
-    (found.into_iter().collect(), errors)
+fn count(v: i64) -> u32 {
+    u32::try_from(v.max(0)).unwrap_or(u32::MAX)
 }
 
 // ---------------------------------------------------------------- HTTP tracker
 
-#[allow(clippy::too_many_arguments)]
-async fn announce_http(
-    base: &str,
-    infohash: InfoHash,
-    port: u16,
-    uploaded: u64,
-    downloaded: u64,
-    left: u64,
-    numwant: usize,
-    compact: bool,
-) -> Result<AnnounceResult, TrackerError> {
+/// The announce query string, starting with `?` or `&` as `base` requires.
+/// `event` is omitted for a regular re-announce.
+fn http_announce_url(base: &str, p: &AnnounceParams, peer_id: &[u8; 20]) -> String {
     let sep = if base.contains('?') { '&' } else { '?' };
-    let query = format!(
-        "{sep}info_hash={}&peer_id={}&port={}&uploaded={uploaded}\
-         &downloaded={downloaded}&left={left}&compact={}&numwant={numwant}&event=started",
-        percent_encode(&infohash.0),
-        percent_encode(&random_peer_id()),
-        port,
-        i32::from(compact),
+    let mut url = format!(
+        "{base}{sep}info_hash={}&peer_id={}&port={}&uploaded={}\
+         &downloaded={}&left={}&compact={}&numwant={}",
+        percent_encode(&p.infohash.0),
+        percent_encode(peer_id),
+        p.port,
+        p.uploaded,
+        p.downloaded,
+        p.left,
+        i32::from(p.compact),
+        p.numwant,
     );
-    let url = format!("{base}{query}");
+    if let Some(e) = p.event {
+        url.push_str("&event=");
+        url.push_str(e.http_name());
+    }
+    url
+}
 
-    let parsed = url::Url::parse(&url).map_err(|e| TrackerError::BadResponse(e.to_string()))?;
+async fn announce_http(base: &str, p: &AnnounceParams) -> Result<AnnounceResult, TrackerError> {
+    let url = http_announce_url(base, p, &random_peer_id());
+    let body = http_fetch(&url).await?;
+    parse_http_response(&body)
+}
+
+/// GET `url` over http or https and return the raw response bytes.
+async fn http_fetch(url: &str) -> Result<Vec<u8>, TrackerError> {
+    let parsed = url::Url::parse(url).map_err(|e| TrackerError::BadResponse(e.to_string()))?;
     let tls = match parsed.scheme() {
         "https" => true,
         "http" => false,
@@ -159,7 +295,7 @@ async fn announce_http(
 
     // TLS is negotiated on top of the same TCP connection; everything after
     // this point is identical for http and https.
-    let body = if tls {
+    if tls {
         let connector = tls_connector();
         let server_name = rustls::pki_types::ServerName::try_from(host.clone())
             .map_err(|_| TrackerError::BadResponse(format!("bad TLS server name: {host}")))?;
@@ -167,13 +303,11 @@ async fn announce_http(
             .await
             .map_err(|_| TrackerError::Unreachable("TLS handshake timed out".into()))?
             .map_err(|e| TrackerError::Unreachable(format!("TLS handshake failed: {e}")))?;
-        http_get(&mut tls_stream, &host, &path_and_query).await?
+        http_get(&mut tls_stream, &host, &path_and_query).await
     } else {
         let mut plain = tcp;
-        http_get(&mut plain, &host, &path_and_query).await?
-    };
-
-    parse_http_response(&body)
+        http_get(&mut plain, &host, &path_and_query).await
+    }
 }
 
 /// Build a TLS client that trusts the roots bundled with webpki-roots.
@@ -225,25 +359,18 @@ where
     Ok(raw)
 }
 
-fn parse_http_response(raw: &[u8]) -> Result<AnnounceResult, TrackerError> {
+/// Decode the bencoded body of an HTTP tracker response, surfacing a
+/// `failure reason` as an error.
+///
+/// Trackers signal errors both by HTTP status and by a bencoded `failure
+/// reason`, so the status is ignored and the bencode parser produces the real
+/// message.
+fn decode_http_body(raw: &[u8]) -> Result<bencode::Value, TrackerError> {
     let sep = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| TrackerError::BadResponse("no header/body separator".into()))?;
-    let head = String::from_utf8_lossy(&raw[..sep]);
     let body = &raw[sep + 4..];
-
-    let status = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|c| c.parse::<u16>().ok())
-        .unwrap_or(0);
-
-    // Trackers signal errors both by HTTP status and by a bencoded `failure
-    // reason`, so accept the body when the status is not 2xx and let the
-    // bencode parser produce the real message.
-    let _ = status;
 
     let value = bencode::decode(body)
         .map_err(|e| TrackerError::BadResponse(e.to_string()))?;
@@ -251,6 +378,28 @@ fn parse_http_response(raw: &[u8]) -> Result<AnnounceResult, TrackerError> {
     if let Ok(failure) = value.get("failure reason").and_then(|v| v.as_str()) {
         return Err(TrackerError::Failure(failure.to_owned()));
     }
+    Ok(value)
+}
+
+fn parse_scrape_response(raw: &[u8], infohash: InfoHash) -> Result<ScrapeResult, TrackerError> {
+    let value = decode_http_body(raw)?;
+    let files = value
+        .get("files")
+        .and_then(|f| f.as_dict())
+        .map_err(|e| TrackerError::BadResponse(e.to_string()))?;
+    let entry = files
+        .get(infohash.0.as_slice())
+        .ok_or_else(|| TrackerError::BadResponse("scrape reply omits our infohash".into()))?;
+    let field = |k: &str| count(entry.get_int_opt(k).unwrap_or(0));
+    Ok(ScrapeResult {
+        complete: field("complete"),
+        incomplete: field("incomplete"),
+        downloaded: field("downloaded"),
+    })
+}
+
+fn parse_http_response(raw: &[u8]) -> Result<AnnounceResult, TrackerError> {
+    let value = decode_http_body(raw)?;
 
     let interval = value
         .get_int_opt("interval")
@@ -304,21 +453,17 @@ fn parse_http_response(raw: &[u8]) -> Result<AnnounceResult, TrackerError> {
         min_interval,
         peers,
         warning,
+        seeders: value.get_int_opt("complete").map(count),
+        leechers: value.get_int_opt("incomplete").map(count),
     })
 }
 
 // ----------------------------------------------------------------- UDP tracker
 
-#[allow(clippy::too_many_arguments)]
-async fn announce_udp(
-    url: &str,
-    infohash: InfoHash,
-    port: u16,
-    uploaded: u64,
-    downloaded: u64,
-    left: u64,
-    numwant: usize,
-) -> Result<AnnounceResult, TrackerError> {
+/// Resolve `url`, bind a socket, and run the BEP 15 connect step. BEP 15
+/// requires the fixed protocol id there; trackers silently drop anything else.
+/// A random transaction id ties the response to us.
+async fn udp_connect(url: &str) -> Result<(UdpSocket, i64), TrackerError> {
     let parsed = url::Url::parse(url)
         .map_err(|e| TrackerError::BadResponse(format!("bad udp url: {e}")))?;
     let host = parsed
@@ -328,16 +473,13 @@ async fn announce_udp(
     let tp = parsed.port().unwrap_or(80);
 
     let server = resolve(&host, tp).await?;
-    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0")
+    let sock = UdpSocket::bind("0.0.0.0:0")
         .await
         .map_err(|e| TrackerError::Unreachable(e.to_string()))?;
     sock.connect(server)
         .await
         .map_err(|e| TrackerError::Unreachable(e.to_string()))?;
 
-    // Step 1: connect request. BEP 15 requires the fixed protocol id here;
-    // trackers silently drop anything else. A random transaction id ties the
-    // response to us.
     let tx: i32 = rand::random();
     let mut req = Vec::with_capacity(16);
     req.extend_from_slice(&UDP_PROTOCOL_ID.to_be_bytes());
@@ -371,43 +513,39 @@ async fn announce_udp(
             "udp transaction id mismatch (possible spoof)".into(),
         ));
     }
-    let real_conn_id = i64::from_be_bytes(buf[8..16].try_into().unwrap());
+    let conn_id = i64::from_be_bytes(buf[8..16].try_into().unwrap());
+    Ok((sock, conn_id))
+}
 
-    // Step 2: announce.
-    let tx2: i32 = rand::random();
+/// The 98-byte BEP 15 announce request.
+fn udp_announce_packet(conn_id: i64, tx: i32, p: &AnnounceParams, peer_id: &[u8; 20], key: u32) -> Vec<u8> {
     let mut a = Vec::with_capacity(98);
-    a.extend_from_slice(&real_conn_id.to_be_bytes());
+    a.extend_from_slice(&conn_id.to_be_bytes());
     a.extend_from_slice(&1i32.to_be_bytes()); // action = announce
-    a.extend_from_slice(&tx2.to_be_bytes());
-    a.extend_from_slice(&infohash.0);
-    a.extend_from_slice(&random_peer_id());
-    a.extend_from_slice(&(downloaded as i64).to_be_bytes());
-    a.extend_from_slice(&(left as i64).to_be_bytes());
-    a.extend_from_slice(&(uploaded as i64).to_be_bytes());
-    a.extend_from_slice(&0i32.to_be_bytes()); // event: none
+    a.extend_from_slice(&tx.to_be_bytes());
+    a.extend_from_slice(&p.infohash.0);
+    a.extend_from_slice(peer_id);
+    a.extend_from_slice(&(p.downloaded as i64).to_be_bytes());
+    a.extend_from_slice(&(p.left as i64).to_be_bytes());
+    a.extend_from_slice(&(p.uploaded as i64).to_be_bytes());
+    a.extend_from_slice(&udp_event_code(p.event).to_be_bytes());
     a.extend_from_slice(&0u32.to_be_bytes()); // IP: default
-    a.extend_from_slice(&rand::random::<u32>().to_be_bytes()); // key
+    a.extend_from_slice(&key.to_be_bytes());
     // BEP 15 uses -1 for "tracker default"; a caller-supplied value is
     // honoured but clamped so a silly numwant cannot stall the response.
-    let want = if numwant == 0 { -1i32 } else { (numwant as i32).clamp(1, 500) };
+    let want = if p.numwant == 0 { -1i32 } else { (p.numwant as i32).clamp(1, 500) };
     a.extend_from_slice(&want.to_be_bytes());
-    a.extend_from_slice(&port.to_be_bytes());
+    a.extend_from_slice(&p.port.to_be_bytes());
+    a
+}
 
-    sock.send(&a)
-        .await
-        .map_err(|e| TrackerError::Unreachable(e.to_string()))?;
-
-    let n = tokio::time::timeout(Duration::from_secs(10), sock.recv(&mut buf))
-        .await
-        .map_err(|_| TrackerError::Unreachable("udp announce timed out".into()))?
-        .map_err(|e| TrackerError::Unreachable(e.to_string()))?;
-
-    if n < 20 {
+fn parse_udp_announce(buf: &[u8], tx: i32) -> Result<AnnounceResult, TrackerError> {
+    if buf.len() < 20 {
         return Err(TrackerError::BadResponse("short udp announce reply".into()));
     }
     let action = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
     if action == 3 {
-        let msg = String::from_utf8_lossy(&buf[8..n]).into_owned();
+        let msg = String::from_utf8_lossy(&buf[8..]).into_owned();
         return Err(TrackerError::Failure(msg));
     }
     if action != 1 {
@@ -415,14 +553,15 @@ async fn announce_udp(
     }
     // Reply layout: action, transaction id, interval, leechers, seeders (4
     // bytes each), then packed (ipv4, port) pairs.
-    let rtx2 = i32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    if rtx2 != tx2 {
+    let rtx = i32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if rtx != tx {
         return Err(TrackerError::BadResponse("udp announce txid mismatch".into()));
     }
 
-    let interval = i32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]) as u64;
+    let word = |at: usize| i32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
+    let interval = word(8).max(0) as u64;
     let mut peers = Vec::new();
-    for chunk in buf[20..n].chunks_exact(6) {
+    for chunk in buf[20..].chunks_exact(6) {
         let ip = std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let p = u16::from_be_bytes([chunk[4], chunk[5]]);
         if p > 0 {
@@ -438,7 +577,81 @@ async fn announce_udp(
         min_interval: None,
         peers,
         warning: None,
+        leechers: Some(count(word(12) as i64)),
+        seeders: Some(count(word(16) as i64)),
     })
+}
+
+async fn announce_udp(url: &str, p: &AnnounceParams) -> Result<AnnounceResult, TrackerError> {
+    let (sock, conn_id) = udp_connect(url).await?;
+
+    let tx: i32 = rand::random();
+    let packet = udp_announce_packet(conn_id, tx, p, &random_peer_id(), rand::random());
+    sock.send(&packet)
+        .await
+        .map_err(|e| TrackerError::Unreachable(e.to_string()))?;
+
+    let mut buf = [0u8; 2048];
+    let n = tokio::time::timeout(Duration::from_secs(10), sock.recv(&mut buf))
+        .await
+        .map_err(|_| TrackerError::Unreachable("udp announce timed out".into()))?
+        .map_err(|e| TrackerError::Unreachable(e.to_string()))?;
+    parse_udp_announce(&buf[..n], tx)
+}
+
+/// The 36-byte BEP 15 scrape request for one infohash.
+fn udp_scrape_packet(conn_id: i64, tx: i32, infohash: InfoHash) -> Vec<u8> {
+    let mut a = Vec::with_capacity(36);
+    a.extend_from_slice(&conn_id.to_be_bytes());
+    a.extend_from_slice(&2i32.to_be_bytes()); // action = scrape
+    a.extend_from_slice(&tx.to_be_bytes());
+    a.extend_from_slice(&infohash.0);
+    a
+}
+
+/// Scrape reply: action, transaction id, then per torrent seeders, completed
+/// and leechers (4 bytes each).
+fn parse_udp_scrape(buf: &[u8], tx: i32) -> Result<ScrapeResult, TrackerError> {
+    if buf.len() < 8 {
+        return Err(TrackerError::BadResponse("short udp scrape reply".into()));
+    }
+    let action = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if action == 3 {
+        let msg = String::from_utf8_lossy(&buf[8..]).into_owned();
+        return Err(TrackerError::Failure(msg));
+    }
+    if action != 2 || buf.len() < 20 {
+        return Err(TrackerError::BadResponse(format!(
+            "unexpected udp scrape reply (action {action}, {} bytes)",
+            buf.len()
+        )));
+    }
+    let rtx = i32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if rtx != tx {
+        return Err(TrackerError::BadResponse("udp scrape txid mismatch".into()));
+    }
+    let word = |at: usize| count(i32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as i64);
+    Ok(ScrapeResult {
+        complete: word(8),
+        downloaded: word(12),
+        incomplete: word(16),
+    })
+}
+
+async fn scrape_udp(url: &str, infohash: InfoHash) -> Result<ScrapeResult, TrackerError> {
+    let (sock, conn_id) = udp_connect(url).await?;
+
+    let tx: i32 = rand::random();
+    sock.send(&udp_scrape_packet(conn_id, tx, infohash))
+        .await
+        .map_err(|e| TrackerError::Unreachable(e.to_string()))?;
+
+    let mut buf = [0u8; 2048];
+    let n = tokio::time::timeout(Duration::from_secs(10), sock.recv(&mut buf))
+        .await
+        .map_err(|_| TrackerError::Unreachable("udp scrape timed out".into()))?
+        .map_err(|e| TrackerError::Unreachable(e.to_string()))?;
+    parse_udp_scrape(&buf[..n], tx)
 }
 
 // -------------------------------------------------------------------- helpers
@@ -576,7 +789,7 @@ mod tests {
             .unwrap();
         let hash = InfoHash([0u8; 20]);
         let err = rt
-            .block_on(announce("wss://x/announce", hash, 6881, 0, 0, 0, 50, true))
+            .block_on(announce("wss://x/announce", hash, 6881, 0, 0, 0, None, 50, true))
             .unwrap_err();
         assert!(matches!(err, TrackerError::UnsupportedScheme(_)));
     }
@@ -603,6 +816,7 @@ mod tests {
                 0,
                 0,
                 0,
+                None,
                 50,
                 true,
             ))
@@ -629,7 +843,7 @@ mod tests {
         let hash = InfoHash([0u8; 20]);
         for bad in ["wss://x/announce", "ftp://x/announce", "file:///tmp/x"] {
             let err = rt
-                .block_on(announce(bad, hash, 6881, 0, 0, 0, 50, true))
+                .block_on(announce(bad, hash, 6881, 0, 0, 0, None, 50, true))
                 .unwrap_err();
             assert!(
                 matches!(err, TrackerError::UnsupportedScheme(_)),
@@ -688,7 +902,7 @@ mod tests {
                     tokio::time::sleep(delay).await;
                     let mut peers = vec![127, 0, 0, 1];
                     peers.extend_from_slice(&peer_port.to_be_bytes());
-                    let mut body = b"d8:intervali1800e5:peers6:".to_vec();
+                    let mut body = b"d8:completei1e10:incompletei1e8:intervali1800e5:peers6:".to_vec();
                     body.extend_from_slice(&peers);
                     body.push(b'e');
                     let mut resp = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
@@ -709,8 +923,8 @@ mod tests {
         let dead = "http://127.0.0.1:1/announce".to_owned();
 
         let start = std::time::Instant::now();
-        let (mut peers, errors) =
-            announce_all(&[a, b, dead.clone()], &test_meta(), 6881, 1234, 55, 100).await;
+        let AnnounceOutcome { mut peers, errors, .. } =
+            announce_all(&[a, b, dead.clone()], &test_meta(), 6881, 1234, 55, 100, None).await;
         let elapsed = start.elapsed();
 
         peers.sort_by_key(|p| p.port);
@@ -747,6 +961,7 @@ mod tests {
             assert_eq!(&buf[8..12], &1i32.to_be_bytes());
             let field = |at: usize| i64::from_be_bytes(buf[at..at + 8].try_into().unwrap());
             assert_eq!((field(56), field(64), field(72)), (55, 100, 1234));
+            assert_eq!(&buf[80..84], &0i32.to_be_bytes());
             let mut reply = 1i32.to_be_bytes().to_vec();
             reply.extend_from_slice(&buf[12..16]);
             reply.extend_from_slice(&900i32.to_be_bytes());
@@ -756,12 +971,229 @@ mod tests {
             sock.send_to(&reply, from).await.unwrap();
         });
 
-        let res = announce(&url, InfoHash([7; 20]), 6881, 1234, 55, 100, 50, true)
+        let res = announce(&url, InfoHash([7; 20]), 6881, 1234, 55, 100, None, 50, true)
             .await
             .unwrap();
         tracker.await.unwrap();
         assert_eq!(res.interval, Duration::from_secs(900));
         let ports: Vec<u16> = res.peers.iter().map(|p| p.port).collect();
         assert_eq!(ports, [6881, 6882]);
+        assert_eq!((res.seeders, res.leechers), (Some(7), Some(3)));
+    }
+
+    fn params(event: Option<Event>) -> AnnounceParams {
+        AnnounceParams {
+            infohash: InfoHash([7; 20]),
+            port: 6881,
+            uploaded: 1,
+            downloaded: 2,
+            left: 3,
+            event,
+            numwant: 50,
+            compact: true,
+        }
+    }
+
+    #[test]
+    fn http_query_carries_each_event_and_omits_none() {
+        let id = [1u8; 20];
+        for (event, expect) in [
+            (Some(Event::Started), Some("&event=started")),
+            (Some(Event::Completed), Some("&event=completed")),
+            (Some(Event::Stopped), Some("&event=stopped")),
+            (None, None),
+        ] {
+            let url = http_announce_url("http://t/announce", &params(event), &id);
+            match expect {
+                Some(e) => assert!(url.ends_with(e), "{url}"),
+                None => assert!(!url.contains("event="), "{url}"),
+            }
+            assert!(url.contains("?info_hash="), "{url}");
+        }
+        let url = http_announce_url("http://t/announce?key=v", &params(None), &id);
+        assert!(url.starts_with("http://t/announce?key=v&info_hash="), "{url}");
+    }
+
+    #[test]
+    fn udp_packet_encodes_event_codes() {
+        let id = [1u8; 20];
+        for (event, code) in [
+            (None, 0i32),
+            (Some(Event::Completed), 1),
+            (Some(Event::Started), 2),
+            (Some(Event::Stopped), 3),
+        ] {
+            let pkt = udp_announce_packet(42, 9, &params(event), &id, 5);
+            assert_eq!(pkt.len(), 98);
+            assert_eq!(&pkt[80..84], &code.to_be_bytes());
+            assert_eq!(&pkt[96..98], &6881u16.to_be_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn http_announce_sends_the_event() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = mock_tracker(Duration::ZERO, 1111, seen.clone()).await;
+        announce(&url, InfoHash([7; 20]), 6881, 0, 0, 0, Some(Event::Completed), 50, true)
+            .await
+            .unwrap();
+        announce(&url, InfoHash([7; 20]), 6881, 0, 0, 0, None, 50, true)
+            .await
+            .unwrap();
+        let reqs = seen.lock().unwrap();
+        assert!(reqs[0].contains("&event=completed "), "{}", reqs[0]);
+        assert!(!reqs[1].contains("event="), "{}", reqs[1]);
+    }
+
+    #[test]
+    fn scrape_url_replaces_the_announce_segment() {
+        let cases = [
+            ("http://t.example/announce", Some("http://t.example/scrape")),
+            ("http://t.example:8080/x/announce.php?k=1", Some("http://t.example:8080/x/scrape.php?k=1")),
+            ("https://t.example/pass/announce", Some("https://t.example/pass/scrape")),
+            ("http://t.example/tracker", None),
+            ("http://t.example/announce/pass", None),
+            ("http://announce", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(scrape_url(input).as_deref(), want, "{input}");
+        }
+    }
+
+    fn scrape_body(hash: &[u8], complete: i64, downloaded: i64, incomplete: i64) -> Vec<u8> {
+        use bencode::Value;
+        let entry = Value::Dict(std::collections::BTreeMap::from([
+            (b"complete".to_vec(), Value::Int(complete)),
+            (b"downloaded".to_vec(), Value::Int(downloaded)),
+            (b"incomplete".to_vec(), Value::Int(incomplete)),
+        ]));
+        let files = Value::Dict(std::collections::BTreeMap::from([(hash.to_vec(), entry)]));
+        let mut resp = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        resp.extend(bencode::encode(&Value::Dict(std::collections::BTreeMap::from([(
+            b"files".to_vec(),
+            files,
+        )]))));
+        resp
+    }
+
+    #[test]
+    fn parses_http_scrape_reply() {
+        let hash = InfoHash([7; 20]);
+        let got = parse_scrape_response(&scrape_body(&hash.0, 5, 50, 10), hash).unwrap();
+        assert_eq!(
+            got,
+            ScrapeResult { complete: 5, incomplete: 10, downloaded: 50 }
+        );
+        assert!(parse_scrape_response(&scrape_body(&[9; 20], 5, 50, 10), hash).is_err());
+        let neg = parse_scrape_response(&scrape_body(&hash.0, -1, 0, 0), hash).unwrap();
+        assert_eq!(neg.complete, 0);
+        assert!(parse_scrape_response(b"HTTP/1.1 200 OK\r\n\r\nd5:filesi1ee", hash).is_err());
+    }
+
+    #[test]
+    fn http_announce_reply_counts_are_parsed() {
+        let resp = b"HTTP/1.1 200 OK\r\n\r\nd8:completei12e10:incompletei34e8:intervali900e5:peers0:e";
+        let res = parse_http_response(resp).unwrap();
+        assert_eq!((res.seeders, res.leechers), (Some(12), Some(34)));
+        let res = parse_http_response(b"HTTP/1.1 200 OK\r\n\r\nd8:intervali900e5:peers0:e").unwrap();
+        assert_eq!((res.seeders, res.leechers), (None, None));
+    }
+
+    #[test]
+    fn udp_scrape_encodes_and_parses() {
+        let pkt = udp_scrape_packet(42, 9, InfoHash([7; 20]));
+        assert_eq!(pkt.len(), 36);
+        assert_eq!(&pkt[8..12], &2i32.to_be_bytes());
+        assert_eq!(&pkt[16..36], &[7u8; 20]);
+
+        let mut reply = 2i32.to_be_bytes().to_vec();
+        reply.extend_from_slice(&9i32.to_be_bytes());
+        for v in [5i32, 50, 10] {
+            reply.extend_from_slice(&v.to_be_bytes());
+        }
+        assert_eq!(
+            parse_udp_scrape(&reply, 9).unwrap(),
+            ScrapeResult { complete: 5, downloaded: 50, incomplete: 10 }
+        );
+        assert!(parse_udp_scrape(&reply, 8).is_err());
+        assert!(parse_udp_scrape(&reply[..12], 9).is_err());
+        assert!(parse_udp_scrape(&[], 9).is_err());
+        let mut err = 3i32.to_be_bytes().to_vec();
+        err.extend_from_slice(&9i32.to_be_bytes());
+        err.extend_from_slice(b"nope");
+        assert!(matches!(parse_udp_scrape(&err, 9), Err(TrackerError::Failure(_))));
+    }
+
+    /// Answers announces with `announce_counts` (if any) and scrapes with
+    /// `(complete, incomplete)`, recording each request line.
+    async fn counting_tracker(
+        announce_counts: Option<(i64, i64)>,
+        scrape_counts: (i64, i64),
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> String {
+        use bencode::Value;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = s.read(&mut buf).await.unwrap();
+                    let line = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap().to_owned();
+                    seen.lock().unwrap().push(line.clone());
+                    let resp = if line.contains("/scrape?") {
+                        scrape_body(&[7; 20], scrape_counts.0, 0, scrape_counts.1)
+                    } else {
+                        let mut d = std::collections::BTreeMap::from([
+                            (b"interval".to_vec(), Value::Int(1800)),
+                            (b"peers".to_vec(), Value::Bytes(vec![])),
+                        ]);
+                        if let Some((c, i)) = announce_counts {
+                            d.insert(b"complete".to_vec(), Value::Int(c));
+                            d.insert(b"incomplete".to_vec(), Value::Int(i));
+                        }
+                        let mut r = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+                        r.extend(bencode::encode(&Value::Dict(d)));
+                        r
+                    };
+                    let _ = s.write_all(&resp).await;
+                });
+            }
+        });
+        format!("http://{addr}/announce")
+    }
+
+    #[tokio::test]
+    async fn announce_all_prefers_announce_counts_and_scrapes_only_when_missing() {
+        let seen_a = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_b = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let with_counts = counting_tracker(Some((3, 4)), (99, 99), seen_a.clone()).await;
+        let without = counting_tracker(None, (10, 2), seen_b.clone()).await;
+
+        let out = announce_all(&[with_counts], &test_meta(), 6881, 0, 0, 0, None).await;
+        assert_eq!((out.seeders, out.leechers), (Some(3), Some(4)));
+        assert_eq!(seen_a.lock().unwrap().len(), 1, "no scrape needed");
+
+        let out = announce_all(&[without.clone()], &test_meta(), 6881, 0, 0, 0, None).await;
+        assert_eq!((out.seeders, out.leechers), (Some(10), Some(2)));
+        assert_eq!(seen_b.lock().unwrap().len(), 2);
+
+        let both = counting_tracker(Some((3, 4)), (99, 99), seen_a.clone()).await;
+        let out = announce_all(&[both, without], &test_meta(), 6881, 0, 0, 0, None).await;
+        assert_eq!((out.seeders, out.leechers), (Some(10), Some(4)), "max across trackers");
+    }
+
+    #[tokio::test]
+    async fn stopped_announce_skips_scrape_and_asks_for_no_peers() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = counting_tracker(None, (10, 2), seen.clone()).await;
+        let out = announce_all(&[url], &test_meta(), 6881, 0, 0, 0, Some(Event::Stopped)).await;
+        assert_eq!(out.seeders, None);
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].contains("numwant=0") && reqs[0].contains("event=stopped"), "{}", reqs[0]);
     }
 }

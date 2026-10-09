@@ -25,10 +25,10 @@ use crate::peer::wire::{handshake_incoming, Handshake};
 use crate::portmap;
 use crate::ratelimit::{Limits, RateLimiter};
 use crate::state::{
-    human_bytes, Command, DownloadState, Level, SessionCommand, SessionState, Settings,
+    human_bytes, Command, DownloadState, FilePriority, FileSummary, Level, SessionCommand, SessionState, Settings,
     TorrentSummary, TorrentView, UiState,
 };
-use crate::store::{Record, Store};
+use crate::store::{Record, Snapshot, Store};
 
 const TICK: Duration = Duration::from_millis(250);
 const PERSIST_EVERY: Duration = Duration::from_secs(30);
@@ -277,14 +277,11 @@ impl Core {
                 Err(err) => self.log(Level::Warn, format!("skipping stored torrent {id}: {err:#}")).await,
             }
         }
-        for i in 0..self.entries.len() {
-            if self.entries[i].rec.stopped {
-                let e = &self.entries[i];
-                stub_ui(e, DownloadState::Stopped).await;
-            } else {
-                self.start_entry(i).await;
-            }
+        for e in &self.entries {
+            let state = if e.rec.stopped { DownloadState::Stopped } else { DownloadState::Queued };
+            stub_ui(e, state).await;
         }
+        self.rebalance().await;
         for q in self.store.take_queue() {
             self.add(q.source, q.dir).await;
         }
@@ -327,6 +324,7 @@ impl Core {
                 },
                 _ = ticker.tick() => {
                     self.poll_entries().await;
+                    self.rebalance().await;
                     if last_persist.elapsed() >= PERSIST_EVERY {
                         last_persist = std::time::Instant::now();
                         self.save_all().await;
@@ -373,29 +371,38 @@ impl Core {
         match cmd {
             SessionCommand::Add { source, dir } => self.add(source, dir).await,
             SessionCommand::Remove { id, delete_data } => self.remove(&id, delete_data).await,
+            SessionCommand::MoveQueue { id, up } => self.move_queue(&id, up).await,
             SessionCommand::Start(id) => {
                 if let Some(i) = self.find(&id) {
                     if self.entries[i].run.is_none() {
-                        self.start_entry(i).await;
+                        let queued = !self.entries[i].rec.stopped
+                            && matches!(self.entries[i].ui.read().await.torrent.as_ref().map(|t| t.state), Some(DownloadState::Queued));
+                        self.entries[i].rec.force = queued;
+                        self.entries[i].rec.stopped = false;
+                        stub_ui(&self.entries[i], DownloadState::Queued).await;
+                        self.rebalance().await;
                         self.save(i).await;
                     }
                 }
             }
-            SessionCommand::Stop(id) => {
+            SessionCommand::Stop(id) | SessionCommand::Torrent(id, Command::Stop) => {
                 if let Some(i) = self.find(&id) {
                     self.stop_entry(i, true).await;
                     self.save(i).await;
-                }
-            }
-            SessionCommand::Torrent(id, Command::Stop) => {
-                if let Some(i) = self.find(&id) {
-                    self.stop_entry(i, true).await;
-                    self.save(i).await;
+                    self.rebalance().await;
                 }
             }
             SessionCommand::Torrent(id, c) => {
-                if let Some(run) = self.find(&id).and_then(|i| self.entries[i].run.as_ref()) {
-                    let _ = run.cmd.send(c);
+                if let Some(i) = self.find(&id) {
+                    match &self.entries[i].run {
+                        Some(run) => {
+                            let _ = run.cmd.send(c);
+                        }
+                        None if c == Command::Recheck => {
+                            self.log(Level::Info, "recheck needs a running torrent; start it first").await;
+                        }
+                        None => {}
+                    }
                 }
             }
             SessionCommand::SetTorrentLimits { id, download, upload } => {
@@ -411,6 +418,7 @@ impl Core {
             SessionCommand::SetSettings(s) => self.set_settings(s).await,
             SessionCommand::Quit => {}
         }
+        self.rebalance().await;
     }
 
     fn find(&self, id: &str) -> Option<usize> {
@@ -428,7 +436,9 @@ impl Core {
                 };
                 self.entries.push(entry);
                 let i = self.entries.len() - 1;
-                self.start_entry(i).await;
+                self.entries[i].rec.queue = i as u64;
+                stub_ui(&self.entries[i], DownloadState::Queued).await;
+                self.rebalance().await;
                 self.save(i).await;
                 self.log(Level::Info, format!("added {name}")).await;
             }
@@ -445,7 +455,10 @@ impl Core {
             uploaded: 0,
             download_limit: 0,
             upload_limit: 0,
-            wanted: None,
+            priorities: None,
+            queue: 0,
+            force: false,
+            snapshot: None,
             magnet: None,
         };
         let (ih, meta, magnet) = if source.starts_with("magnet:") {
@@ -493,7 +506,7 @@ impl Core {
             dht_enabled: self.settings.dht,
             inbound: Some(in_rx),
             port: self.port,
-            wanted_files: e.rec.wanted.clone(),
+            file_priorities: e.rec.priorities.clone(),
         };
         let ui = Arc::clone(&e.ui);
         let dir = e.rec.dir.clone();
@@ -531,7 +544,89 @@ impl Core {
         refresh(e).await;
         if mark {
             e.rec.stopped = true;
+            e.rec.force = false;
         }
+    }
+
+    async fn is_candidate(e: &Entry) -> bool {
+        !e.rec.stopped
+            && !matches!(e.ui.read().await.torrent.as_ref().map(|t| t.state), Some(DownloadState::Error))
+    }
+
+    async fn is_complete(e: &Entry) -> bool {
+        let ui = e.ui.read().await;
+        let done = ui.torrent.as_ref().is_some_and(|t| {
+            matches!(t.state, DownloadState::Seeding | DownloadState::Complete)
+                || (t.piece_count > 0 && t.verified_pieces == t.piece_count)
+        });
+        done || (e.run.is_none() && e.rec.snapshot.as_ref().is_some_and(|s| s.complete))
+    }
+
+    /// Start and stop torrents so the queue limits hold: forced torrents
+    /// always run and use no slot, the rest run in queue order while slots remain.
+    async fn rebalance(&mut self) {
+        let (max_dl, max_all) = (self.settings.max_active_downloads, self.settings.max_active_torrents);
+        let n = self.entries.len();
+        let (mut cand, mut done, mut plan) = (vec![false; n], vec![false; n], vec![false; n]);
+        let (mut dl, mut all) = (0, 0);
+        for i in 0..n {
+            let e = &self.entries[i];
+            cand[i] = Self::is_candidate(e).await;
+            if !cand[i] {
+                continue;
+            }
+            done[i] = Self::is_complete(e).await;
+            if e.rec.force {
+                plan[i] = true;
+            }
+        }
+        for i in 0..n {
+            if !cand[i] || plan[i] {
+                continue;
+            }
+            let fits = (max_all == 0 || all < max_all) && (done[i] || max_dl == 0 || dl < max_dl);
+            if fits {
+                plan[i] = true;
+                all += 1;
+                dl += !done[i] as usize;
+            }
+        }
+        for i in 0..n {
+            if !cand[i] {
+                continue;
+            }
+            let running = self.entries[i].run.is_some();
+            if plan[i] && !running {
+                self.start_entry(i).await;
+                self.save(i).await;
+            } else if !plan[i] {
+                if running {
+                    self.stop_entry(i, false).await;
+                    self.save(i).await;
+                }
+                stub_ui(&self.entries[i], DownloadState::Queued).await;
+            }
+        }
+    }
+
+    async fn move_queue(&mut self, id: &str, up: bool) {
+        let Some(i) = self.find(id) else { return };
+        if self.entries[i].rec.stopped {
+            return;
+        }
+        let mut others = self.entries.iter().enumerate().filter(|(_, e)| !e.rec.stopped).map(|(j, _)| j);
+        let j = if up {
+            others.take_while(|j| *j < i).last()
+        } else {
+            others.find(|j| *j > i)
+        };
+        let Some(j) = j else { return };
+        self.entries.swap(i, j);
+        for k in 0..self.entries.len() {
+            self.entries[k].rec.queue = k as u64;
+            self.save(k).await;
+        }
+        self.rebalance().await;
     }
 
     async fn remove(&mut self, id: &str, delete_data: bool) {
@@ -544,6 +639,7 @@ impl Core {
             }
         }
         self.store.remove(id);
+        self.rebalance().await;
         self.log(
             Level::Info,
             format!("removed {}{}", e.rec.id, if delete_data { " and its files" } else { "" }),
@@ -572,6 +668,7 @@ impl Core {
             self.log(Level::Info, "ratio target applies to torrents started from now on").await;
         }
         self.state.write().await.settings = new;
+        self.rebalance().await;
     }
 
     async fn poll_entries(&mut self) {
@@ -613,6 +710,7 @@ impl Core {
                     Ok(Ok(())) => {
                         if ui.torrent.as_ref().is_some_and(|t| t.state == DownloadState::Stopped) {
                             e.rec.stopped = true;
+                            e.rec.force = false;
                         }
                     }
                     other => {
@@ -631,9 +729,9 @@ impl Core {
                 dirty = true;
             }
 
-            let wanted_before = e.rec.wanted.clone();
+            let before = e.rec.priorities.clone();
             refresh(e).await;
-            if dirty || e.rec.wanted != wanted_before {
+            if dirty || e.rec.priorities != before {
                 self.save(i).await;
             }
         }
@@ -642,6 +740,7 @@ impl Core {
     async fn aggregate(&mut self) {
         let mut views = Vec::with_capacity(self.entries.len());
         let (mut down, mut up) = (0.0, 0.0);
+        let mut position = 0;
         for e in &self.entries {
             let mut ui = e.ui.read().await.clone();
             ui.command_tx = None;
@@ -658,6 +757,12 @@ impl Core {
                 download_limit: e.rec.download_limit,
                 upload_limit: e.rec.upload_limit,
                 added_at: e.rec.added_at,
+                queue_position: if e.rec.stopped {
+                    None
+                } else {
+                    position += 1;
+                    Some(position - 1)
+                },
             });
         }
         let mut st = self.state.write().await;
@@ -718,36 +823,77 @@ fn make_entry(rec: Record, ih: InfoHash, meta: Option<Arc<Metainfo>>, magnet: Op
     }
 }
 
-/// Give a torrent that has not published anything yet a row to show.
+/// Give a torrent that is not publishing a row to show, from its last
+/// known progress if it has any.
 async fn stub_ui(e: &Entry, state: DownloadState) {
-    let Some(meta) = &e.meta else { return };
     let mut ui = e.ui.write().await;
-    match &mut ui.torrent {
-        Some(t) => t.state = state,
-        None => {
-            ui.torrent = Some(TorrentSummary {
-                name: meta.name.clone(),
-                infohash: e.rec.id.clone(),
-                total_length: meta.total_length,
-                piece_length: meta.piece_length,
-                piece_count: meta.piece_count() as u32,
-                state,
-                download_dir: e.rec.dir.display().to_string(),
-                trackers: meta.announce_list.clone(),
-                uploaded: e.rec.uploaded,
-                ..Default::default()
-            })
-        }
+    if let Some(t) = &mut ui.torrent {
+        t.state = state;
+        return;
     }
+    let mut t = TorrentSummary {
+        infohash: e.rec.id.clone(),
+        state,
+        download_dir: e.rec.dir.display().to_string(),
+        uploaded: e.rec.uploaded,
+        ..Default::default()
+    };
+    let snap = e.rec.snapshot.as_ref();
+    match (&e.meta, &e.magnet) {
+        (Some(meta), _) => {
+            t.name = meta.name.clone();
+            t.total_length = meta.total_length;
+            t.piece_length = meta.piece_length;
+            t.piece_count = meta.piece_count() as u32;
+            t.trackers = meta.announce_list.clone();
+            let snap = snap.filter(|s| s.piece_count == t.piece_count);
+            t.files = meta
+                .files
+                .iter()
+                .enumerate()
+                .map(|(i, (path, length))| FileSummary {
+                    index: i,
+                    path: path.iter().map(|c| c.to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"),
+                    length,
+                    downloaded: snap.and_then(|s| s.files.get(i).copied()).unwrap_or(0).min(length),
+                    wanted: priority_at(e, i) != FilePriority::Skip,
+                    priority: priority_at(e, i),
+                })
+                .collect();
+            if let Some(s) = snap {
+                t.verified_pieces = s.verified_pieces;
+                t.downloaded = s.downloaded;
+                t.progress = s.progress;
+            }
+        }
+        (_, Some(m)) => t.name = m.display_name.clone().unwrap_or_else(|| e.rec.id.clone()),
+        _ => return,
+    }
+    ui.torrent = Some(t);
 }
 
-/// Pull the engine's cumulative upload total and file selection into the record.
+fn priority_at(e: &Entry, i: usize) -> FilePriority {
+    e.rec.priorities.as_ref().and_then(|p| p.get(i).copied()).unwrap_or_default()
+}
+
+/// Pull the engine's upload total, file priorities and progress into the record.
 async fn refresh(e: &mut Entry) {
     let ui = e.ui.read().await;
     if let Some(t) = &ui.torrent {
         e.rec.uploaded = e.rec.uploaded.max(t.uploaded);
         if !t.files.is_empty() {
-            e.rec.wanted = Some(t.files.iter().map(|f| f.wanted).collect());
+            e.rec.priorities = Some(t.files.iter().map(|f| f.priority).collect());
+            e.rec.snapshot = Some(Snapshot {
+                name: t.name.clone(),
+                total_length: t.total_length,
+                piece_count: t.piece_count,
+                verified_pieces: t.verified_pieces,
+                downloaded: t.downloaded,
+                progress: t.progress,
+                complete: matches!(t.state, DownloadState::Seeding | DownloadState::Complete)
+                    || (t.piece_count > 0 && t.verified_pieces == t.piece_count),
+                files: t.files.iter().map(|f| f.downloaded).collect(),
+            });
         }
     }
 }

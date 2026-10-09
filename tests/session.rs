@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, RwLock};
 use torrust::bencode::{encode, Value};
 use torrust::engine::{build_seeder, Engine};
 use torrust::session::{Session, SessionHandle};
-use torrust::state::{DownloadState, SessionCommand, SessionState, Settings, UiState};
+use torrust::state::{Command, DownloadState, FilePriority, SessionCommand, SessionState, Settings, UiState};
 use torrust::storage::{sha1_bytes, Storage};
 use torrust::store::Store;
 use torrust::Metainfo;
@@ -396,5 +396,142 @@ async fn ipc_add_delivers_to_running_session_and_queues_otherwise() {
     assert_eq!(send_add_to(&store2, &p.display().to_string(), Some(&dl)).await.unwrap(), Delivery::Queued);
     let h = Session::start_in(store2, settings(&dl)).await.unwrap();
     assert!(h.state().read().await.torrents.iter().any(|t| t.id == id));
+    quit(h).await;
+}
+
+fn queued(st: &SessionState, id: &str) -> bool {
+    torrent_state(st, id) == Some(DownloadState::Queued)
+}
+
+fn position(st: &SessionState, id: &str) -> Option<usize> {
+    st.torrents.iter().find(|t| t.id == id)?.queue_position
+}
+
+#[tokio::test]
+async fn queue_runs_one_download_at_a_time_and_advances() {
+    let fxs = [Fixture::new("q1", 11), Fixture::new("q2", 12), Fixture::new("q3", 13)];
+    let dl = temp_dir("dl");
+    let mut ids = Vec::new();
+    let mut paths = Vec::new();
+    for fx in &fxs {
+        let t = mock_tracker(Some(seeder_for(fx).await)).await;
+        let (p, id) = write_torrent(fx, &t);
+        paths.push(p);
+        ids.push(id);
+    }
+    let mut s = settings(&dl);
+    s.max_active_downloads = 1;
+    let h = Session::start_in(Store::at(temp_dir("home")), s).await.unwrap();
+    for p in &paths {
+        add(&h, p, &dl);
+    }
+    wait_for(&h, "one running, two queued", 20, |st| {
+        st.torrents.len() == 3 && !queued(st, &ids[0]) && queued(st, &ids[1]) && queued(st, &ids[2])
+    })
+    .await;
+    wait_for(&h, "first done", 60, |st| is_done(torrent_state(st, &ids[0]))).await;
+    wait_for(&h, "all done in turn", 60, |st| ids.iter().all(|id| is_done(torrent_state(st, id)))).await;
+    for fx in &fxs {
+        fx.assert_on_disk(&dl);
+    }
+    quit(h).await;
+}
+
+#[tokio::test]
+async fn move_queue_and_force_start() {
+    let fxs = [Fixture::new("m1", 21), Fixture::new("m2", 22), Fixture::new("m3", 23)];
+    let dl = temp_dir("dl");
+    let t = mock_tracker(None).await;
+    let mut ids = Vec::new();
+    let mut paths = Vec::new();
+    for fx in &fxs {
+        let (p, id) = write_torrent(fx, &t);
+        paths.push(p);
+        ids.push(id);
+    }
+    let mut s = settings(&dl);
+    s.max_active_downloads = 1;
+    let h = Session::start_in(Store::at(temp_dir("home")), s).await.unwrap();
+    for p in &paths {
+        add(&h, p, &dl);
+    }
+    wait_for(&h, "initial queue", 20, |st| {
+        st.torrents.len() == 3 && !queued(st, &ids[0]) && queued(st, &ids[1]) && queued(st, &ids[2])
+    })
+    .await;
+    {
+        let st = h.state();
+        let st = st.read().await;
+        assert_eq!(ids.iter().map(|id| position(&st, id)).collect::<Vec<_>>(), vec![Some(0), Some(1), Some(2)]);
+    }
+
+    let mv = |id: &str| h.command().send(SessionCommand::MoveQueue { id: id.to_owned(), up: true }).unwrap();
+    mv(&ids[2]);
+    wait_for(&h, "third moved to slot 1", 10, |st| position(st, &ids[2]) == Some(1) && position(st, &ids[1]) == Some(2)).await;
+    assert!(queued(&*h.state().read().await, &ids[2]));
+    mv(&ids[2]);
+    wait_for(&h, "third now runs, first queued", 20, |st| {
+        position(st, &ids[2]) == Some(0) && !queued(st, &ids[2]) && queued(st, &ids[0]) && queued(st, &ids[1])
+    })
+    .await;
+
+    h.command().send(SessionCommand::Start(ids[1].clone())).unwrap();
+    wait_for(&h, "force start alongside", 20, |st| {
+        !queued(st, &ids[1]) && !queued(st, &ids[2]) && queued(st, &ids[0])
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!queued(&*h.state().read().await, &ids[1]), "forced torrent was re-queued");
+
+    h.command().send(SessionCommand::SetSettings(Settings { max_active_downloads: 0, ..settings(&dl) })).unwrap();
+    wait_for(&h, "unlimited starts the rest", 20, |st| !queued(st, &ids[0])).await;
+    quit(h).await;
+}
+
+#[tokio::test]
+async fn restart_restores_saved_progress_and_priorities() {
+    let fx = Fixture::new("p1", 31);
+    let dl = temp_dir("dl");
+    fx.write_to(&dl);
+    let t = mock_tracker(None).await;
+    let (p, id) = write_torrent(&fx, &t);
+    let home = temp_dir("home");
+
+    let h = Session::start_in(Store::at(&home), settings(&dl)).await.unwrap();
+    add(&h, &p, &dl);
+    wait_for(&h, "seeding", 30, |st| is_done(torrent_state(st, &id))).await;
+    let set = |i, p| h.command().send(SessionCommand::Torrent(id.clone(), Command::SetFilePriority(i, p))).unwrap();
+    set(0, FilePriority::High);
+    set(1, FilePriority::Skip);
+    let published = |st: &SessionState| {
+        st.torrents.iter().find(|t| t.id == id).and_then(|t| t.ui.torrent.as_ref()).is_some_and(|t| {
+            t.files.len() == 3 && t.files[0].priority == FilePriority::High && t.files[1].priority == FilePriority::Skip
+        })
+    };
+    wait_for(&h, "priorities published", 15, published).await;
+    h.command().send(SessionCommand::Stop(id.clone())).unwrap();
+    wait_for(&h, "stopped", 15, |st| torrent_state(st, &id) == Some(DownloadState::Stopped)).await;
+    quit(h).await;
+
+    let (records, _) = Store::at(&home).load_records();
+    let snap = records[0].snapshot.clone().expect("snapshot saved");
+    assert!(snap.verified_pieces > 0 && snap.progress > 0.0);
+
+    let h = Session::start_in(Store::at(&home), settings(&dl)).await.unwrap();
+    {
+        let st = h.state();
+        let st = st.read().await;
+        let t = st.torrents[0].ui.torrent.as_ref().unwrap();
+        assert_eq!(t.state, DownloadState::Stopped);
+        assert!(t.progress > 0.0 && t.verified_pieces == snap.verified_pieces, "stopped torrent shows {}", t.progress);
+        assert_eq!(t.files[0].priority, FilePriority::High);
+        assert_eq!(t.files[1].priority, FilePriority::Skip);
+        assert_eq!(st.torrents[0].queue_position, None);
+    }
+    h.command().send(SessionCommand::Start(id.clone())).unwrap();
+    wait_for(&h, "engine publishes restored priorities", 30, |st| {
+        is_done(torrent_state(st, &id)) && published(st)
+    })
+    .await;
     quit(h).await;
 }

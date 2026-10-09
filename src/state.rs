@@ -17,6 +17,10 @@ pub enum DownloadState {
     Complete,
     /// Finished and still uploading until the ratio target is reached.
     Seeding,
+    /// Waiting for a free slot under the session's active-torrent limits.
+    Queued,
+    /// Re-hashing the data on disk (startup or a forced recheck).
+    Checking,
     Error,
     Stopped,
 }
@@ -31,6 +35,8 @@ impl DownloadState {
             DownloadState::Paused => "paused",
             DownloadState::Complete => "complete",
             DownloadState::Seeding => "seeding",
+            DownloadState::Queued => "queued",
+            DownloadState::Checking => "checking",
             DownloadState::Error => "error",
             DownloadState::Stopped => "stopped",
         }
@@ -142,7 +148,31 @@ pub struct FileSummary {
     pub downloaded: u64,
     /// False when the user skipped this file. Its bytes are never requested,
     /// though pieces shared with wanted files still arrive.
+    /// Always equal to `priority != FilePriority::Skip`.
     pub wanted: bool,
+    pub priority: FilePriority,
+}
+
+/// Download priority of one file. Pieces of higher-priority files are
+/// requested first; `Skip` files are not downloaded at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FilePriority {
+    Skip,
+    Low,
+    #[default]
+    Normal,
+    High,
+}
+
+impl FilePriority {
+    pub fn label(self) -> &'static str {
+        match self {
+            FilePriority::Skip => "skip",
+            FilePriority::Low => "low",
+            FilePriority::Normal => "normal",
+            FilePriority::High => "high",
+        }
+    }
 }
 
 impl FileSummary {
@@ -174,6 +204,10 @@ pub enum Command {
     /// Shut the engine down gracefully; `Engine::run` returns `Ok` with the
     /// torrent marked [`DownloadState::Stopped`].
     Stop,
+    /// Re-hash every piece on disk and continue from what verifies.
+    Recheck,
+    /// Set one file's priority by file-list index.
+    SetFilePriority(usize, FilePriority),
     /// Change the connection cap while running.
     SetMaxPeers(usize),
 }
@@ -199,6 +233,10 @@ pub struct Settings {
     pub dht: bool,
     /// Ask the router (NAT-PMP, then UPnP) to forward `listen_port`.
     pub port_forwarding: bool,
+    /// Queue limits: at most this many torrents downloading, and this many
+    /// running in total (downloading + seeding). 0 means no limit.
+    pub max_active_downloads: usize,
+    pub max_active_torrents: usize,
 }
 
 impl Default for Settings {
@@ -214,6 +252,8 @@ impl Default for Settings {
             upload_limit: 0,
             ratio_target: 2.0,
             max_peers: 50,
+            max_active_downloads: 3,
+            max_active_torrents: 8,
             dht: true,
             port_forwarding: true,
         }
@@ -236,6 +276,8 @@ pub struct TorrentView {
     pub upload_limit: u64,
     /// Unix seconds when the torrent was added.
     pub added_at: u64,
+    /// Position in the queue (0 = first), or `None` for a stopped torrent.
+    pub queue_position: Option<usize>,
 }
 
 /// Everything the session TUI renders. Published by the session every
@@ -286,6 +328,8 @@ pub enum SessionCommand {
     /// Forward a per-torrent command (pause, resume, file toggle).
     Torrent(TorrentId, Command),
     SetTorrentLimits { id: TorrentId, download: u64, upload: u64 },
+    /// Move a torrent one place up (`true`) or down in the queue.
+    MoveQueue { id: TorrentId, up: bool },
     SetSettings(Settings),
     /// Persist everything and shut down.
     Quit,

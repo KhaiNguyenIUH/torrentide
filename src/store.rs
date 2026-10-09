@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::bencode::{self, Value};
-use crate::state::{Settings, TorrentId};
+use crate::state::{FilePriority, Settings, TorrentId};
 
 /// Where the session keeps its files. `TORRUST_HOME` overrides the platform
 /// default.
@@ -51,9 +51,27 @@ pub struct Record {
     pub uploaded: u64,
     pub download_limit: u64,
     pub upload_limit: u64,
-    pub wanted: Option<Vec<bool>>,
+    pub priorities: Option<Vec<FilePriority>>,
+    /// Queue position; records are loaded in this order.
+    pub queue: u64,
+    /// Started past the queue limits; cleared when the torrent is stopped.
+    pub force: bool,
+    /// What the torrent last showed, so it renders real progress while not running.
+    pub snapshot: Option<Snapshot>,
     /// The magnet URI, kept until the metadata has been fetched and stored.
     pub magnet: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Snapshot {
+    pub name: String,
+    pub total_length: u64,
+    pub piece_count: u32,
+    pub verified_pieces: u32,
+    pub downloaded: u64,
+    pub progress: f64,
+    pub complete: bool,
+    pub files: Vec<u64>,
 }
 
 /// A `torrust add` left for the next session to pick up.
@@ -137,7 +155,7 @@ impl Store {
         let _ = fs::remove_file(self.state_path(id));
     }
 
-    /// Every readable record, oldest first, plus a warning per skipped file.
+    /// Every readable record in queue order, plus a warning per skipped file.
     pub fn load_records(&self) -> (Vec<Record>, Vec<String>) {
         let mut out = Vec::new();
         let mut warnings = Vec::new();
@@ -168,7 +186,7 @@ impl Store {
                 }
             }
         }
-        out.sort_by(|a, b| a.added_at.cmp(&b.added_at).then(a.id.cmp(&b.id)));
+        out.sort_by(|a, b| a.queue.cmp(&b.queue).then(a.added_at.cmp(&b.added_at)).then(a.id.cmp(&b.id)));
         (out, warnings)
     }
 
@@ -247,6 +265,8 @@ fn encode_settings(s: &Settings) -> Vec<u8> {
     d.insert(b"max_peers".to_vec(), int(s.max_peers as u64));
     d.insert(b"dht".to_vec(), int(s.dht as u64));
     d.insert(b"port_forwarding".to_vec(), int(s.port_forwarding as u64));
+    d.insert(b"max_active_downloads".to_vec(), int(s.max_active_downloads as u64));
+    d.insert(b"max_active_torrents".to_vec(), int(s.max_active_torrents as u64));
     bencode::encode(&Value::Dict(d))
 }
 
@@ -277,6 +297,12 @@ fn decode_settings(raw: &[u8]) -> Result<Settings> {
     if let Some(n) = v.get_int_opt("port_forwarding") {
         s.port_forwarding = n != 0;
     }
+    if let Some(n) = v.get_int_opt("max_active_downloads") {
+        s.max_active_downloads = n.max(0) as usize;
+    }
+    if let Some(n) = v.get_int_opt("max_active_torrents") {
+        s.max_active_torrents = n.max(0) as usize;
+    }
     Ok(s)
 }
 
@@ -288,11 +314,13 @@ fn encode_record(r: &Record) -> Vec<u8> {
     d.insert(b"uploaded".to_vec(), int(r.uploaded));
     d.insert(b"download_limit".to_vec(), int(r.download_limit));
     d.insert(b"upload_limit".to_vec(), int(r.upload_limit));
-    if let Some(w) = &r.wanted {
-        d.insert(
-            b"wanted".to_vec(),
-            Value::Bytes(w.iter().map(|b| if *b { b'1' } else { b'0' }).collect()),
-        );
+    if let Some(p) = &r.priorities {
+        d.insert(b"priorities".to_vec(), Value::Bytes(p.iter().map(|p| priority_byte(*p)).collect()));
+    }
+    d.insert(b"queue".to_vec(), int(r.queue));
+    d.insert(b"force".to_vec(), int(r.force as u64));
+    if let Some(s) = &r.snapshot {
+        d.insert(b"snapshot".to_vec(), encode_snapshot(s));
     }
     if let Some(m) = &r.magnet {
         d.insert(b"magnet".to_vec(), Value::Bytes(m.as_bytes().to_vec()));
@@ -310,10 +338,57 @@ fn decode_record(id: &str, raw: &[u8]) -> Result<Record> {
         uploaded: v.get_int_opt("uploaded").unwrap_or(0).max(0) as u64,
         download_limit: v.get_int_opt("download_limit").unwrap_or(0).max(0) as u64,
         upload_limit: v.get_int_opt("upload_limit").unwrap_or(0).max(0) as u64,
-        wanted: v
-            .get_bytes_opt("wanted")
-            .map(|b| b.iter().map(|c| *c == b'1').collect()),
+        priorities: v.get_bytes_opt("priorities").map(|b| b.iter().map(|c| byte_priority(*c)).collect()).or_else(|| {
+            v.get_bytes_opt("wanted")
+                .map(|b| b.iter().map(|c| if *c == b'1' { FilePriority::Normal } else { FilePriority::Skip }).collect())
+        }),
+        queue: v.get_int_opt("queue").unwrap_or(0).max(0) as u64,
+        force: v.get_int_opt("force").unwrap_or(0) != 0,
+        snapshot: v.get_opt("snapshot").and_then(decode_snapshot),
         magnet: v.get_str_opt("magnet").map(str::to_owned),
+    })
+}
+
+fn priority_byte(p: FilePriority) -> u8 {
+    b'0' + p as u8
+}
+
+fn byte_priority(b: u8) -> FilePriority {
+    match b {
+        b'0' => FilePriority::Skip,
+        b'1' => FilePriority::Low,
+        b'3' => FilePriority::High,
+        _ => FilePriority::Normal,
+    }
+}
+
+fn encode_snapshot(s: &Snapshot) -> Value {
+    let mut d = BTreeMap::new();
+    d.insert(b"name".to_vec(), Value::Bytes(s.name.as_bytes().to_vec()));
+    d.insert(b"total_length".to_vec(), int(s.total_length));
+    d.insert(b"piece_count".to_vec(), int(s.piece_count as u64));
+    d.insert(b"verified_pieces".to_vec(), int(s.verified_pieces as u64));
+    d.insert(b"downloaded".to_vec(), int(s.downloaded));
+    d.insert(b"progress".to_vec(), Value::Bytes(s.progress.to_string().into_bytes()));
+    d.insert(b"complete".to_vec(), int(s.complete as u64));
+    d.insert(b"files".to_vec(), Value::List(s.files.iter().map(|n| int(*n)).collect()));
+    Value::Dict(d)
+}
+
+fn decode_snapshot(v: &Value) -> Option<Snapshot> {
+    let n = |k: &str| v.get_int_opt(k).map(|n| n.max(0) as u64);
+    Some(Snapshot {
+        name: v.get_str_opt("name")?.to_owned(),
+        total_length: n("total_length")?,
+        piece_count: n("piece_count")? as u32,
+        verified_pieces: n("verified_pieces")? as u32,
+        downloaded: n("downloaded")?,
+        progress: v.get_str_opt("progress")?.parse::<f64>().ok().filter(|p| p.is_finite())?.clamp(0.0, 1.0),
+        complete: n("complete").unwrap_or(0) != 0,
+        files: match v.get_opt("files")? {
+            Value::List(l) => l.iter().map(|x| x.as_int_u64().unwrap_or(0)).collect(),
+            _ => return None,
+        },
     })
 }
 
@@ -355,6 +430,8 @@ mod tests {
             max_peers: 12,
             dht: false,
             port_forwarding: false,
+            max_active_downloads: 2,
+            max_active_torrents: 4,
         };
         store.save_settings(&s).unwrap();
         assert_eq!(store.load_settings(), s);
@@ -371,7 +448,19 @@ mod tests {
             uploaded: 1234,
             download_limit: 1,
             upload_limit: 2,
-            wanted: Some(vec![true, false, true]),
+            priorities: Some(vec![FilePriority::High, FilePriority::Skip, FilePriority::Low]),
+            queue: 2,
+            force: true,
+            snapshot: Some(Snapshot {
+                name: "n".into(),
+                total_length: 99,
+                piece_count: 7,
+                verified_pieces: 3,
+                downloaded: 40,
+                progress: 0.4242,
+                complete: false,
+                files: vec![10, 0, 30],
+            }),
             magnet: None,
         };
         store.save_torrent(&r.id, b"d4:infode").unwrap();
@@ -379,7 +468,8 @@ mod tests {
         let m = Record {
             id: "bb".repeat(20),
             magnet: Some("magnet:?xt=urn:btih:x".into()),
-            wanted: None,
+            priorities: None,
+            snapshot: None,
             ..r.clone()
         };
         store.save_record(&m).unwrap();
@@ -389,6 +479,34 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         store.remove(&r.id);
         assert_eq!(store.load_records().0.len(), 1);
+    }
+
+    #[test]
+    fn old_format_record_loads_with_defaults_and_migrated_wanted() {
+        let store = Store::at(tmp("old"));
+        let id = "dd".repeat(20);
+        let old = bencode::encode(&Value::Dict(BTreeMap::from([
+            (b"dir".to_vec(), Value::Bytes(b"/d".to_vec())),
+            (b"added_at".to_vec(), Value::Int(5)),
+            (b"wanted".to_vec(), Value::Bytes(b"101".to_vec())),
+        ])));
+        store.save_torrent(&id, b"x").unwrap();
+        write_atomic(&store.state_path(&id), &old).unwrap();
+        let (got, warnings) = store.load_records();
+        assert!(warnings.is_empty());
+        let r = &got[0];
+        assert_eq!(r.priorities, Some(vec![FilePriority::Normal, FilePriority::Skip, FilePriority::Normal]));
+        assert!(!r.force && r.snapshot.is_none() && r.queue == 0 && !r.stopped);
+    }
+
+    #[test]
+    fn old_settings_without_queue_limits_get_defaults() {
+        let store = Store::at(tmp("oldsettings"));
+        let raw = bencode::encode(&Value::Dict(BTreeMap::from([(b"listen_port".to_vec(), Value::Int(7))])));
+        write_atomic(&store.root.join("settings.bencode"), &raw).unwrap();
+        let s = store.load_settings();
+        assert_eq!(s.listen_port, 7);
+        assert_eq!(s.max_active_downloads, Settings::default().max_active_downloads);
     }
 
     #[test]

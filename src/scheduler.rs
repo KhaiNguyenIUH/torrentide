@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::metainfo::Metainfo;
+use crate::state::FilePriority;
 use crate::peer::connection::BLOCK_SIZE;
 
 /// How long a requested block may stay unanswered before it is requested
@@ -196,6 +197,8 @@ pub struct Scheduler {
     /// only when none of its bytes belong to a wanted file; pieces straddling
     /// the boundary still download.
     excluded: HashSet<u32>,
+    /// Per-piece priority band, empty meaning every piece is Normal.
+    priority: Vec<FilePriority>,
     /// Below this many pieces remaining we switch to endgame, asking every peer
     /// that claims a piece so a single slow peer cannot stall the download.
     endgame_threshold: usize,
@@ -219,6 +222,7 @@ impl Scheduler {
             request_timeout: REQUEST_TIMEOUT,
             endgame_retry: ENDGAME_RETRY,
             excluded: HashSet::new(),
+            priority: Vec::new(),
             endgame_threshold: 4,
         }
     }
@@ -229,6 +233,24 @@ impl Scheduler {
     pub fn set_excluded(&mut self, pieces: &HashSet<u32>) {
         self.excluded = pieces.clone();
         self.in_flight.retain(|(p, _), _| !self.excluded.contains(p));
+    }
+
+    /// Install per-piece priorities (see [`piece_priorities`]). Pieces whose
+    /// every file is `Skip` become the excluded set, so this subsumes
+    /// [`Scheduler::set_excluded`] for callers that track priorities.
+    pub fn set_piece_priorities(&mut self, priorities: Vec<FilePriority>) {
+        let skipped = priorities
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| **p == FilePriority::Skip)
+            .map(|(i, _)| i as u32)
+            .collect();
+        self.priority = priorities;
+        self.set_excluded(&skipped);
+    }
+
+    fn priority_of(&self, piece: u32) -> FilePriority {
+        self.priority.get(piece as usize).copied().unwrap_or_default()
     }
 
     pub fn excluded(&self) -> &HashSet<u32> {
@@ -370,8 +392,10 @@ impl Scheduler {
             .collect();
 
         if !endgame {
-            // Rarest-first: pieces held by the fewest peers go first, because
-            // they are the ones most likely to become unavailable.
+            // Priority band first (High > Normal > Low), so a file the user
+            // wants sooner is never starved by a rarer piece of a lesser one.
+            // Within a band: rarest-first, because the pieces held by the
+            // fewest peers are the ones most likely to become unavailable.
             //
             // Both criteria must live in a SINGLE sort key. Sorting by rarity
             // and then re-sorting by how much of the piece we already hold
@@ -383,6 +407,7 @@ impl Scheduler {
                 // we have most of, so pieces complete (and become seedable)
                 // sooner; then fall back to ascending index for determinism.
                 (
+                    std::cmp::Reverse(self.priority_of(*p)),
                     holders,
                     std::cmp::Reverse(self.piece_block_count(*p)),
                     *p,
@@ -443,6 +468,33 @@ pub fn excluded_pieces(meta: &Metainfo, wanted: &[bool]) -> HashSet<u32> {
             })
         })
         .collect()
+}
+
+/// Priority of every piece: the highest priority among the files overlapping
+/// it. A piece is `Skip` only when all of its files are, so a piece shared by
+/// a skipped file and a wanted one is still fetched at the wanted file's
+/// priority.
+pub fn piece_priorities(meta: &Metainfo, files: &[FilePriority]) -> Vec<FilePriority> {
+    let mut out = vec![FilePriority::Skip; meta.piece_count()];
+    let piece_len = meta.piece_length as u64;
+    if piece_len == 0 {
+        return out;
+    }
+    let mut cursor = 0u64;
+    for (i, (_, len)) in meta.files.iter().enumerate() {
+        let (fs, fe) = (cursor, cursor + len);
+        cursor = fe;
+        if fs >= fe {
+            continue;
+        }
+        let prio = files.get(i).copied().unwrap_or_default();
+        let first = (fs / piece_len) as usize;
+        let last = (((fe - 1) / piece_len) as usize).min(out.len().saturating_sub(1));
+        for slot in out.iter_mut().take(last + 1).skip(first) {
+            *slot = (*slot).max(prio);
+        }
+    }
+    out
 }
 
 /// Downloaded bytes per file, in torrent file order.
@@ -847,5 +899,84 @@ mod tests {
             length: BLOCK_SIZE,
         });
         assert_eq!(s.remaining_bytes(&m), 3 * BLOCK_SIZE as u64);
+    }
+
+    fn multi(piece_len: u32, lengths: &[u64]) -> Metainfo {
+        use crate::metainfo::{FileEntry, Files, InfoHash};
+        use std::path::PathBuf;
+        let total: u64 = lengths.iter().sum();
+        Metainfo {
+            infohash: InfoHash([0; 20]),
+            name: "root".into(),
+            piece_length: piece_len,
+            pieces: vec![[0u8; 20]; total.div_ceil(piece_len as u64) as usize],
+            files: Files::Multi {
+                files: lengths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, length)| FileEntry {
+                        path: PathBuf::from("root").join(format!("f{i}")),
+                        length: *length,
+                    })
+                    .collect(),
+            },
+            total_length: total,
+            private: false,
+            announce: None,
+            announce_list: vec![],
+        }
+    }
+
+    #[test]
+    fn priority_band_beats_rarity() {
+        let m = multi(BLOCK_SIZE, &[BLOCK_SIZE as u64; 3]);
+        let mut s = Scheduler::new(&m);
+        s.set_piece_priorities(piece_priorities(
+            &m,
+            &[FilePriority::Low, FilePriority::Normal, FilePriority::High],
+        ));
+        let rarity = HashMap::from([(0u32, 1u32), (1, 10), (2, 50)]);
+        let order: Vec<u32> = s.fill_batch(&rarity, 3).iter().map(|r| r.piece).collect();
+        assert_eq!(order, [2, 1, 0]);
+    }
+
+    #[test]
+    fn rarest_first_within_a_priority_band() {
+        let m = multi(BLOCK_SIZE, &[BLOCK_SIZE as u64; 4]);
+        let mut s = Scheduler::new(&m);
+        s.set_piece_priorities(piece_priorities(&m, &[FilePriority::High; 4]));
+        let rarity = HashMap::from([(0u32, 9u32), (1, 1), (2, 5), (3, 3)]);
+        let order: Vec<u32> = s.fill_batch(&rarity, 4).iter().map(|r| r.piece).collect();
+        assert_eq!(order, [1, 3, 2, 0]);
+    }
+
+    #[test]
+    fn skipped_files_are_never_scheduled() {
+        let m = multi(BLOCK_SIZE, &[BLOCK_SIZE as u64; 3]);
+        let mut s = Scheduler::new(&m);
+        s.set_piece_priorities(piece_priorities(
+            &m,
+            &[FilePriority::Skip, FilePriority::Normal, FilePriority::Skip],
+        ));
+        let got: Vec<u32> = s.fill_batch(&HashMap::new(), 10).iter().map(|r| r.piece).collect();
+        assert_eq!(got, [1]);
+        assert_eq!(s.excluded(), &HashSet::from([0u32, 2]));
+    }
+
+    #[test]
+    fn straddling_piece_takes_the_highest_priority() {
+        let m = multi(16, &[10, 10]);
+        assert_eq!(
+            piece_priorities(&m, &[FilePriority::Skip, FilePriority::Low]),
+            [FilePriority::Low, FilePriority::Low]
+        );
+        assert_eq!(
+            piece_priorities(&m, &[FilePriority::Skip, FilePriority::Skip]),
+            [FilePriority::Skip, FilePriority::Skip]
+        );
+        assert_eq!(
+            piece_priorities(&m, &[FilePriority::High, FilePriority::Skip]),
+            [FilePriority::High, FilePriority::Skip]
+        );
     }
 }

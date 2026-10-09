@@ -10,7 +10,7 @@
 //! For a magnet link the only difference is step 1: we begin with just an
 //! infohash and must fetch the metadata itself before anything else can happen.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,9 +28,11 @@ use crate::metainfo::{Magnet, Metainfo, SocketAddrLite};
 use crate::peer::connection::{FromPeer, BLOCK_SIZE};
 use crate::peer::pool::PeerPool;
 use crate::scheduler::{BlockRequest, Scheduler};
-use crate::state::{Command, DownloadState, FileSummary, Level, PeerSummary, TorrentSummary, UiState};
+use crate::state::{
+    Command, DownloadState, FilePriority, FileSummary, Level, PeerSummary, TorrentSummary, UiState,
+};
 use crate::storage::Storage;
-use crate::tracker;
+use crate::tracker::{self, Event};
 
 /// Port we advertise to peers and announce to trackers.
 pub const LOCAL_PORT: u16 = 6881;
@@ -54,6 +56,10 @@ const MAX_IN_FLIGHT: usize = 200;
 /// How often a session engine re-runs tit-for-tat choking.
 const RECHOKE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Budget for the best-effort `completed` / `stopped` announces: shutting
+/// down must not hang on a dead tracker.
+const EVENT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Knobs a session sets per torrent. The default is the single-torrent CLI
 /// behaviour: finish and return, own listener, own DHT node, auto-unchoke.
 pub struct EngineOptions {
@@ -74,8 +80,9 @@ pub struct EngineOptions {
     pub inbound: Option<mpsc::UnboundedReceiver<(TcpStream, Handshake)>>,
     /// Port announced to trackers, the DHT and peers.
     pub port: u16,
-    /// File selection to restore; ignored if its length does not match.
-    pub wanted_files: Option<Vec<bool>>,
+    /// Per-file priorities to restore; ignored if its length does not match
+    /// or it skips every file.
+    pub file_priorities: Option<Vec<FilePriority>>,
 }
 
 impl Default for EngineOptions {
@@ -91,7 +98,7 @@ impl Default for EngineOptions {
             dht_enabled: true,
             inbound: None,
             port: LOCAL_PORT,
-            wanted_files: None,
+            file_priorities: None,
         }
     }
 }
@@ -146,29 +153,61 @@ impl Engine {
         let mut scheduler = Scheduler::new(&self.meta);
         let port = self.opts.port;
         let mut inbound = self.opts.inbound.take();
-        let mut wanted = match self.opts.wanted_files.take() {
-            Some(w) if w.len() == self.meta.files.iter().count() && w.iter().any(|x| *x) => w,
-            _ => vec![true; self.meta.files.iter().count()],
-        };
+        let file_count = self.meta.files.iter().count();
+        let mut priorities = initial_priorities(file_count, self.opts.file_priorities.take());
 
         self.log(Level::Info, format!("preparing {}", download_dir.display()))
             .await;
 
         // Resume support: verify what is already on disk so we neither
-        // re-download finished pieces nor trust unverified bytes.
-        let verified = self.recheck_existing(&storage, &mut scheduler).await;
+        // re-download finished pieces nor trust unverified bytes. The hashing
+        // runs off the async threads and the torrent shows as Checking; a
+        // Stop is honoured at once and any other command waits its turn.
+        self.state.write().await.torrent = Some(TorrentSummary {
+            name: self.meta.name.clone(),
+            infohash: self.meta.infohash.to_hex(),
+            total_length: self.meta.total_length,
+            piece_length: self.meta.piece_length,
+            piece_count: self.meta.piece_count() as u32,
+            state: DownloadState::Checking,
+            download_dir: download_dir.display().to_string(),
+            trackers: self.meta.announce_list.clone(),
+            uploaded: self.opts.uploaded_so_far,
+            files: file_summaries(&self.meta, &scheduler, &priorities),
+            ..Default::default()
+        });
+        let mut backlog: VecDeque<Command> = VecDeque::new();
+        let mut startup_check = spawn_check(Arc::clone(&storage), Arc::clone(&self.meta));
+        let verified = loop {
+            tokio::select! {
+                ev = startup_check.recv() => match ev {
+                    Some(CheckEvent::Progress { checked, good }) => self.publish_check(checked, good).await,
+                    Some(CheckEvent::Done(v)) => break v,
+                    None => break vec![false; self.meta.piece_count()],
+                },
+                Some(cmd) = self.commands.recv() => {
+                    if cmd == Command::Stop {
+                        if let Some(t) = &mut self.state.write().await.torrent {
+                            t.state = DownloadState::Stopped;
+                        }
+                        self.log(Level::Info, "stopped while checking").await;
+                        return Ok(());
+                    }
+                    backlog.push_back(cmd);
+                }
+            }
+        };
+        let good = apply_verified(&mut scheduler, &verified);
         self.log(
             Level::Info,
             format!(
-                "rechecked {verified}/{} pieces already on disk",
+                "rechecked {good}/{} pieces already on disk",
                 self.meta.piece_count()
             ),
         )
         .await;
 
-        if wanted.iter().any(|w| !*w) {
-            scheduler.set_excluded(&crate::scheduler::excluded_pieces(&self.meta, &wanted));
-        }
+        scheduler.set_piece_priorities(crate::scheduler::piece_priorities(&self.meta, &priorities));
 
         let summary = TorrentSummary {
             name: self.meta.name.clone(),
@@ -183,7 +222,7 @@ impl Engine {
             download_dir: download_dir.display().to_string(),
             trackers: self.meta.announce_list.clone(),
             uploaded: self.opts.uploaded_so_far,
-            files: file_summaries(&self.meta, &scheduler, &wanted),
+            files: file_summaries(&self.meta, &scheduler, &priorities),
             ..Default::default()
         };
         self.state.write().await.torrent = Some(summary);
@@ -254,7 +293,7 @@ impl Engine {
         // Announces run in their own task so slow trackers (timeouts of tens
         // of seconds) never stall the loop; results come back on this channel.
         let (announce_tx, mut announce_rx) =
-            mpsc::unbounded_channel::<(Vec<SocketAddrLite>, Vec<String>)>();
+            mpsc::unbounded_channel::<tracker::AnnounceOutcome>();
         let mut announce_in_flight = false;
 
         // BEP 27: private torrents must never touch the DHT.
@@ -286,6 +325,12 @@ impl Engine {
         // toggling the last wanted file off is refused).
         let mut paused = false;
         let mut seeding = false;
+        // `Some` while a forced recheck is hashing in the background.
+        let mut check_rx: Option<mpsc::UnboundedReceiver<CheckEvent>> = None;
+        // Lifecycle event for the next announce. A torrent that is already
+        // complete on resume has no download to report finishing.
+        let mut next_event = Some(Event::Started);
+        let mut completed_sent = scheduler.is_complete();
         let mut last_rechoke = Instant::now();
         let uploaded_so_far = self.opts.uploaded_so_far;
 
@@ -311,11 +356,20 @@ impl Engine {
                     pool.adopt_inbound(stream, hs).await;
                 }
 
-                Some((peers, errors)) = announce_rx.recv() => {
+                Some(outcome) = announce_rx.recv() => {
                     announce_in_flight = false;
-                    if errors.is_empty() {
-                        self.state.write().await.warning = None;
-                    } else {
+                    let tracker::AnnounceOutcome { peers, errors, seeders, leechers } = outcome;
+                    {
+                        let mut st = self.state.write().await;
+                        if let Some(t) = &mut st.torrent {
+                            t.seeders_known = seeders.unwrap_or(t.seeders_known);
+                            t.leecher_known = leechers.unwrap_or(t.leecher_known);
+                        }
+                        if errors.is_empty() {
+                            st.warning = None;
+                        }
+                    }
+                    if !errors.is_empty() {
                         let msg = errors.join("; ");
                         self.log(Level::Warn, format!("tracker: {msg}")).await;
                         self.state.write().await.warning = Some(msg);
@@ -348,9 +402,51 @@ impl Engine {
                     }
                 }
 
+                Some(ev) = async {
+                    match check_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match ev {
+                        CheckEvent::Progress { checked, good } => self.publish_check(checked, good).await,
+                        CheckEvent::Done(verified) => {
+                            check_rx = None;
+                            scheduler = Scheduler::new(&self.meta);
+                            let good = apply_verified(&mut scheduler, &verified);
+                            scheduler.set_piece_priorities(crate::scheduler::piece_priorities(
+                                &self.meta,
+                                &priorities,
+                            ));
+                            pool.set_seeder(build_seeder(Arc::clone(&storage), &self.meta, &verified));
+                            if seeding && !scheduler.is_complete() {
+                                seeding = false;
+                            }
+                            if let Some(t) = &mut self.state.write().await.torrent {
+                                t.state = if paused {
+                                    DownloadState::Paused
+                                } else if seeding {
+                                    DownloadState::Seeding
+                                } else {
+                                    DownloadState::Downloading
+                                };
+                                t.downloaded = scheduler.block_map().bytes_downloaded(&self.meta);
+                                t.verified_pieces = scheduler.block_map().verified_count();
+                                t.progress = scheduler.progress();
+                                t.files = file_summaries(&self.meta, &scheduler, &priorities);
+                            }
+                            self.log(
+                                Level::Info,
+                                format!("recheck done: {good}/{} pieces verified", self.meta.piece_count()),
+                            )
+                            .await;
+                        }
+                    }
+                }
+
                 _ = ticker.tick() => {
                     // ---- commands from the TUI (pause, file selection) ----
-                    while let Ok(cmd) = self.commands.try_recv() {
+                    while let Some(cmd) = backlog.pop_front().or_else(|| self.commands.try_recv().ok()) {
                         match cmd {
                             Command::Pause => {
                                 if !paused {
@@ -365,7 +461,8 @@ impl Engine {
                                 }
                             }
                             Command::Stop => {
-                                let total = uploaded_so_far + pool.total_uploaded().await;
+                                let session_up = pool.total_uploaded().await;
+                                let total = uploaded_so_far + session_up;
                                 if let Some(t) = &mut self.state.write().await.torrent {
                                     t.state = DownloadState::Stopped;
                                     t.download_rate = 0.0;
@@ -374,16 +471,46 @@ impl Engine {
                                 }
                                 pool.disconnect_all().await;
                                 self.log(Level::Info, "stopped").await;
+                                self.announce_event(Event::Stopped, port, session_up, &scheduler).await;
                                 return Ok(());
                             }
                             Command::SetMaxPeers(n) => pool.set_max_peers(n),
-                            Command::ToggleFile(i) => {
-                                apply_file_toggle(
+                            Command::Recheck => {
+                                if check_rx.is_none() {
+                                    // Stop serving while the data is in doubt: a
+                                    // peer must never be sent a corrupt piece.
+                                    pool.set_seeder(None);
+                                    check_rx = Some(spawn_check(Arc::clone(&storage), Arc::clone(&self.meta)));
+                                    if let Some(t) = &mut self.state.write().await.torrent {
+                                        t.state = DownloadState::Checking;
+                                        t.progress = 0.0;
+                                    }
+                                    self.log(Level::Info, "rechecking all pieces").await;
+                                }
+                            }
+                            Command::SetFilePriority(i, p) => {
+                                apply_file_priority(
                                     &self.meta,
-                                    &mut wanted,
+                                    &mut priorities,
                                     &mut scheduler,
                                     &self.state,
                                     i,
+                                    p,
+                                )
+                                .await;
+                            }
+                            Command::ToggleFile(i) => {
+                                let flipped = match priorities.get(i) {
+                                    Some(FilePriority::Skip) => FilePriority::Normal,
+                                    _ => FilePriority::Skip,
+                                };
+                                apply_file_priority(
+                                    &self.meta,
+                                    &mut priorities,
+                                    &mut scheduler,
+                                    &self.state,
+                                    i,
+                                    flipped,
                                 )
                                 .await;
                             }
@@ -393,7 +520,7 @@ impl Engine {
                     // ---- periodically refill the request pipeline ----
                     // A pause stops new requests. Blocks already on the wire
                     // still land and verify, so resuming never loses data.
-                    if !paused && !seeding && last_fill.elapsed() >= PIPELINE_INTERVAL {
+                    if !paused && !seeding && check_rx.is_none() && last_fill.elapsed() >= PIPELINE_INTERVAL {
                         last_fill = Instant::now();
                         let mut rarity: HashMap<u32, u32> = HashMap::new();
                         for p in 0..self.meta.piece_count() as u32 {
@@ -422,6 +549,7 @@ impl Engine {
                         let downloaded = scheduler.block_map().bytes_downloaded(&meta);
                         let left = meta.total_length.saturating_sub(downloaded);
                         let tx = announce_tx.clone();
+                        let event = next_event.take();
                         tokio::spawn(async move {
                             let res = tracker::announce_all(
                                 &meta.announce_list,
@@ -430,6 +558,7 @@ impl Engine {
                                 uploaded,
                                 downloaded,
                                 left,
+                                event,
                             )
                             .await;
                             let _ = tx.send(res);
@@ -469,7 +598,7 @@ impl Engine {
                     }
 
                     // ---- verify any fully-downloaded pieces ----
-                    let ready = scheduler.ready_pieces();
+                    let ready = if check_rx.is_none() { scheduler.ready_pieces() } else { Vec::new() };
                     if !ready.is_empty() {
                         let mut confirmed = 0u32;
                         let mut corrupt = Vec::new();
@@ -550,14 +679,20 @@ impl Engine {
 
                         let mut st = self.state.write().await;
                         if let Some(t) = &mut st.torrent {
+                            let checking = check_rx.is_some();
                             t.uploaded = total_up;
-                            t.downloaded = downloaded;
-                            t.verified_pieces = scheduler.block_map().verified_count();
-                            t.progress = scheduler.progress();
                             t.download_rate = current_rate;
                             t.upload_rate = upload_rate;
                             t.eta_secs = eta;
-                            if reached {
+                            if !checking {
+                                t.downloaded = downloaded;
+                                t.verified_pieces = scheduler.block_map().verified_count();
+                                t.progress = scheduler.progress();
+                                t.files = file_summaries(&self.meta, &scheduler, &priorities);
+                            }
+                            if checking {
+                                t.state = DownloadState::Checking;
+                            } else if reached {
                                 t.state = DownloadState::Stopped;
                                 t.upload_rate = 0.0;
                             } else if paused {
@@ -569,13 +704,13 @@ impl Engine {
                                     DownloadState::Downloading
                                 };
                             }
-                            t.files = file_summaries(&self.meta, &scheduler, &wanted);
                         }
                         st.peers = peers;
                         let _ = connected;
                         drop(st);
                         if reached {
                             pool.disconnect_all().await;
+                            self.announce_event(Event::Stopped, port, uploaded, &scheduler).await;
                             self.log(
                                 Level::Info,
                                 format!("ratio reached ({:.2}), stopping", self.opts.ratio_target),
@@ -586,7 +721,7 @@ impl Engine {
                     }
 
                     // ---- completion check ----
-                    if !seeding && scheduler.is_complete() {
+                    if !seeding && check_rx.is_none() && scheduler.is_complete() {
                         // Publish the final figures BEFORE logging completion:
                         // the TUI renders log and stats from the same snapshot,
                         // so logging first would let a frame show "complete"
@@ -616,7 +751,16 @@ impl Engine {
                         )
                         .await;
                         if !self.opts.seed_after_complete {
+                            if !completed_sent {
+                                let up = pool.total_uploaded().await;
+                                self.announce_event(Event::Completed, port, up, &scheduler).await;
+                            }
                             return Ok(());
+                        }
+                        if !completed_sent {
+                            completed_sent = true;
+                            next_event = Some(Event::Completed);
+                            force_announce = true;
                         }
                         seeding = true;
                         last_rechoke = Instant::now() - RECHOKE_INTERVAL;
@@ -626,30 +770,37 @@ impl Engine {
         }
     }
 
-    /// Verify every piece on disk and mark the good ones complete, so a resumed
-    /// download does not start over.
-    async fn recheck_existing(&self, storage: &Storage, scheduler: &mut Scheduler) -> u32 {
-        let mut good = 0;
-        for i in 0..self.meta.piece_count() {
-            if i % 64 == 0 {
-                self.log(
-                    Level::Debug,
-                    format!("rechecking piece {i}/{}", self.meta.piece_count()),
-                )
-                .await;
-            }
-            match storage.verify_piece(&self.meta, i as u32) {
-                Ok(true) => {
-                    scheduler.block_map_mut().mark_verified(i as u32);
-                    good += 1;
-                }
-                _ => {
-                    // Bad or missing: drop any partial state so it gets refetched.
-                    scheduler.block_map_mut().invalidate_piece(i as u32);
-                }
-            }
+    /// Publish hashing progress while the torrent is in the Checking state.
+    async fn publish_check(&self, checked: usize, good: u32) {
+        let total = self.meta.piece_count().max(1);
+        if let Some(t) = &mut self.state.write().await.torrent {
+            t.state = DownloadState::Checking;
+            t.progress = checked as f64 / total as f64;
+            t.verified_pieces = good;
         }
-        good
+    }
+
+    /// Best-effort lifecycle announce (`completed`, `stopped`) that gives up
+    /// after [`EVENT_TIMEOUT`] so a dead tracker cannot delay shutdown.
+    async fn announce_event(&self, event: Event, port: u16, uploaded: u64, scheduler: &Scheduler) {
+        if self.meta.announce_list.is_empty() {
+            return;
+        }
+        let downloaded = scheduler.block_map().bytes_downloaded(&self.meta);
+        let left = self.meta.total_length.saturating_sub(downloaded);
+        let _ = tokio::time::timeout(
+            EVENT_TIMEOUT,
+            tracker::announce_all(
+                &self.meta.announce_list,
+                &self.meta,
+                port,
+                uploaded,
+                downloaded,
+                left,
+                Some(event),
+            ),
+        )
+        .await;
     }
 
     pub async fn log(&self, level: Level, msg: impl Into<String>) {
@@ -662,6 +813,60 @@ impl Engine {
             Level::Trace => tracing::trace!("{msg}"),
         }
         self.state.write().await.log(level, msg);
+    }
+}
+
+/// What the background hashing task reports.
+enum CheckEvent {
+    Progress { checked: usize, good: u32 },
+    Done(Vec<bool>),
+}
+
+/// Hash every piece on a blocking thread so a multi-gigabyte recheck never
+/// stalls the engine loop. The task stops early when the receiver is dropped.
+fn spawn_check(storage: Arc<Storage>, meta: Arc<Metainfo>) -> mpsc::UnboundedReceiver<CheckEvent> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::task::spawn_blocking(move || {
+        let total = meta.piece_count();
+        let step = (total / 100).max(1);
+        let mut verified = vec![false; total];
+        let mut good = 0u32;
+        for i in 0..total {
+            let ok = matches!(storage.verify_piece(&meta, i as u32), Ok(true));
+            verified[i] = ok;
+            good += u32::from(ok);
+            if (i + 1) % step == 0
+                && tx.send(CheckEvent::Progress { checked: i + 1, good }).is_err()
+            {
+                return;
+            }
+        }
+        let _ = tx.send(CheckEvent::Done(verified));
+    });
+    rx
+}
+
+/// Mark the pieces that hashed correctly and drop partial state for the rest,
+/// so bad or missing data gets refetched. Returns the verified count.
+fn apply_verified(scheduler: &mut Scheduler, verified: &[bool]) -> u32 {
+    let mut good = 0;
+    for (i, ok) in verified.iter().enumerate() {
+        if *ok {
+            scheduler.block_map_mut().mark_verified(i as u32);
+            good += 1;
+        } else {
+            scheduler.block_map_mut().invalidate_piece(i as u32);
+        }
+    }
+    good
+}
+
+/// Pick the starting per-file priorities. A stored selection that does not
+/// fit this torrent, or that skips every file, is ignored.
+fn initial_priorities(files: usize, stored: Option<Vec<FilePriority>>) -> Vec<FilePriority> {
+    match stored {
+        Some(p) if p.len() == files && p.iter().any(|x| *x != FilePriority::Skip) => p,
+        _ => vec![FilePriority::Normal; files],
     }
 }
 
@@ -780,13 +985,18 @@ async fn snapshot_peers(pool: &PeerPool) -> Vec<PeerSummary> {
 }
 
 /// Per-file progress summaries in torrent file order.
-fn file_summaries(meta: &Metainfo, scheduler: &Scheduler, wanted: &[bool]) -> Vec<FileSummary> {
+fn file_summaries(
+    meta: &Metainfo,
+    scheduler: &Scheduler,
+    priorities: &[FilePriority],
+) -> Vec<FileSummary> {
     let downloaded = crate::scheduler::file_downloaded(meta, scheduler.block_map());
     meta.files
         .iter()
         .enumerate()
         .map(|(i, (path, len))| {
             let got = downloaded.get(i).copied().unwrap_or(0);
+            let priority = priorities.get(i).copied().unwrap_or_default();
             FileSummary {
                 index: i,
                 path: path
@@ -796,36 +1006,41 @@ fn file_summaries(meta: &Metainfo, scheduler: &Scheduler, wanted: &[bool]) -> Ve
                     .join("/"),
                 length: len,
                 downloaded: got.min(len),
-                wanted: wanted.get(i).copied().unwrap_or(true),
+                wanted: priority != FilePriority::Skip,
+                priority,
             }
         })
         .collect()
 }
 
-/// Flip whether a file is downloaded, refusing to skip the last wanted file.
+/// Set one file's priority, refusing to skip the last file still wanted.
 ///
-/// Skipping recomputes the scheduler's excluded-piece set from the whole
-/// wanted vector (not incrementally), so the two can never drift apart.
-async fn apply_file_toggle(
+/// The scheduler's per-piece priorities (and with them the excluded-piece
+/// set) are recomputed from the whole priority vector, not incrementally, so
+/// the two can never drift apart.
+async fn apply_file_priority(
     meta: &Metainfo,
-    wanted: &mut Vec<bool>,
+    priorities: &mut [FilePriority],
     scheduler: &mut Scheduler,
     state: &Arc<RwLock<UiState>>,
     i: usize,
+    priority: FilePriority,
 ) {
-    if i >= wanted.len() {
+    if i >= priorities.len() || priorities[i] == priority {
         return;
     }
-    if wanted[i] && wanted.iter().filter(|w| **w).count() == 1 {
+    if priority == FilePriority::Skip
+        && priorities.iter().filter(|p| **p != FilePriority::Skip).count() == 1
+    {
         state
             .write()
             .await
             .log(Level::Warn, "cannot skip the only remaining file");
         return;
     }
-    wanted[i] = !wanted[i];
-    let now_wanted = wanted[i];
-    scheduler.set_excluded(&crate::scheduler::excluded_pieces(meta, wanted));
+    let was_skipped = priorities[i] == FilePriority::Skip;
+    priorities[i] = priority;
+    scheduler.set_piece_priorities(crate::scheduler::piece_priorities(meta, priorities));
 
     let name = meta
         .files
@@ -835,13 +1050,14 @@ async fn apply_file_toggle(
         .unwrap_or_else(|| format!("file {i}"));
     state.write().await.log(
         Level::Info,
-        if now_wanted {
-            format!("downloading {name}")
-        } else {
-            format!("skipping {name}")
+        match priority {
+            FilePriority::Skip => format!("skipping {name}"),
+            p if was_skipped => format!("downloading {name} ({} priority)", p.label()),
+            p => format!("{name}: {} priority", p.label()),
         },
     );
 }
+
 /// Build an upload capability from the pieces we have verified.
 ///
 /// Returns `None` when we hold nothing, because advertising an all-zero
@@ -896,13 +1112,14 @@ async fn fetch_magnet_metadata(
 
     // ---- 1. trackers listed in the magnet ----
     if !magnet.trackers.is_empty() {
-        let (peers, errors) = crate::tracker::announce_all(
+        let tracker::AnnounceOutcome { peers, errors, .. } = tracker::announce_all(
             &magnet.trackers,
             &placeholder_meta(magnet),
             port,
             0,
             0,
             0,
+            Some(Event::Started),
         )
         .await;
 
