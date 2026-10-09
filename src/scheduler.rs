@@ -7,9 +7,20 @@
 //! endgame phase, the standard approach.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::metainfo::Metainfo;
 use crate::peer::connection::BLOCK_SIZE;
+
+/// How long a requested block may stay unanswered before it is requested
+/// again. Peers that choke us, disconnect, or just stall drop our requests
+/// without telling us; without this those blocks would stay "in flight"
+/// forever and the download would hang just short of 100%.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// In endgame the last few blocks are re-requested this quickly, so the
+/// fastest peer that has them wins instead of the slowest one we asked first.
+pub const ENDGAME_RETRY: Duration = Duration::from_secs(5);
 
 /// Tracks which blocks of which pieces we hold.
 pub struct BlockMap {
@@ -175,8 +186,11 @@ pub struct Scheduler {
     /// a torrent's total size is rarely an exact multiple of the piece length,
     /// and a request that overshoots it would run past the end of the payload.
     last_piece_len: u32,
-    /// Blocks requested but not yet received, so we do not ask twice.
-    in_flight: HashSet<(u32, usize)>,
+    /// Blocks requested but not yet received, with when they were last asked
+    /// for, so we do not ask twice until the request goes stale.
+    in_flight: HashMap<(u32, usize), Instant>,
+    request_timeout: Duration,
+    endgame_retry: Duration,
     /// Pieces the user skipped via per-file selection. They are never
     /// requested and do not count toward completion. A piece is excludable
     /// only when none of its bytes belong to a wanted file; pieces straddling
@@ -201,7 +215,9 @@ impl Scheduler {
             piece_len: pl,
             piece_count,
             last_piece_len,
-            in_flight: HashSet::new(),
+            in_flight: HashMap::new(),
+            request_timeout: REQUEST_TIMEOUT,
+            endgame_retry: ENDGAME_RETRY,
             excluded: HashSet::new(),
             endgame_threshold: 4,
         }
@@ -212,7 +228,7 @@ impl Scheduler {
     /// re-requested; blocks that already arrived stay on disk, harmlessly.
     pub fn set_excluded(&mut self, pieces: &HashSet<u32>) {
         self.excluded = pieces.clone();
-        self.in_flight.retain(|(p, _)| !self.excluded.contains(p));
+        self.in_flight.retain(|(p, _), _| !self.excluded.contains(p));
     }
 
     pub fn excluded(&self) -> &HashSet<u32> {
@@ -289,19 +305,31 @@ impl Scheduler {
     /// `rarity` maps a piece index to how many connected peers hold it. Passing
     /// `None` means rarity is unknown and every piece is treated as equally
     /// rare.
+    ///
+    /// A block whose request has gone stale is handed out again: after
+    /// [`REQUEST_TIMEOUT`] normally, or [`ENDGAME_RETRY`] in endgame.
     pub fn next_block(&mut self, rarity: &HashMap<u32, u32>) -> Option<BlockRequest> {
         let candidates = self.candidate_pieces(rarity);
+        let retry_after = if self.in_endgame() {
+            self.endgame_retry
+        } else {
+            self.request_timeout
+        };
 
         for piece in candidates {
             let n = self.block_map.blocks_in_piece(piece as usize);
             for block in 0..n {
                 let key = (piece, block);
-                if self.block_map.have_block(piece, block) || self.in_flight.contains(&key) {
+                let pending = self
+                    .in_flight
+                    .get(&key)
+                    .is_some_and(|asked| asked.elapsed() < retry_after);
+                if self.block_map.have_block(piece, block) || pending {
                     continue;
                 }
                 let begin = (block as u32) * BLOCK_SIZE;
                 let length = block_len(self.length_of_piece(piece), begin);
-                self.in_flight.insert(key);
+                self.in_flight.insert(key, Instant::now());
                 return Some(BlockRequest {
                     piece,
                     block,
@@ -325,14 +353,17 @@ impl Scheduler {
         out
     }
 
-    fn candidate_pieces(&self, rarity: &HashMap<u32, u32>) -> Vec<u32> {
+    /// Endgame means re-asking for the last blocks so one slow peer cannot
+    /// stall us. It is only worth the duplicate traffic near the end; on a
+    /// torrent whose entire size is below the threshold we would be in endgame
+    /// from the first block, which is pure waste.
+    fn in_endgame(&self) -> bool {
         let remaining = self.remaining_pieces();
-        // Endgame means asking every peer that has a piece so one slow peer
-        // cannot stall us. That is only worth the duplicate traffic when there
-        // is still more than the threshold left; on a torrent whose entire size
-        // is below the threshold we would be in endgame from the first block,
-        // which is pure waste.
-        let endgame = remaining <= self.endgame_threshold && remaining < self.piece_count;
+        remaining <= self.endgame_threshold && remaining < self.piece_count
+    }
+
+    fn candidate_pieces(&self, rarity: &HashMap<u32, u32>) -> Vec<u32> {
+        let endgame = self.in_endgame();
 
         let mut pieces: Vec<u32> = (0..self.piece_count as u32)
             .filter(|i| !self.block_map.is_verified(*i) && !self.excluded.contains(i))
@@ -374,8 +405,13 @@ impl Scheduler {
             .count()
     }
 
+    /// Requests still awaiting an answer. Stale ones do not count, so they
+    /// never eat the engine's request budget.
     pub fn in_flight_count(&self) -> usize {
-        self.in_flight.len()
+        self.in_flight
+            .values()
+            .filter(|asked| asked.elapsed() < self.request_timeout)
+            .count()
     }
 }
 
@@ -548,6 +584,41 @@ mod tests {
         s.on_timeout(r.key());
         let again = s.next_block(&HashMap::new()).unwrap();
         assert_eq!(again.key(), r.key());
+    }
+
+    #[test]
+    fn stale_requests_are_retried() {
+        let m = meta(BLOCK_SIZE, 1);
+        let mut s = Scheduler::new(&m);
+        let r = s.next_block(&HashMap::new()).unwrap();
+        assert!(s.next_block(&HashMap::new()).is_none());
+
+        // The peer never answered: once the request is stale the block is
+        // handed out again and stops counting against the request budget.
+        s.request_timeout = Duration::ZERO;
+        assert_eq!(s.in_flight_count(), 0);
+        let again = s.next_block(&HashMap::new()).unwrap();
+        assert_eq!(again.key(), r.key());
+    }
+
+    #[test]
+    fn endgame_retries_sooner_than_normal() {
+        let m = meta(BLOCK_SIZE, 8);
+        let mut s = Scheduler::new(&m);
+        s.endgame_retry = Duration::ZERO;
+
+        // Far from the end: an unanswered block is not re-requested.
+        let r = s.next_block(&HashMap::new()).unwrap();
+        let next = s.next_block(&HashMap::new()).unwrap();
+        assert_ne!(next.key(), r.key());
+
+        // One piece left: its pending block is handed out again at once.
+        for i in 0..7u32 {
+            s.block_map.mark_verified(i);
+        }
+        let first = s.next_block(&HashMap::new()).unwrap();
+        let dup = s.next_block(&HashMap::new()).unwrap();
+        assert_eq!((first.key(), dup.key()), ((7, 0), (7, 0)));
     }
 
     #[test]
