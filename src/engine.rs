@@ -272,6 +272,15 @@ impl Engine {
                                     self.log(Level::Info, "resumed").await;
                                 }
                             }
+                            Command::Stop => {
+                                if let Some(t) = &mut self.state.write().await.torrent {
+                                    t.state = DownloadState::Stopped;
+                                    t.download_rate = 0.0;
+                                    t.upload_rate = 0.0;
+                                }
+                                self.log(Level::Info, "stopped").await;
+                                return Ok(());
+                            }
                             Command::ToggleFile(i) => {
                                 apply_file_toggle(
                                     &self.meta,

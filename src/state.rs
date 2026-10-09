@@ -4,6 +4,7 @@
 //! `UiState` snapshot. The TUI only ever reads a snapshot, so it can never
 //! observe a half-updated download.
 
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +15,8 @@ pub enum DownloadState {
     Downloading,
     Paused,
     Complete,
+    /// Finished and still uploading until the ratio target is reached.
+    Seeding,
     Error,
     Stopped,
 }
@@ -27,6 +30,7 @@ impl DownloadState {
             DownloadState::Downloading => "downloading",
             DownloadState::Paused => "paused",
             DownloadState::Complete => "complete",
+            DownloadState::Seeding => "seeding",
             DownloadState::Error => "error",
             DownloadState::Stopped => "stopped",
         }
@@ -164,6 +168,122 @@ pub enum Command {
     Resume,
     /// Flip whether the file at this file-list index is downloaded.
     ToggleFile(usize),
+    /// Shut the engine down gracefully; `Engine::run` returns `Ok` with the
+    /// torrent marked [`DownloadState::Stopped`].
+    Stop,
+}
+
+/// Stable identifier of a torrent within a session: its infohash in hex.
+pub type TorrentId = String;
+
+/// Session-wide preferences, edited from the settings screen and persisted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Settings {
+    /// Where new torrents are saved unless `add` names a directory.
+    pub download_dir: PathBuf,
+    /// TCP port for incoming peers. If it is taken the session falls back to
+    /// an ephemeral port and says so.
+    pub listen_port: u16,
+    /// Global caps in bytes per second; 0 means unlimited.
+    pub download_limit: u64,
+    pub upload_limit: u64,
+    /// Stop seeding once uploaded / size reaches this; 0 means seed forever.
+    pub ratio_target: f64,
+    /// Connection cap per torrent.
+    pub max_peers: usize,
+    pub dht: bool,
+    /// Ask the router (NAT-PMP, then UPnP) to forward `listen_port`.
+    pub port_forwarding: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Settings {
+            download_dir: home.join("Downloads"),
+            listen_port: 6881,
+            download_limit: 0,
+            upload_limit: 0,
+            ratio_target: 2.0,
+            max_peers: 50,
+            dht: true,
+            port_forwarding: true,
+        }
+    }
+}
+
+/// One torrent as the session TUI sees it.
+#[derive(Debug, Clone)]
+pub struct TorrentView {
+    pub id: TorrentId,
+    /// The engine's own snapshot (summary, peers, log). Its `command_tx` is
+    /// `None`; commands go through [`SessionState::command_tx`].
+    pub ui: UiState,
+    /// Cumulative bytes uploaded, across restarts.
+    pub uploaded: u64,
+    /// `uploaded / total_length`; 0 before metadata is known.
+    pub ratio: f64,
+    /// Per-torrent caps in bytes per second; 0 means unlimited.
+    pub download_limit: u64,
+    pub upload_limit: u64,
+    /// Unix seconds when the torrent was added.
+    pub added_at: u64,
+}
+
+/// Everything the session TUI renders. Published by the session every
+/// 250 ms; the TUI only ever reads a cloned snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct SessionState {
+    /// In the order they were added.
+    pub torrents: Vec<TorrentView>,
+    pub settings: Settings,
+    /// Session-level events (adds, removals, port mapping, errors).
+    pub log: Vec<LogEntry>,
+    /// Totals across all torrents, bytes per second.
+    pub download_rate: f64,
+    pub upload_rate: f64,
+    /// Human-readable listen/port-forwarding status, e.g.
+    /// `"port 6881 · forwarded via NAT-PMP"`.
+    pub port_status: String,
+    pub warning: Option<String>,
+    /// Set when the session is shutting down; the TUI exits its loop.
+    pub shutdown: bool,
+    pub command_tx: Option<tokio::sync::mpsc::UnboundedSender<SessionCommand>>,
+}
+
+impl SessionState {
+    pub fn log(&mut self, level: Level, message: impl Into<String>) {
+        const MAX: usize = 500;
+        if self.log.len() >= MAX {
+            self.log.remove(0);
+        }
+        self.log.push(LogEntry {
+            level,
+            message: message.into(),
+        });
+    }
+}
+
+/// Commands the session TUI (and `torrust add` over IPC) send to the session.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionCommand {
+    /// A `.torrent` path or a `magnet:` URI; `dir` defaults to
+    /// [`Settings::download_dir`].
+    Add { source: String, dir: Option<PathBuf> },
+    /// Stop the torrent and forget it; with `delete_data` also remove its
+    /// downloaded files once the engine has shut down.
+    Remove { id: TorrentId, delete_data: bool },
+    Start(TorrentId),
+    Stop(TorrentId),
+    /// Forward a per-torrent command (pause, resume, file toggle).
+    Torrent(TorrentId, Command),
+    SetTorrentLimits { id: TorrentId, download: u64, upload: u64 },
+    SetSettings(Settings),
+    /// Persist everything and shut down.
+    Quit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

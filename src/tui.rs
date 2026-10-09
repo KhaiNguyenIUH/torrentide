@@ -118,7 +118,7 @@ fn level_style(level: Level) -> Style {
 /// Colour for the torrent state shown in the header.
 fn state_style(state: DownloadState) -> Style {
     match state {
-        DownloadState::Complete => good_style(),
+        DownloadState::Complete | DownloadState::Seeding => good_style(),
         DownloadState::Error => error_style(),
         DownloadState::Paused => warn_style(),
         DownloadState::Stopped => muted_style(),
