@@ -1,0 +1,542 @@
+//! Command-line entry point.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+use tokio::sync::RwLock;
+
+use torrust::engine::{self, Engine};
+use torrust::metainfo::{Magnet, Metainfo};
+use torrust::state::{Level, UiState};
+
+#[derive(Parser)]
+#[command(
+    name = "torrust",
+    version,
+    about = "A BitTorrent client with a TUI",
+    long_about = "Download torrents over the BitTorrent protocol.\n\n\
+                  Accepts a local .torrent file or a magnet: URI."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Download a torrent to a directory
+    Download {
+        /// Path to a .torrent file, or a magnet: URI
+        source: String,
+
+        /// Directory to save the downloaded files into
+        #[arg(short, long, default_value = ".")]
+        output: PathBuf,
+
+        /// Exit when the download finishes instead of waiting
+        #[arg(long)]
+        exit_when_done: bool,
+
+        /// Print progress to stdout instead of starting the TUI
+        #[arg(long)]
+        no_tui: bool,
+    },
+
+    /// Parse a .torrent file and print its contents without downloading
+    Inspect {
+        /// Path to a .torrent file
+        path: PathBuf,
+    },
+
+    /// Parse a magnet URI and print what it contains
+    #[command(alias = "m")]
+    Magnet {
+        /// The magnet: URI
+        uri: String,
+    },
+
+    /// Adopt a half-downloaded torrent from another client
+    ///
+    /// Matches the other app's files against the torrent (tolerating its
+    /// `.!qB` incomplete-file suffix and no-subfolder layouts), transfers
+    /// them into the download directory, and verifies what will resume.
+    /// Stop the other client first.
+    Import {
+        /// Path to the .torrent file (must be the same torrent)
+        torrent: PathBuf,
+
+        /// Directory holding the other app's files
+        #[arg(short, long)]
+        from: PathBuf,
+
+        /// Directory to place the adopted files into (our download dir)
+        #[arg(short, long, default_value = ".")]
+        output: PathBuf,
+
+        /// How to bring the bytes over: copy, move, or link (hard-link)
+        #[arg(long, default_value = "copy")]
+        mode: String,
+
+        /// Skip the post-transfer hash check (trust name+size matching;
+        /// startup will still verify before downloading)
+        #[arg(long)]
+        no_verify: bool,
+
+        /// Start downloading immediately after importing
+        #[arg(long)]
+        start: bool,
+
+        /// Exit when the download finishes instead of waiting (with --start)
+        #[arg(long)]
+        exit_when_done: bool,
+
+        /// Print progress to stdout instead of starting the TUI (with --start)
+        #[arg(long)]
+        no_tui: bool,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let uses_tui = matches!(
+        cli.command,
+        Command::Download { no_tui: false, .. } | Command::Import { no_tui: false, start: true, .. }
+    );
+    init_tracing(uses_tui);
+
+    match cli.command {
+        Command::Download {
+            source,
+            output,
+            exit_when_done,
+            no_tui,
+        } => run_download(&source, output, exit_when_done, no_tui).await,
+        Command::Inspect { path } => inspect(&path),
+        Command::Magnet { uri } => inspect_magnet(&uri),
+        Command::Import {
+            torrent,
+            from,
+            output,
+            mode,
+            no_verify,
+            start,
+            exit_when_done,
+            no_tui,
+        } => {
+            run_import(
+                &torrent,
+                &from,
+                output,
+                &mode,
+                !no_verify,
+                start,
+                exit_when_done,
+                no_tui,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_download(
+    source: &str,
+    output: PathBuf,
+    exit_when_done: bool,
+    no_tui: bool,
+) -> Result<()> {
+    validate_source(source)?;
+
+    let state = Arc::new(RwLock::new(UiState::default()));
+
+    // Commands flow TUI -> engine. The sender is published in the shared state
+    // so the UI thread can clone it out of any snapshot; the receiver is owned
+    // by whichever engine starts below.
+    let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+    state.write().await.command_tx = Some(command_tx);
+
+    if source.starts_with("magnet:") {
+        let magnet = Magnet::parse(source)?;
+        log_to(
+            &state,
+            Level::Info,
+            format!("parsed magnet {}", magnet.infohash),
+        )
+        .await;
+
+        if !no_tui {
+            log_to(&state, Level::Info, format!("logs: {}", log_path().display())).await;
+        }
+
+        // Without a TUI and with --exit-when-done we still need a driver, so
+        // always run the engine in a task.
+        let ui = spawn_ui_if_needed(&state, no_tui);
+
+        let handle = tokio::spawn(engine::run_magnet(
+            magnet,
+            output.clone(),
+            Arc::clone(&state),
+            command_rx,
+        ));
+        return finish(handle, &state, ui, exit_when_done, exit_when_done || no_tui).await;
+    }
+
+    let raw = std::fs::read(source).map_err(|e| anyhow::anyhow!("reading {source}: {e}"))?;
+    let meta = Arc::new(Metainfo::from_bytes(&raw).context("parsing .torrent file")?);
+
+    start_download(meta, output, &state, command_rx, exit_when_done, no_tui).await
+}
+
+/// Adopt a half-finished download from another client: match its files,
+/// transfer them into our layout, verify what will resume, and optionally
+/// start downloading immediately.
+#[allow(clippy::too_many_arguments)]
+async fn run_import(
+    torrent: &Path,
+    from: &Path,
+    output: PathBuf,
+    mode: &str,
+    verify: bool,
+    start: bool,
+    exit_when_done: bool,
+    no_tui: bool,
+) -> Result<()> {
+    use torrust::import;
+    use torrust::state::human_bytes;
+
+    if !from.is_dir() {
+        bail!("--from {} is not a directory", from.display());
+    }
+    let mode: import::Mode = mode.parse()?;
+
+    let raw = std::fs::read(torrent).map_err(|e| anyhow::anyhow!("reading {}: {e}", torrent.display()))?;
+    let meta = Metainfo::from_bytes(&raw).context("parsing .torrent file")?;
+
+    let file_count = meta.files.iter().count();
+    println!("importing {}", meta.name);
+    println!("  torrent:  {} ({} files, {})", torrent.display(), file_count, human_bytes(meta.total_length));
+    println!("  from:     {}", from.display());
+    println!("  into:     {}", output.display());
+    println!("  mode:     {mode:?}");
+    println!();
+
+    let plan = import::plan(&meta, from);
+    for f in &plan.found {
+        let note = if f.source_len == f.length {
+            String::new()
+        } else if f.source_len < f.length {
+            format!("  (partial: {} of {} on disk)", human_bytes(f.source_len), human_bytes(f.length))
+        } else {
+            "  (larger than expected — will be truncated)".to_string()
+        };
+        let renamed = if f.renamed { "  [stripped .!qB]" } else { "" };
+        println!(
+            "  FOUND   {:>10}  {}{}{}",
+            human_bytes(f.source_len.min(f.length)),
+            f.rel.display(),
+            renamed,
+            note,
+        );
+    }
+    for m in &plan.missing {
+        println!(
+            "  MISSING {:>10}  {}  (will download)",
+            human_bytes(m.length),
+            m.rel.display(),
+        );
+    }
+    println!();
+    println!(
+        "  {} of {} on disk{}",
+        human_bytes(plan.found_bytes()),
+        human_bytes(plan.total_bytes()),
+        if plan.missing.is_empty() {
+            String::new()
+        } else {
+            format!(" — {} will be fetched", human_bytes(plan.missing_bytes()))
+        }
+    );
+
+    let rep = import::execute(&plan, &output, mode)?;
+    println!(
+        "  transferred {} (copy:{}, move:{}, link:{}, in place:{}, renamed:{})",
+        human_bytes(rep.bytes),
+        rep.copied,
+        rep.moved,
+        rep.linked,
+        rep.in_place,
+        rep.renamed,
+    );
+
+    if verify {
+        println!("  verifying...");
+        let v = import::verify(&meta, &output)?;
+        println!(
+            "  verified {}/{} pieces — {} will resume",
+            v.pieces_verified,
+            v.pieces_total,
+            human_bytes(v.bytes_verified),
+        );
+    } else {
+        println!("  (skipped verification; startup will verify before downloading)");
+    }
+
+    if start {
+        println!();
+        let state = Arc::new(RwLock::new(UiState::default()));
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        state.write().await.command_tx = Some(command_tx);
+        start_download(Arc::new(meta), output, &state, command_rx, exit_when_done, no_tui).await
+    } else {
+        println!();
+        println!(
+            "  now run: torrust download {} --output {}",
+            torrent.display(),
+            output.display()
+        );
+        Ok(())
+    }
+}
+/// Publish the torrent summary, start the TUI, run the engine, and shut down
+/// gracefully.
+async fn start_download(
+    meta: Arc<Metainfo>,
+    output: PathBuf,
+    state: &Arc<RwLock<UiState>>,
+    command_rx: tokio::sync::mpsc::UnboundedReceiver<torrust::state::Command>,
+    exit_when_done: bool,
+    no_tui: bool,
+) -> Result<()> {
+    {
+        let mut st = state.write().await;
+        st.torrent = Some(torrust::state::TorrentSummary {
+            name: meta.name.clone(),
+            infohash: meta.infohash.to_hex(),
+            total_length: meta.total_length,
+            piece_length: meta.piece_length,
+            piece_count: meta.piece_count() as u32,
+            download_dir: output.display().to_string(),
+            trackers: meta.announce_list.clone(),
+            ..Default::default()
+        });
+        st.log(Level::Info, format!("loaded {}", meta.name));
+        if !no_tui {
+            st.log(Level::Info, format!("logs: {}", log_path().display()));
+        }
+        if meta.announce_list.is_empty() {
+            if meta.private {
+                st.log(
+                    Level::Warn,
+                    "private torrent with no trackers: DHT is disabled for private torrents, so no peers can be found",
+                );
+            } else {
+                st.log(
+                    Level::Warn,
+                    "torrent has no trackers; peers will come from the DHT only",
+                );
+            }
+        }
+    }
+
+    let ui = spawn_ui_if_needed(state, no_tui);
+
+    let engine = Engine::new(meta, Arc::clone(state), command_rx);
+    let handle = tokio::spawn(engine.run(output));
+    finish(handle, state, ui, exit_when_done, exit_when_done || no_tui).await
+}
+
+/// Run the TUI on a dedicated thread unless the caller opted out.
+///
+/// Returns the thread handle so the caller can wait for a graceful shutdown
+/// (terminal restored) instead of letting process exit kill the UI mid-frame.
+fn spawn_ui_if_needed(state: &Arc<RwLock<UiState>>, skip: bool) -> Option<std::thread::JoinHandle<()>> {
+    if skip {
+        return None;
+    }
+    let ui_state = Arc::clone(state);
+    Some(std::thread::spawn(move || {
+        if let Err(e) = torrust::tui::run_tui(ui_state) {
+            tracing::error!("TUI exited with an error: {e}");
+        }
+    }))
+}
+
+/// Await the engine, shut the UI down gracefully, then print a final summary.
+///
+/// When the TUI is active the process must not return while it is mid-frame:
+/// that would leave a frozen stale frame painted on the terminal. So with
+/// `--exit-when-done` we signal shutdown and join the UI thread (which
+/// restores the console) before printing; otherwise we wait for the user to
+/// quit with `q`, leaving the finished state on screen for inspection.
+async fn finish(
+    handle: tokio::task::JoinHandle<Result<()>>,
+    state: &Arc<RwLock<UiState>>,
+    ui: Option<std::thread::JoinHandle<()>>,
+    exit_when_done: bool,
+    print_summary: bool,
+) -> Result<()> {
+    let result = handle.await.context("download task panicked")?;
+
+    if let Err(e) = &result {
+        let mut st = state.write().await;
+        st.log(Level::Error, format!("{e}"));
+        if let Some(t) = &mut st.torrent {
+            t.state = torrust::state::DownloadState::Error;
+        }
+    }
+
+    if exit_when_done {
+        state.write().await.shutdown = true;
+    }
+    if let Some(h) = ui {
+        // `JoinHandle::join` blocks; run it off the async runtime.
+        let _ = tokio::task::spawn_blocking(|| h.join()).await;
+    }
+
+    if print_summary {
+        let st = state.read().await;
+        if let Some(t) = &st.torrent {
+            println!();
+            println!("  {}", t.name);
+            println!("  infohash    {}", t.infohash);
+            println!("  size        {}", t.human_size());
+            println!(
+                "  progress    {:.1}% ({}/{} pieces)",
+                t.progress * 100.0,
+                t.verified_pieces,
+                t.piece_count
+            );
+            println!("  downloaded  {}", t.human_downloaded());
+            println!("  saved to    {}", t.download_dir);
+        }
+        for line in st.log.iter() {
+            println!("  [{}] {}", line.level.label(), line.message);
+        }
+        println!();
+    }
+
+    result
+}
+
+async fn log_to(state: &Arc<RwLock<UiState>>, level: Level, msg: String) {
+    state.write().await.log(level, msg);
+}
+
+fn inspect(path: &std::path::Path) -> Result<()> {
+    let raw =
+        std::fs::read(path).map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+    let m = Metainfo::from_bytes(&raw)?;
+
+    println!("name        {}", m.name);
+    println!("infohash    {}", m.infohash);
+    println!("private     {}", m.private);
+    println!(
+        "total size  {} ({} bytes)",
+        torrust::state::human_bytes(m.total_length),
+        m.total_length
+    );
+    println!("pieces      {} x {}", m.piece_count(), m.piece_length);
+    match &m.announce {
+        Some(a) => println!("announce    {a}"),
+        None => println!("announce    (none)"),
+    }
+    if m.announce_list.len() > 1 {
+        println!("trackers    ({} total)", m.announce_list.len());
+        for t in &m.announce_list {
+            println!("              {t}");
+        }
+    }
+
+    println!("\nfiles");
+    for (p, len) in m.files.iter() {
+        println!(
+            "  {:>12}  {}",
+            torrust::state::human_bytes(len),
+            p.display()
+        );
+    }
+    Ok(())
+}
+
+fn inspect_magnet(uri: &str) -> Result<()> {
+    let m = Magnet::parse(uri)?;
+    println!("infohash    {}", m.infohash);
+    if let Some(dn) = &m.display_name {
+        println!("name        {dn}");
+    }
+    if m.trackers.is_empty() {
+        println!("trackers    (none — DHT only)");
+    } else {
+        println!("trackers    ({} total)", m.trackers.len());
+        for t in &m.trackers {
+            println!("              {t}");
+        }
+    }
+    if m.trackers.is_empty() && m.display_name.is_none() {
+        println!("\nnote: without trackers or a display name, metadata must come from the DHT");
+    }
+    Ok(())
+}
+
+fn log_path() -> PathBuf {
+    std::env::temp_dir().join("torrust.log")
+}
+
+/// With the TUI running, logs go to a file so they cannot corrupt the screen
+/// (if the file cannot be opened they are dropped, never sent to the
+/// terminal). Otherwise they go to stderr.
+fn init_tracing(to_file: bool) {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("torrust=info,warn"));
+    let file_layer = to_file.then(|| {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path())
+            .ok();
+        fmt::layer()
+            .with_writer(file.map(std::sync::Mutex::new).map_or_else(
+                || tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::sink),
+                tracing_subscriber::fmt::writer::BoxMakeWriter::new,
+            ))
+            .with_ansi(false)
+    });
+    let stderr_layer = (!to_file)
+        .then(|| fmt::layer().with_writer(std::io::stderr).with_ansi(false));
+    let _ = tracing_subscriber::registry()
+        .with(file_layer)
+        .with(stderr_layer)
+        .with(filter)
+        .try_init();
+}
+
+/// Guard against a source that is neither a readable file nor a magnet URI.
+fn validate_source(source: &str) -> Result<()> {
+    if source.starts_with("magnet:") {
+        return Ok(());
+    }
+    let p = std::path::Path::new(source);
+    if !p.exists() {
+        bail!(
+            "{source} is neither a magnet: URI nor an existing file.\n\
+             Usage: torrust download <file.torrent|magnet:?xt=...>"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_nonexistent_source() {
+        assert!(
+            validate_source("magnet:?xt=urn:btih:0000000000000000000000000000000000000000").is_ok()
+        );
+        assert!(validate_source(r"C:\definitely\not\here.torrent").is_err());
+    }
+}
