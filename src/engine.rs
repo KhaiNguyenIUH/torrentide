@@ -132,7 +132,15 @@ impl Engine {
         );
         let can_seed = seeder.is_some();
 
-        let mut pool = PeerPool::new(Arc::clone(&self.meta), seeder, LOCAL_PORT, peer_tx);
+        let mut pool = PeerPool::new(
+            Arc::clone(&self.meta),
+            seeder,
+            LOCAL_PORT,
+            peer_tx,
+            crate::ratelimit::Limits::default(),
+            crate::peer::pool::MAX_PEERS,
+            true,
+        );
 
         if can_seed {
             let (listen_tx, mut listen_rx) =

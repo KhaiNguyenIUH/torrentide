@@ -18,6 +18,8 @@ pub mod engine;
 pub mod import;
 pub mod metainfo;
 pub mod peer;
+pub mod portmap;
+pub mod ratelimit;
 pub mod scheduler;
 pub mod state;
 pub mod storage;

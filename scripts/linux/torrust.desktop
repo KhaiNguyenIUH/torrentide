@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Torrust
+Comment=BitTorrent client
+Exec=torrust add %u
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/magnet;application/x-bittorrent;

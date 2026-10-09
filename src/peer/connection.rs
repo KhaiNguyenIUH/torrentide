@@ -7,16 +7,17 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{split, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 use super::wire::{self, Bitfield, Message};
 use crate::metainfo::InfoHash;
+use crate::ratelimit::Limits;
 use crate::storage::Storage;
 
 /// Standard request block size. 16 KiB is what most clients use and keeps the
@@ -51,6 +52,8 @@ pub enum ToPeer {
     SetInterested(bool),
     SetChoking(bool),
     Have(u32),
+    /// Shut the connection down: the writer closes its half and the reader ends.
+    Close,
     /// Send a raw Bitfield message. Sent internally when the connection comes up.
     SendBitfield(Vec<u8>),
     /// A block we read from local storage in response to a peer's `Request`.
@@ -99,6 +102,12 @@ pub struct PeerState {
     pub interested: bool,
     /// True when *they* are choking us.
     pub they_choke: bool,
+    /// True when *they* have told us they want our pieces.
+    pub peer_interested: bool,
+    /// Bytes received from this peer since the last rechoke.
+    pub window_down: u64,
+    /// Bytes sent to this peer since the last rechoke.
+    pub window_up: u64,
     /// Blocks requested but not yet received.
     pub outstanding: HashMap<(u32, u32), Instant>,
     pub downloaded: u64,
@@ -114,6 +123,9 @@ impl PeerState {
             am_choking: true,
             interested: false,
             they_choke: true,
+            peer_interested: false,
+            window_down: 0,
+            window_up: 0,
             outstanding: HashMap::new(),
             downloaded: 0,
             uploaded: 0,
@@ -206,13 +218,19 @@ impl Seeder {
     }
 }
 
+/// The seeder shared between the pool and every live connection, so pieces
+/// verified after a connection was made can still be served over it.
+pub type SharedSeeder = Arc<RwLock<Option<Seeder>>>;
+
 /// Dial a peer and complete the handshake as the initiating side.
 pub async fn connect(
     addr: SocketAddr,
     infohash: InfoHash,
     piece_count: usize,
-    seeder: Option<Seeder>,
+    seeder: SharedSeeder,
     inbound_tx: mpsc::UnboundedSender<FromPeer>,
+    limits: Limits,
+    auto_unchoke: bool,
 ) -> Result<PeerHandle> {
     // A short connect timeout matters: a tracker can hand back many dead peers,
     // and each one that lingers for the full timeout delays the next attempt.
@@ -242,6 +260,8 @@ pub async fn connect(
         seeder,
         inbound_tx,
         false,
+        limits,
+        auto_unchoke,
     )
     .await?;
 
@@ -253,19 +273,44 @@ pub async fn connect(
 
 /// Complete the handshake on an inbound socket and start serving.
 pub async fn accept(
-    stream: TcpStream,
+    mut stream: TcpStream,
     infohash: InfoHash,
     piece_count: usize,
-    seeder: Option<Seeder>,
+    seeder: SharedSeeder,
     inbound_tx: mpsc::UnboundedSender<FromPeer>,
+    limits: Limits,
+    auto_unchoke: bool,
+) -> Result<PeerHandle> {
+    let hs = wire::handshake_incoming(&mut stream).await?;
+    accept_handshaken(
+        stream,
+        hs,
+        infohash,
+        piece_count,
+        seeder,
+        inbound_tx,
+        limits,
+        auto_unchoke,
+    )
+    .await
+}
+
+/// Like [`accept`], for a socket whose peer handshake was already read (for
+/// example by a session listener routing on the infohash).
+pub async fn accept_handshaken(
+    stream: TcpStream,
+    hs: wire::Handshake,
+    infohash: InfoHash,
+    piece_count: usize,
+    seeder: SharedSeeder,
+    inbound_tx: mpsc::UnboundedSender<FromPeer>,
+    limits: Limits,
+    auto_unchoke: bool,
 ) -> Result<PeerHandle> {
     let addr = stream
         .peer_addr()
         .context("reading peer address of inbound connection")?;
     let _ = stream.set_nodelay(true);
-    let (mut rd, mut wr) = split(stream);
-
-    let hs = wire::handshake_incoming(&mut rd).await?;
     if hs.infohash != infohash.0 {
         return Err(anyhow!(
             "peer {addr} wants infohash {} but we are serving {}",
@@ -273,6 +318,7 @@ pub async fn accept(
             infohash
         ));
     }
+    let (rd, mut wr) = split(stream);
     // The dialer waits for our half of the handshake before sending anything.
     wire::handshake_outgoing(&mut wr, &infohash.0, true, false, false).await?;
 
@@ -289,6 +335,8 @@ pub async fn accept(
         seeder,
         inbound_tx,
         true,
+        limits,
+        auto_unchoke,
     )
     .await
 }
@@ -300,9 +348,11 @@ async fn spawn_tasks<S>(
     addr: SocketAddr,
     peer_id: [u8; 20],
     piece_count: usize,
-    seeder: Option<Seeder>,
+    seeder: SharedSeeder,
     inbound_tx: mpsc::UnboundedSender<FromPeer>,
     inbound: bool,
+    limits: Limits,
+    auto_unchoke: bool,
 ) -> Result<PeerHandle>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -311,14 +361,22 @@ where
     let state = Arc::new(Mutex::new(PeerState::new(piece_count)));
     let reader_state = Arc::clone(&state);
     let reader_tx = peer_tx.clone();
-    let writer_seed = seeder.clone();
+    let close = Arc::new(Notify::new());
+    let reader_close = Arc::clone(&close);
+    let reader_limits = limits.clone();
+    let reader_seeder = Arc::clone(&seeder);
 
     // ---- reader ----
     tokio::spawn(async move {
         let mut err_msg: Option<String> = None;
         loop {
-            let next_msg = tokio::time::timeout(PEER_IDLE_TIMEOUT, wire::read_message(&mut rd))
-                .await;
+            let next_msg = tokio::select! {
+                _ = reader_close.notified() => {
+                    err_msg = Some("closed locally".into());
+                    break;
+                }
+                m = tokio::time::timeout(PEER_IDLE_TIMEOUT, wire::read_message(&mut rd)) => m,
+            };
 
             match next_msg {
                 Err(_) => {
@@ -335,6 +393,7 @@ where
 
                     let mut forward: Option<FromPeer> = None;
                     let mut reply: Option<ToPeer> = None;
+                    let mut charge_down = 0usize;
 
                     match msg {
                         Message::KeepAlive => {}
@@ -359,16 +418,18 @@ where
                             forward = Some(FromPeer::Bitfield(bf));
                         }
                         Message::Interested => {
+                            st.peer_interested = true;
                             forward = Some(FromPeer::Interested(true));
-                            // A peer that wants data from us should not be
-                            // choked; serve it.
+                            // Without a choker, a peer that wants data from us
+                            // is simply served.
                             // The writer flips `am_choking` when it sends the
                             // unchoke; flipping it here made the writer skip it.
-                            if st.am_choking {
+                            if auto_unchoke && st.am_choking {
                                 reply = Some(ToPeer::SetChoking(false));
                             }
                         }
                         Message::NotInterested => {
+                            st.peer_interested = false;
                             forward = Some(FromPeer::Interested(false));
                         }
                         Message::Piece {
@@ -378,6 +439,8 @@ where
                         } => {
                             st.outstanding.remove(&(index, begin));
                             st.downloaded += block.len() as u64;
+                            st.window_down += block.len() as u64;
+                            charge_down = block.len();
                             forward = Some(FromPeer::Piece {
                                 index,
                                 begin,
@@ -389,17 +452,20 @@ where
                             begin,
                             length,
                         } => {
-                            if let Some(s) = &seeder {
-                                if !st.am_choking {
-                                    if let Some((i, b, data)) = s.read_requested(index, begin, length)
-                                    {
-                                        st.uploaded += data.len() as u64;
-                                        reply = Some(ToPeer::Serve {
-                                            index: i,
-                                            begin: b,
-                                            block: data,
-                                        });
-                                    }
+                            if !st.am_choking {
+                                let hit = reader_seeder
+                                    .read()
+                                    .unwrap()
+                                    .as_ref()
+                                    .and_then(|s| s.read_requested(index, begin, length));
+                                if let Some((i, b, data)) = hit {
+                                    st.uploaded += data.len() as u64;
+                                    st.window_up += data.len() as u64;
+                                    reply = Some(ToPeer::Serve {
+                                        index: i,
+                                        begin: b,
+                                        block: data,
+                                    });
                                 }
                             }
                         }
@@ -409,6 +475,14 @@ where
                     }
 
                     drop(st);
+
+                    // ponytail: backpressure only. The kernel socket buffers of
+                    // every peer still fill, so real rate overshoots the limit
+                    // by about peers x buffer size; shape reads per peer if
+                    // that ever matters.
+                    if charge_down > 0 {
+                        reader_limits.acquire_down(charge_down).await;
+                    }
 
                     if let Some(ev) = forward {
                         if inbound_tx.send(ev).is_err() {
@@ -433,7 +507,7 @@ where
     let writer_state = Arc::clone(&state);
     // Queue the initial Bitfield before the loop starts so it is always the
     // first thing the peer sees from us.
-    if let Some(s) = &writer_seed {
+    if let Some(s) = seeder.read().unwrap().as_ref() {
         let _ = peer_tx.send(ToPeer::SendBitfield(encode_bitfield(&s.bitfield)));
     }
     tokio::spawn(async move {
@@ -501,12 +575,16 @@ where
                     Message::Choke
                 }
                 ToPeer::Have(index) => Message::Have { index },
+                ToPeer::Close => break,
                 ToPeer::SendBitfield(bytes) => Message::Bitfield { bits: bytes },
-                ToPeer::Serve { index, begin, block } => Message::Piece {
-                    index,
-                    begin,
-                    block,
-                },
+                ToPeer::Serve { index, begin, block } => {
+                    limits.acquire_up(block.len()).await;
+                    Message::Piece {
+                        index,
+                        begin,
+                        block,
+                    }
+                }
             };
 
             let framed = wire::encode_framed(&msg);
@@ -515,6 +593,8 @@ where
             }
             let _ = wr.flush().await;
         }
+        let _ = wr.shutdown().await;
+        close.notify_one();
     });
 
     Ok(PeerHandle {
