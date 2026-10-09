@@ -7,12 +7,16 @@
 //! [`UiState`] is only ever read as an immutable snapshot.
 
 use std::io::{self, Stdout, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -29,7 +33,7 @@ use tokio::sync::RwLock;
 
 use crate::state::{
     human_bytes, now_hms, Command, DownloadState, FileSummary, Level, LogEntry, PeerSummary,
-    TorrentSummary, UiState,
+    SessionCommand, SessionState, Settings, TorrentId, TorrentSummary, TorrentView, UiState,
 };
 
 /// Narrowest terminal the full layout is attempted in.
@@ -418,7 +422,11 @@ fn torrent_or_placeholder(torrent: Option<&TorrentSummary>) -> TorrentSummary {
 
 /// Footer key hints, with the clock right-aligned when there is room for it.
 fn bindings_line(width: u16) -> Line<'static> {
-    let keys = KEYS;
+    keys_line(&KEYS, width)
+}
+
+/// Footer hints for an arbitrary key list; shared by both screens.
+fn keys_line(keys: &[(&'static str, &'static str)], width: u16) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     for (i, (key, desc)) in keys.iter().enumerate() {
@@ -597,7 +605,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn restore() {
         let mut out = io::stdout();
-        let _ = execute!(out, LeaveAlternateScreen, Show);
+        let _ = execute!(out, DisableBracketedPaste, LeaveAlternateScreen, Show);
         let _ = disable_raw_mode();
         let _ = out.flush();
     }
@@ -711,11 +719,11 @@ fn render(frame: &mut Frame, snapshot: &Snapshot, app: &mut App) {
     render_peers(frame, chunks[2], app, app.focus == Focus::Peers);
     render_files(frame, chunks[3], app, app.focus == Focus::Files);
 
-    render_log(frame, chunks[4], state, app);
-    render_footer(frame, chunks[5], state.warning.as_deref());
+    render_log(frame, chunks[4], &state.log, "log", app);
+    render_footer(frame, chunks[5], state.warning.as_deref(), &KEYS);
 
     if app.show_help {
-        render_help(frame, area);
+        render_help(frame, area, &KEYS, (50, 60));
     }
 }
 
@@ -941,15 +949,15 @@ fn render_files(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
 /// Render the tail of the log, scrolling back through history when the user has
 /// paged up. The scroll offset is clamped here because this is the first place
 /// both the buffer size and the visible height are known.
-fn render_log(frame: &mut Frame, area: Rect, state: &UiState, app: &mut App) {
+fn render_log(frame: &mut Frame, area: Rect, log: &[LogEntry], label: &str, app: &mut App) {
     let inner_width = usize::from(area.width.saturating_sub(2));
     let inner_height = usize::from(area.height.saturating_sub(2));
 
     // The buffer only ever shrinks when it is trimmed at 500 entries, but a
     // resize can also shrink the window under us.
-    app.clamp_log(state.log.len(), inner_height);
-    let visible = log_window(&state.log, inner_height, app.log_scroll);
-    let end = state.log.len() - app.log_scroll.min(state.log.len());
+    app.clamp_log(log.len(), inner_height);
+    let visible = log_window(log, inner_height, app.log_scroll);
+    let end = log.len() - app.log_scroll.min(log.len());
     let start = end.saturating_sub(visible.len());
 
     let lines: Vec<Line> = visible
@@ -968,10 +976,10 @@ fn render_log(frame: &mut Frame, area: Rect, state: &UiState, app: &mut App) {
         })
         .collect();
 
-    let title = if state.log.is_empty() {
-        " log ".to_string()
+    let title = if log.is_empty() {
+        format!(" {label} ")
     } else {
-        format!(" log {}-{}/{} ", start + 1, end, state.log.len())
+        format!(" {label} {}-{}/{} ", start + 1, end, log.len())
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -981,7 +989,7 @@ fn render_log(frame: &mut Frame, area: Rect, state: &UiState, app: &mut App) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, warning: Option<&str>) {
+fn render_footer(frame: &mut Frame, area: Rect, warning: Option<&str>, keys: &[(&'static str, &'static str)]) {
     let mut lines: Vec<Line> = Vec::new();
     if let Some(message) = warning {
         let text = truncate_line(message, usize::from(area.width).saturating_sub(2));
@@ -990,12 +998,11 @@ fn render_footer(frame: &mut Frame, area: Rect, warning: Option<&str>) {
             Span::styled(text, warn_style()),
         ]));
     }
-    lines.push(bindings_line(area.width));
+    lines.push(keys_line(keys, area.width));
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
-    let keys = KEYS;
+fn render_help(frame: &mut Frame, area: Rect, keys: &[(&str, &str)], size: (u16, u16)) {
     let mut lines: Vec<Line> = vec![Line::from(Span::styled("Keys", heading_style()))];
     for (key, desc) in keys.iter() {
         lines.push(Line::from(vec![
@@ -1015,7 +1022,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         .style(base_style())
         .title(Span::styled(" help ", heading_style()));
 
-    let popup = centered_rect(50, 60, area);
+    let popup = centered_rect(size.0, size.1, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), popup);
 }
@@ -1108,6 +1115,1175 @@ pub fn run_tui(state: Arc<RwLock<UiState>>) -> Result<()> {
     std::thread::Builder::new()
         .name("torrust-tui".to_string())
         .spawn(move || run_loop(state))
+        .context("failed to spawn the TUI thread")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("the TUI thread panicked"))?
+}
+
+// ---------------------------------------------------------------------------
+// Session screen (many torrents)
+// ---------------------------------------------------------------------------
+
+/// Key bindings advertised in the session footer and help overlay. The most
+/// used keys come first because the footer is clipped on narrow terminals.
+const SESSION_KEYS: [(&str, &str); 15] = [
+    ("a", "add"),
+    ("s", "start/stop"),
+    ("p", "pause"),
+    ("d", "remove"),
+    ("l", "limits"),
+    ("o", "settings"),
+    ("tab/1-6", "panel"),
+    ("j/k", "torrents"),
+    ("J/K", "files"),
+    ("space", "skip file"),
+    ("PgUp/PgDn", "log"),
+    ("?", "keys"),
+    ("q", "quit"),
+    ("Enter", "confirm"),
+    ("Esc", "cancel"),
+];
+
+/// Footer hints: the global keys only; the modal keys live in the help overlay.
+const SESSION_FOOTER_KEYS: [(&str, &str); 9] = [
+    ("a", "add"),
+    ("s", "start/stop"),
+    ("p", "pause"),
+    ("d", "remove"),
+    ("l", "limits"),
+    ("o", "settings"),
+    ("?", "keys"),
+    ("q", "quit"),
+    ("tab", "panel"),
+];
+
+/// Text shown in the torrent table while the session holds nothing.
+const EMPTY_MESSAGE: &str = "No torrents \u{2014} press a to add one";
+
+/// Name shown before a magnet link has produced metadata.
+const PENDING_NAME: &str = "(fetching metadata...)";
+
+/// Compact byte count for table cells, e.g. `1.4G`, `523K`, `12B`.
+fn compact_bytes(n: u64) -> String {
+    const UNITS: [char; 5] = ['K', 'M', 'G', 'T', 'P'];
+    if n < 1024 {
+        return format!("{n}B");
+    }
+    let mut v = n as f64 / 1024.0;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if v < 10.0 {
+        format!("{v:.1}{}", UNITS[i])
+    } else {
+        format!("{v:.0}{}", UNITS[i])
+    }
+}
+
+/// A rate for a table cell; idle is a dash so busy rows stand out.
+fn compact_rate(rate: f64) -> String {
+    if !rate.is_finite() || rate < 1.0 {
+        "-".to_string()
+    } else {
+        format!("{}/s", compact_bytes(rate as u64))
+    }
+}
+
+/// ETA for a table cell: `1h04m`, `4m09s`, `09s`, or `--` without an estimate.
+fn compact_eta(eta: Option<f64>) -> String {
+    let secs = match eta {
+        Some(s) if s.is_finite() && s > 0.0 => s.round() as u64,
+        _ => return "--".to_string(),
+    };
+    if secs >= 86_400 {
+        format!("{}d{:02}h", secs / 86_400, (secs % 86_400) / 3600)
+    } else if secs >= 3600 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// A byte-per-second cap as shown to the user; 0 is unlimited.
+fn limit_label(bytes: u64) -> String {
+    if bytes == 0 {
+        "unlimited".to_string()
+    } else {
+        format!("{}/s", human_bytes(bytes))
+    }
+}
+
+fn view_state(view: &TorrentView) -> DownloadState {
+    view.ui
+        .torrent
+        .as_ref()
+        .map(|t| t.state)
+        .unwrap_or(DownloadState::Connecting)
+}
+
+fn view_name(view: &TorrentView) -> String {
+    match view.ui.torrent.as_ref() {
+        Some(t) if !t.name.is_empty() => t.name.clone(),
+        _ => PENDING_NAME.to_string(),
+    }
+}
+
+const TABLE_HEADERS: [&str; 10] = [
+    "#", "Name", "Size", "Done", "Status", "\u{2193}", "\u{2191}", "ETA", "Peers", "Ratio",
+];
+
+/// The ten cells of a torrent table row, in [`TABLE_HEADERS`] order.
+fn torrent_cells(index: usize, view: &TorrentView) -> [String; 10] {
+    let summary = view.ui.torrent.as_ref();
+    let size = match summary {
+        Some(t) if t.total_length > 0 => compact_bytes(t.total_length),
+        _ => "?".to_string(),
+    };
+    [
+        (index + 1).to_string(),
+        view_name(view),
+        size,
+        percent(summary.map(|t| t.progress).unwrap_or(0.0)),
+        view_state(view).label().to_string(),
+        compact_rate(summary.map(|t| t.download_rate).unwrap_or(0.0)),
+        compact_rate(summary.map(|t| t.upload_rate).unwrap_or(0.0)),
+        compact_eta(summary.and_then(|t| t.eta_secs)),
+        view.ui.peers.len().to_string(),
+        format!("{:.2}", view.ratio),
+    ]
+}
+
+/// Which table columns fit in `width` cells. Narrow terminals drop the
+/// secondary columns (size, ETA, peers, ratio) rather than crushing the name.
+fn visible_columns(width: u16) -> &'static [usize] {
+    if width >= 80 {
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    } else if width >= 56 {
+        &[0, 1, 3, 4, 5, 6]
+    } else {
+        &[0, 1, 3, 5]
+    }
+}
+
+fn column_width(column: usize) -> Constraint {
+    match column {
+        0 => Constraint::Length(3),
+        1 => Constraint::Min(8),
+        2 | 3 => Constraint::Length(6),
+        4 => Constraint::Length(11),
+        5 | 6 => Constraint::Length(8),
+        7 => Constraint::Length(7),
+        _ => Constraint::Length(5),
+    }
+}
+
+/// Rows the torrent table takes out of `body` rows: enough for every torrent
+/// plus borders and header, but never more than ~45% so the detail panel
+/// keeps room, and never so few that a row cannot be seen.
+fn table_rows(torrents: usize, body: u16) -> u16 {
+    let wanted = u16::try_from(torrents).unwrap_or(u16::MAX).saturating_add(3);
+    wanted.min(body * 45 / 100).max(4).min(body)
+}
+
+/// One-line session summary for the header.
+fn header_summary(state: &SessionState) -> String {
+    let mut text = format!(
+        "{} torrent{}  \u{2193} {}/s  \u{2191} {}/s",
+        state.torrents.len(),
+        if state.torrents.len() == 1 { "" } else { "s" },
+        human_bytes(state.download_rate.max(0.0) as u64),
+        human_bytes(state.upload_rate.max(0.0) as u64),
+    );
+    if !state.port_status.is_empty() {
+        text.push_str("  ");
+        text.push_str(&state.port_status);
+    }
+    text
+}
+
+/// Keep the selection on the same torrent across refreshes.
+///
+/// The list can grow or shrink under the user, so the row number alone would
+/// silently retarget `d` or `s` onto a different torrent. If the selected id is
+/// gone the old row position is kept (clamped), which lands on the torrent that
+/// slid into its place.
+fn reselect(prev_id: Option<&str>, prev_index: Option<usize>, ids: &[&str]) -> Option<usize> {
+    if let Some(id) = prev_id {
+        if let Some(pos) = ids.iter().position(|candidate| *candidate == id) {
+            return Some(pos);
+        }
+    }
+    clamp_selection(prev_index, ids.len())
+}
+
+/// Show the end of `text` within `width` cells, so the cursor end of a long
+/// path stays visible while typing.
+fn tail_fit(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let tail: String = text.chars().skip(count - (width - 1)).collect();
+    format!("\u{2026}{tail}")
+}
+
+/// Strip whitespace and the quotes a terminal adds when a file is dragged in.
+fn clean_input(text: &str) -> String {
+    text.trim().trim_matches(['"', '\'']).trim().to_string()
+}
+
+/// A single-line text buffer. The cursor is always at the end; that covers
+/// typing, paste and backspace, which is all the prompts need.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TextInput {
+    text: String,
+}
+
+impl TextInput {
+    fn new(text: impl Into<String>) -> Self {
+        TextInput { text: text.into() }
+    }
+
+    /// Apply an editing key; returns whether the buffer changed.
+    fn handle(&mut self, key: &KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Char('u') if ctrl => {
+                self.text.clear();
+                true
+            }
+            KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
+                self.text.push(c);
+                true
+            }
+            KeyCode::Backspace => self.text.pop().is_some(),
+            _ => false,
+        }
+    }
+
+    /// Insert pasted text. Only the first line is kept: a trailing newline
+    /// from the clipboard must not submit the prompt.
+    fn paste(&mut self, pasted: &str) {
+        let line = pasted.lines().next().unwrap_or("");
+        self.text.extend(line.chars().filter(|c| !c.is_control()));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldKind {
+    Text,
+    Number,
+    Toggle,
+}
+
+#[derive(Debug, Clone)]
+struct Field {
+    label: &'static str,
+    kind: FieldKind,
+    input: TextInput,
+    on: bool,
+}
+
+impl Field {
+    fn text(label: &'static str, value: impl Into<String>) -> Self {
+        Field { label, kind: FieldKind::Text, input: TextInput::new(value), on: false }
+    }
+
+    fn number(label: &'static str, value: impl Into<String>) -> Self {
+        Field { label, kind: FieldKind::Number, input: TextInput::new(value), on: false }
+    }
+
+    fn toggle(label: &'static str, on: bool) -> Self {
+        Field { label, kind: FieldKind::Toggle, input: TextInput::default(), on }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormAction {
+    None,
+    Submit,
+    Cancel,
+}
+
+/// A small modal form: a focused field list plus an inline error line.
+#[derive(Debug, Clone)]
+struct Form {
+    title: &'static str,
+    fields: Vec<Field>,
+    focus: usize,
+    error: Option<String>,
+}
+
+impl Form {
+    fn new(title: &'static str, fields: Vec<Field>) -> Self {
+        Form { title, fields, focus: 0, error: None }
+    }
+
+    fn on_key(&mut self, key: &KeyEvent) -> FormAction {
+        let last = self.fields.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => return FormAction::Cancel,
+            KeyCode::Enter => return FormAction::Submit,
+            KeyCode::Tab | KeyCode::Down => self.focus = (self.focus + 1).min(last),
+            KeyCode::BackTab | KeyCode::Up => self.focus = self.focus.saturating_sub(1),
+            _ => {
+                let Some(field) = self.fields.get_mut(self.focus) else {
+                    return FormAction::None;
+                };
+                let changed = match field.kind {
+                    FieldKind::Toggle => match key.code {
+                        KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
+                            field.on = !field.on;
+                            true
+                        }
+                        _ => false,
+                    },
+                    _ => field.input.handle(key),
+                };
+                if changed {
+                    self.error = None;
+                }
+            }
+        }
+        FormAction::None
+    }
+
+    fn paste(&mut self, pasted: &str) {
+        if let Some(field) = self.fields.get_mut(self.focus) {
+            if field.kind != FieldKind::Toggle {
+                field.input.paste(pasted);
+                self.error = None;
+            }
+        }
+    }
+}
+
+/// Parse a KiB/s field into bytes per second; 0 means unlimited.
+fn parse_kib(label: &str, text: &str) -> Result<u64, String> {
+    let kib: u64 = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("{label}: enter a whole number of KiB/s"))?;
+    kib.checked_mul(1024)
+        .ok_or_else(|| format!("{label}: value is too large"))
+}
+
+fn kib_text(bytes: u64) -> String {
+    bytes.div_ceil(1024).to_string()
+}
+
+fn limits_form(down: u64, up: u64) -> Form {
+    Form::new(
+        "torrent limits",
+        vec![
+            Field::number("Download (KiB/s, 0 = off)", kib_text(down)),
+            Field::number("Upload (KiB/s, 0 = off)", kib_text(up)),
+        ],
+    )
+}
+
+fn parse_limits(form: &Form) -> Result<(u64, u64), String> {
+    Ok((
+        parse_kib("Download", &form.fields[0].input.text)?,
+        parse_kib("Upload", &form.fields[1].input.text)?,
+    ))
+}
+
+fn settings_form(settings: &Settings) -> Form {
+    Form::new(
+        "settings",
+        vec![
+            Field::text("Download folder", settings.download_dir.display().to_string()),
+            Field::number("Listen port", settings.listen_port.to_string()),
+            Field::number("Download (KiB/s, 0 = off)", kib_text(settings.download_limit)),
+            Field::number("Upload (KiB/s, 0 = off)", kib_text(settings.upload_limit)),
+            Field::number("Seed ratio (0 = forever)", settings.ratio_target.to_string()),
+            Field::number("Max peers per torrent", settings.max_peers.to_string()),
+            Field::toggle("DHT", settings.dht),
+            Field::toggle("Port forwarding", settings.port_forwarding),
+        ],
+    )
+}
+
+/// Validate the settings form. Nothing is sent to the session unless every
+/// field parses, so a typo can never reach the engine as a bad value.
+fn parse_settings(form: &Form) -> Result<Settings, String> {
+    let f = &form.fields;
+    let dir = clean_input(&f[0].input.text);
+    if dir.is_empty() {
+        return Err("Download folder: enter a path".to_string());
+    }
+    let listen_port = match f[1].input.text.trim().parse::<u16>() {
+        Ok(p) if p > 0 => p,
+        _ => return Err("Listen port: enter a number from 1 to 65535".to_string()),
+    };
+    let ratio_target = match f[4].input.text.trim().parse::<f64>() {
+        Ok(r) if r.is_finite() && r >= 0.0 => r,
+        _ => return Err("Seed ratio: enter a number, 0 or more".to_string()),
+    };
+    let max_peers = match f[5].input.text.trim().parse::<usize>() {
+        Ok(n) if n > 0 => n,
+        _ => return Err("Max peers: enter a whole number, 1 or more".to_string()),
+    };
+    Ok(Settings {
+        download_dir: PathBuf::from(dir),
+        listen_port,
+        download_limit: parse_kib("Download", &f[2].input.text)?,
+        upload_limit: parse_kib("Upload", &f[3].input.text)?,
+        ratio_target,
+        max_peers,
+        dht: f[6].on,
+        port_forwarding: f[7].on,
+    })
+}
+
+/// The add-torrent prompt: first the source, then the optional save folder.
+#[derive(Debug, Clone)]
+struct AddPrompt {
+    source: Option<String>,
+    input: TextInput,
+    default_dir: String,
+    error: Option<String>,
+}
+
+impl AddPrompt {
+    fn new(default_dir: String) -> Self {
+        AddPrompt { source: None, input: TextInput::default(), default_dir, error: None }
+    }
+
+    /// Advance on Enter; yields the command once both answers are in.
+    fn submit(&mut self) -> Option<SessionCommand> {
+        let text = clean_input(&self.input.text);
+        match self.source.clone() {
+            None => {
+                if text.is_empty() {
+                    self.error = Some("enter a .torrent path or a magnet link".to_string());
+                } else {
+                    self.source = Some(text);
+                    self.input.text.clear();
+                    self.error = None;
+                }
+                None
+            }
+            Some(source) => Some(SessionCommand::Add {
+                source,
+                dir: if text.is_empty() { None } else { Some(PathBuf::from(text)) },
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+enum Modal {
+    #[default]
+    None,
+    Help,
+    Add(AddPrompt),
+    Remove { id: TorrentId, name: String },
+    Limits { id: TorrentId, form: Form },
+    Settings(Form),
+}
+
+/// The panels under the torrent table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Tab {
+    #[default]
+    General,
+    Peers,
+    Files,
+    Trackers,
+    Log,
+    Session,
+}
+
+impl Tab {
+    const ALL: [Tab; 6] =
+        [Tab::General, Tab::Peers, Tab::Files, Tab::Trackers, Tab::Log, Tab::Session];
+
+    fn label(self) -> &'static str {
+        match self {
+            Tab::General => "General",
+            Tab::Peers => "Peers",
+            Tab::Files => "Files",
+            Tab::Trackers => "Trackers",
+            Tab::Log => "Log",
+            Tab::Session => "Session",
+        }
+    }
+
+    fn index(self) -> usize {
+        Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
+    }
+
+    fn step(self, delta: isize) -> Tab {
+        let n = Tab::ALL.len() as isize;
+        Tab::ALL[(self.index() as isize + delta).rem_euclid(n) as usize]
+    }
+}
+
+/// The tab strip. Inactive tabs shrink to their number when the full labels
+/// would not fit.
+fn tab_line(active: Tab, width: u16) -> Line<'static> {
+    let full: usize = Tab::ALL.iter().map(|t| t.label().len() + 4).sum();
+    let compact = usize::from(width) < full;
+    let mut spans = Vec::new();
+    for (i, tab) in Tab::ALL.iter().enumerate() {
+        let text = if compact && *tab != active {
+            format!(" {} ", i + 1)
+        } else {
+            format!(" {} {} ", i + 1, tab.label())
+        };
+        let style = if *tab == active { selection_style() } else { muted_style() };
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(spans)
+}
+
+/// What key handling needs to know about one torrent between frames.
+#[derive(Debug, Clone)]
+struct RowInfo {
+    id: TorrentId,
+    name: String,
+    state: DownloadState,
+    download_limit: u64,
+    upload_limit: u64,
+}
+
+struct SessionApp {
+    rows: Vec<RowInfo>,
+    selected: Option<usize>,
+    selected_id: Option<TorrentId>,
+    table_offset: usize,
+    tab: Tab,
+    /// Peers/files/log view state, shared with the single-torrent renderers.
+    view: App,
+    settings: Settings,
+    modal: Modal,
+    cmd: Option<tokio::sync::mpsc::UnboundedSender<SessionCommand>>,
+    quit: bool,
+}
+
+impl SessionApp {
+    fn new() -> Self {
+        SessionApp {
+            rows: Vec::new(),
+            selected: None,
+            selected_id: None,
+            table_offset: 0,
+            tab: Tab::default(),
+            view: App::default(),
+            settings: Settings::default(),
+            modal: Modal::None,
+            cmd: None,
+            quit: false,
+        }
+    }
+
+    /// Absorb a fresh snapshot: refresh the rows, keep the selection on the
+    /// same torrent, and rebuild the per-torrent peer and file views.
+    fn sync(&mut self, state: &SessionState) {
+        self.rows = state
+            .torrents
+            .iter()
+            .map(|t| RowInfo {
+                id: t.id.clone(),
+                name: view_name(t),
+                state: view_state(t),
+                download_limit: t.download_limit,
+                upload_limit: t.upload_limit,
+            })
+            .collect();
+        self.settings = state.settings.clone();
+        if self.cmd.is_none() {
+            self.cmd = state.command_tx.clone();
+        }
+
+        let ids: Vec<&str> = self.rows.iter().map(|r| r.id.as_str()).collect();
+        self.selected = reselect(self.selected_id.as_deref(), self.selected, &ids);
+        let new_id = self.selected.map(|i| self.rows[i].id.clone());
+        if new_id != self.selected_id {
+            self.view.selected = None;
+            self.view.file_selected = None;
+            self.view.log_scroll = 0;
+            self.selected_id = new_id;
+        }
+
+        let current = self.selected.and_then(|i| state.torrents.get(i));
+        self.view.peers = current.map(|t| sort_peers(&t.ui.peers)).unwrap_or_default();
+        self.view.files = current
+            .and_then(|t| t.ui.torrent.as_ref())
+            .map(|s| s.files.clone())
+            .unwrap_or_default();
+        self.view.selected = clamp_selection(self.view.selected, self.view.peers.len());
+        self.view.file_selected = clamp_selection(self.view.file_selected, self.view.files.len());
+    }
+
+    fn current(&self) -> Option<&RowInfo> {
+        self.selected.and_then(|i| self.rows.get(i))
+    }
+
+    /// Send a command to the session. Never blocks; inert without a channel.
+    fn send(&self, cmd: SessionCommand) {
+        if let Some(tx) = &self.cmd {
+            let _ = tx.send(cmd);
+        }
+    }
+
+    fn move_torrent(&mut self, delta: isize) {
+        self.selected = move_selection(self.selected, self.rows.len(), delta);
+        let new_id = self.selected.map(|i| self.rows[i].id.clone());
+        if new_id != self.selected_id {
+            self.view.selected = None;
+            self.view.file_selected = None;
+            self.view.log_scroll = 0;
+            self.selected_id = new_id;
+        }
+    }
+
+    fn set_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.view.log_scroll = 0;
+    }
+
+    fn quit_session(&mut self) {
+        self.send(SessionCommand::Quit);
+        self.quit = true;
+    }
+
+    /// Apply a key press. `key` is expected to already be filtered to Press
+    /// or Repeat events.
+    fn on_key(&mut self, key: KeyEvent) {
+        if !matches!(self.modal, Modal::None) {
+            self.on_modal_key(key);
+            return;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('c') if ctrl => self.quit_session(),
+            KeyCode::Char('q') => self.quit_session(),
+            KeyCode::Char('j') | KeyCode::Down => self.move_torrent(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_torrent(-1),
+            KeyCode::Char('J') => {
+                self.view.file_selected =
+                    move_selection(self.view.file_selected, self.view.files.len(), 1);
+            }
+            KeyCode::Char('K') => {
+                self.view.file_selected =
+                    move_selection(self.view.file_selected, self.view.files.len(), -1);
+            }
+            KeyCode::Tab => self.set_tab(self.tab.step(1)),
+            KeyCode::BackTab => self.set_tab(self.tab.step(-1)),
+            KeyCode::Char(c @ '1'..='6') => self.set_tab(Tab::ALL[usize::from(c as u8 - b'1')]),
+            KeyCode::Char(' ') if self.tab == Tab::Files => {
+                let file = self
+                    .view
+                    .file_selected
+                    .and_then(|i| self.view.files.get(i))
+                    .map(|f| f.index);
+                if let (Some(row), Some(index)) = (self.current(), file) {
+                    self.send(SessionCommand::Torrent(row.id.clone(), Command::ToggleFile(index)));
+                }
+            }
+            KeyCode::Char('a') => {
+                let dir = self.settings.download_dir.display().to_string();
+                self.modal = Modal::Add(AddPrompt::new(dir));
+            }
+            KeyCode::Char('s') => {
+                if let Some(row) = self.current() {
+                    let id = row.id.clone();
+                    self.send(if row.state == DownloadState::Stopped {
+                        SessionCommand::Start(id)
+                    } else {
+                        SessionCommand::Stop(id)
+                    });
+                }
+            }
+            KeyCode::Char('p') => {
+                if let Some(row) = self.current() {
+                    let id = row.id.clone();
+                    match row.state {
+                        DownloadState::Stopped => {}
+                        DownloadState::Paused => {
+                            self.send(SessionCommand::Torrent(id, Command::Resume))
+                        }
+                        _ => self.send(SessionCommand::Torrent(id, Command::Pause)),
+                    }
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(row) = self.current() {
+                    self.modal = Modal::Remove { id: row.id.clone(), name: row.name.clone() };
+                }
+            }
+            KeyCode::Char('l') => {
+                if let Some(row) = self.current() {
+                    self.modal = Modal::Limits {
+                        id: row.id.clone(),
+                        form: limits_form(row.download_limit, row.upload_limit),
+                    };
+                }
+            }
+            KeyCode::Char('o') => self.modal = Modal::Settings(settings_form(&self.settings)),
+            KeyCode::Char('?') => self.modal = Modal::Help,
+            KeyCode::PageDown => self.view.page_log(-5),
+            KeyCode::PageUp => self.view.page_log(5),
+            KeyCode::Home => self.view.page_log(isize::MAX),
+            KeyCode::End => self.view.log_scroll = 0,
+            _ => {}
+        }
+    }
+
+    fn on_modal_key(&mut self, key: KeyEvent) {
+        let modal = std::mem::take(&mut self.modal);
+        self.modal = match modal {
+            Modal::None => Modal::None,
+            Modal::Help => match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') | KeyCode::Char('q') => {
+                    Modal::None
+                }
+                _ => Modal::Help,
+            },
+            Modal::Add(mut prompt) => match key.code {
+                KeyCode::Esc => Modal::None,
+                KeyCode::Enter => match prompt.submit() {
+                    Some(cmd) => {
+                        self.send(cmd);
+                        Modal::None
+                    }
+                    None => Modal::Add(prompt),
+                },
+                _ => {
+                    if prompt.input.handle(&key) {
+                        prompt.error = None;
+                    }
+                    Modal::Add(prompt)
+                }
+            },
+            Modal::Remove { id, name } => match key.code {
+                KeyCode::Char('k') => {
+                    self.send(SessionCommand::Remove { id, delete_data: false });
+                    Modal::None
+                }
+                KeyCode::Char('D') => {
+                    self.send(SessionCommand::Remove { id, delete_data: true });
+                    Modal::None
+                }
+                KeyCode::Esc => Modal::None,
+                _ => Modal::Remove { id, name },
+            },
+            Modal::Limits { id, mut form } => match form.on_key(&key) {
+                FormAction::Cancel => Modal::None,
+                FormAction::Submit => match parse_limits(&form) {
+                    Ok((download, upload)) => {
+                        self.send(SessionCommand::SetTorrentLimits { id, download, upload });
+                        Modal::None
+                    }
+                    Err(message) => {
+                        form.error = Some(message);
+                        Modal::Limits { id, form }
+                    }
+                },
+                FormAction::None => Modal::Limits { id, form },
+            },
+            Modal::Settings(mut form) => match form.on_key(&key) {
+                FormAction::Cancel => Modal::None,
+                FormAction::Submit => match parse_settings(&form) {
+                    Ok(settings) => {
+                        self.send(SessionCommand::SetSettings(settings));
+                        Modal::None
+                    }
+                    Err(message) => {
+                        form.error = Some(message);
+                        Modal::Settings(form)
+                    }
+                },
+                FormAction::None => Modal::Settings(form),
+            },
+        };
+    }
+
+    /// Bracketed paste: goes into the open prompt, ignored otherwise.
+    fn on_paste(&mut self, pasted: &str) {
+        match &mut self.modal {
+            Modal::Add(prompt) => {
+                prompt.input.paste(pasted);
+                prompt.error = None;
+            }
+            Modal::Limits { form, .. } | Modal::Settings(form) => form.paste(pasted),
+            _ => {}
+        }
+    }
+}
+
+fn read_session(state: &Arc<RwLock<SessionState>>) -> Result<SessionState, String> {
+    state
+        .try_read()
+        .map(|guard| guard.clone())
+        .map_err(|err| format!("session state unavailable: {err}"))
+}
+
+/// Paint one session frame.
+fn render_session(frame: &mut Frame, snapshot: &Result<SessionState, String>, app: &mut SessionApp) {
+    let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(Block::default().style(base_style()), area);
+
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        render_too_small(frame, area);
+        return;
+    }
+    let state = match snapshot {
+        Ok(state) => state,
+        Err(message) => {
+            render_error(frame, area, message);
+            return;
+        }
+    };
+    app.sync(state);
+
+    let footer_rows = if state.warning.is_some() { 2 } else { 1 };
+    let body_rows = area.height.saturating_sub(HEADER_ROWS + footer_rows);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(HEADER_ROWS),
+            Constraint::Length(table_rows(state.torrents.len(), body_rows)),
+            Constraint::Min(0),
+            Constraint::Length(footer_rows),
+        ])
+        .split(area);
+
+    render_session_header(frame, chunks[0], state);
+    render_torrent_table(frame, chunks[1], state, app);
+    render_detail(frame, chunks[2], state, app);
+    render_footer(frame, chunks[3], state.warning.as_deref(), &SESSION_FOOTER_KEYS);
+    render_modal(frame, area, app);
+}
+
+fn render_session_header(frame: &mut Frame, area: Rect, state: &SessionState) {
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style())
+        .style(base_style())
+        .title(Span::styled(" torrust ", heading_style()));
+    let text = truncate_line(&header_summary(state), inner_width);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, value_style()))).block(block),
+        area,
+    );
+}
+
+fn render_torrent_table(frame: &mut Frame, area: Rect, state: &SessionState, app: &mut SessionApp) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style())
+        .style(base_style())
+        .title(Span::styled(" torrents ", heading_style()));
+
+    if state.torrents.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(EMPTY_MESSAGE, muted_style()))
+                .alignment(Alignment::Center)
+                .block(block),
+            area,
+        );
+        return;
+    }
+
+    let columns = visible_columns(area.width);
+    let header = Row::new(columns.iter().map(|&c| Cell::from(TABLE_HEADERS[c]))).style(heading_style());
+    let rows: Vec<Row> = state
+        .torrents
+        .iter()
+        .enumerate()
+        .map(|(i, view)| {
+            let cells = torrent_cells(i, view);
+            let status_style = state_style(view_state(view));
+            Row::new(columns.iter().map(|&c| {
+                let cell = Cell::from(cells[c].clone());
+                if c == 4 { cell.style(status_style) } else { cell }
+            }))
+        })
+        .collect();
+    let widths: Vec<Constraint> = columns.iter().map(|&c| column_width(c)).collect();
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(1)
+        .row_highlight_style(selection_style())
+        .highlight_symbol("> ");
+
+    app.table_offset = ensure_visible(
+        app.table_offset,
+        app.selected,
+        usize::from(area.height.saturating_sub(3)),
+        state.torrents.len(),
+    );
+    let mut table_state = TableState::new()
+        .with_selected(app.selected)
+        .with_offset(app.table_offset);
+    frame.render_stateful_widget(table, area, &mut table_state);
+}
+
+fn render_detail(frame: &mut Frame, area: Rect, state: &SessionState, app: &mut SessionApp) {
+    if area.height == 0 {
+        return;
+    }
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    frame.render_widget(Paragraph::new(tab_line(app.tab, area.width)), parts[0]);
+    let body = parts[1];
+
+    let current = app.selected.and_then(|i| state.torrents.get(i));
+    let Some(view) = current else {
+        render_log(frame, body, &state.log, "session log", &mut app.view);
+        return;
+    };
+    match app.tab {
+        Tab::General => render_general(frame, body, view),
+        Tab::Peers => render_peers(frame, body, &mut app.view, false),
+        Tab::Files => render_files(frame, body, &mut app.view, true),
+        Tab::Trackers => render_trackers(frame, body, view),
+        Tab::Log => render_log(frame, body, &view.ui.log, "log", &mut app.view),
+        Tab::Session => render_log(frame, body, &state.log, "session log", &mut app.view),
+    }
+}
+
+fn general_lines(view: &TorrentView) -> Vec<Line<'static>> {
+    let Some(t) = view.ui.torrent.as_ref() else {
+        return vec![kv("Status", "waiting for metadata".to_string())];
+    };
+    vec![
+        kv("Name", view_name(view)),
+        kv("Size", t.human_size()),
+        kv("Saved to", t.download_dir.clone()),
+        kv("Infohash", t.infohash.clone()),
+        kv(
+            "Pieces",
+            format!(
+                "{} / {}   (piece {})",
+                t.verified_pieces,
+                t.piece_count,
+                human_bytes(u64::from(t.piece_length))
+            ),
+        ),
+        kv(
+            "Downloaded",
+            format!("{} ({})", t.human_downloaded(), percent(t.progress)),
+        ),
+        kv("Uploaded", human_bytes(view.uploaded)),
+        kv("Ratio", format!("{:.2}", view.ratio)),
+        kv(
+            "Limits",
+            format!(
+                "\u{2193} {}   \u{2191} {}",
+                limit_label(view.download_limit),
+                limit_label(view.upload_limit)
+            ),
+        ),
+        kv("Trackers", t.trackers.len().to_string()),
+        kv(
+            "Peers",
+            format!(
+                "{} connected   ({} seeders, {} leechers)",
+                view.ui.peers.len(),
+                t.seeders_known,
+                t.leecher_known
+            ),
+        ),
+    ]
+}
+
+fn render_general(frame: &mut Frame, area: Rect, view: &TorrentView) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style())
+        .style(base_style())
+        .title(Span::styled(" general ", heading_style()));
+    frame.render_widget(Paragraph::new(Text::from(general_lines(view))).block(block), area);
+}
+
+fn render_trackers(frame: &mut Frame, area: Rect, view: &TorrentView) {
+    let width = usize::from(area.width.saturating_sub(2));
+    let trackers = view.ui.torrent.as_ref().map(|t| t.trackers.as_slice()).unwrap_or(&[]);
+    let lines: Vec<Line> = if trackers.is_empty() {
+        vec![Line::from(Span::styled("no trackers", muted_style()))]
+    } else {
+        trackers
+            .iter()
+            .map(|url| Line::from(Span::styled(truncate_line(url, width), value_style())))
+            .collect()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style())
+        .style(base_style())
+        .title(Span::styled(format!(" trackers ({}) ", trackers.len()), heading_style()));
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+/// A rectangle at most `w` x `h`, centred in `area` and never outside it.
+fn popup_rect(w: u16, h: u16, area: Rect) -> Rect {
+    let width = w.min(area.width);
+    let height = h.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn modal_block(title: &str) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(heading_style())
+        .style(base_style())
+        .title(Span::styled(format!(" {title} "), heading_style()))
+}
+
+fn render_modal(frame: &mut Frame, area: Rect, app: &SessionApp) {
+    match &app.modal {
+        Modal::None => {}
+        Modal::Help => render_help(frame, area, &SESSION_KEYS, (70, 95)),
+        Modal::Add(prompt) => render_add(frame, area, prompt),
+        Modal::Remove { name, .. } => render_remove(frame, area, name),
+        Modal::Limits { form, .. } | Modal::Settings(form) => render_form(frame, area, form),
+    }
+}
+
+fn render_add(frame: &mut Frame, area: Rect, prompt: &AddPrompt) {
+    let popup = popup_rect(70, 6, area);
+    let width = usize::from(popup.width.saturating_sub(4));
+    let label = if prompt.source.is_none() {
+        "Torrent file path or magnet link:".to_string()
+    } else {
+        format!("Save to (empty = {}):", prompt.default_dir)
+    };
+    let hint = match &prompt.error {
+        Some(message) => Span::styled(message.clone(), error_style()),
+        None => Span::styled("Enter next/confirm  Esc cancel", muted_style()),
+    };
+    let lines = vec![
+        Line::from(Span::styled(truncate_line(&label, width), heading_style())),
+        Line::from(Span::styled(
+            format!("{}_", tail_fit(&prompt.input.text, width.saturating_sub(1))),
+            value_style(),
+        )),
+        Line::from(hint),
+    ];
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(modal_block("add torrent")), popup);
+}
+
+fn render_remove(frame: &mut Frame, area: Rect, name: &str) {
+    let popup = popup_rect(70, 6, area);
+    let width = usize::from(popup.width.saturating_sub(4));
+    let lines = vec![
+        Line::from(Span::styled(truncate_line(name, width), value_style())),
+        Line::from(vec![
+            Span::styled("k", heading_style()),
+            Span::raw(" keep data   "),
+            Span::styled("D", error_style().add_modifier(Modifier::BOLD)),
+            Span::raw(" delete data   "),
+            Span::styled("Esc", heading_style()),
+            Span::raw(" cancel"),
+        ]),
+    ];
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(modal_block("remove torrent")), popup);
+}
+
+fn render_form(frame: &mut Frame, area: Rect, form: &Form) {
+    const LABEL: usize = 26;
+    let popup = popup_rect(72, form.fields.len() as u16 + 3, area);
+    let inner_width = usize::from(popup.width.saturating_sub(2));
+    let value_width = inner_width.saturating_sub(2 + LABEL + 1);
+    let visible = usize::from(popup.height.saturating_sub(3)).max(1);
+    let offset = ensure_visible(0, Some(form.focus), visible, form.fields.len());
+
+    let mut lines: Vec<Line> = form
+        .fields
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible)
+        .map(|(i, field)| {
+            let focused = i == form.focus;
+            let value = match field.kind {
+                FieldKind::Toggle => {
+                    if field.on { "[x] on".to_string() } else { "[ ] off".to_string() }
+                }
+                _ => {
+                    let cursor = if focused { "_" } else { "" };
+                    format!("{}{cursor}", tail_fit(&field.input.text, value_width.saturating_sub(1)))
+                }
+            };
+            Line::from(vec![
+                Span::styled(if focused { "> " } else { "  " }, heading_style()),
+                Span::styled(format!("{:<LABEL$} ", field.label), heading_style()),
+                Span::styled(value, if focused { selection_style() } else { value_style() }),
+            ])
+        })
+        .collect();
+    lines.push(Line::from(match &form.error {
+        Some(message) => Span::styled(truncate_line(message, inner_width), error_style()),
+        None => Span::styled("Enter save  Esc cancel  Tab/Up/Down field", muted_style()),
+    }));
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(modal_block(form.title)), popup);
+}
+
+/// Drive the session UI until the user quits or the session shuts down.
+fn run_session_loop(state: Arc<RwLock<SessionState>>) -> Result<()> {
+    let (mut terminal, _guard) = setup_terminal()?;
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
+    terminal.clear().context("failed to clear the terminal")?;
+
+    let mut app = SessionApp::new();
+    loop {
+        let snapshot = read_session(&state);
+        terminal
+            .draw(|frame| render_session(frame, &snapshot, &mut app))
+            .context("failed to draw a frame")?;
+
+        let shutdown = matches!(&snapshot, Ok(s) if s.shutdown);
+        if app.quit || shutdown {
+            break;
+        }
+        if !event::poll(TICK).context("failed to poll terminal events")? {
+            continue;
+        }
+        match event::read().context("failed to read a terminal event")? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => app.on_key(key),
+            Event::Paste(text) => app.on_paste(&text),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Run the multi-torrent session UI until the user quits.
+///
+/// Blocks the calling thread; the terminal is restored before returning.
+/// Quitting sends [`SessionCommand::Quit`] so the session persists and exits.
+pub fn run_session_tui(state: Arc<RwLock<SessionState>>) -> Result<()> {
+    std::thread::Builder::new()
+        .name("torrust-session-tui".to_string())
+        .spawn(move || run_session_loop(state))
         .context("failed to spawn the TUI thread")?
         .join()
         .map_err(|_| anyhow::anyhow!("the TUI thread panicked"))?
@@ -1724,5 +2900,554 @@ mod tests {
         assert!(message.contains(&MIN_WIDTH.to_string()));
         assert!(message.contains(&MIN_HEIGHT.to_string()));
         assert!(message.contains("too small"));
+    }
+}
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::state::{Level, UiState};
+    use ratatui::backend::TestBackend;
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ch(c: char) -> KeyEvent {
+        key(KeyCode::Char(c))
+    }
+
+    fn view(id: &str, state: DownloadState) -> TorrentView {
+        TorrentView {
+            id: id.to_string(),
+            ui: UiState {
+                torrent: Some(TorrentSummary {
+                    name: format!("name-{id}"),
+                    infohash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                    total_length: 3 * 1024 * 1024 * 1024,
+                    progress: 0.5,
+                    download_rate: 1536.0 * 1024.0,
+                    upload_rate: 0.0,
+                    eta_secs: Some(3725.0),
+                    state,
+                    trackers: vec!["http://tracker.example/announce".to_string()],
+                    files: vec![
+                        FileSummary { index: 0, path: "a.bin".into(), length: 10, downloaded: 5, wanted: true },
+                        FileSummary { index: 1, path: "b.bin".into(), length: 10, downloaded: 0, wanted: true },
+                    ],
+                    ..TorrentSummary::default()
+                }),
+                peers: vec![PeerSummary {
+                    addr: "1.2.3.4:6881".into(),
+                    downloaded: 1,
+                    uploaded: 2,
+                    progress: 0.5,
+                    choked_by_us: false,
+                    choking_us: false,
+                    outstanding: 0,
+                }],
+                log: vec![LogEntry { level: Level::Info, message: format!("log-{id}") }],
+                ..UiState::default()
+            },
+            ratio: 1.25,
+            uploaded: 4096,
+            download_limit: 100 * 1024,
+            upload_limit: 0,
+            added_at: 0,
+        }
+    }
+
+    fn session(ids: &[&str]) -> SessionState {
+        SessionState {
+            torrents: ids.iter().map(|id| view(id, DownloadState::Downloading)).collect(),
+            ..SessionState::default()
+        }
+    }
+
+    fn app_with(state: &SessionState) -> (SessionApp, UnboundedReceiver<SessionCommand>) {
+        let (tx, rx) = unbounded_channel();
+        let mut app = SessionApp::new();
+        app.cmd = Some(tx);
+        app.sync(state);
+        (app, rx)
+    }
+
+    fn type_text(app: &mut SessionApp, text: &str) {
+        for c in text.chars() {
+            app.on_key(ch(c));
+        }
+    }
+
+    #[test]
+    fn compact_formats() {
+        assert_eq!(compact_bytes(12), "12B");
+        assert_eq!(compact_bytes(1536), "1.5K");
+        assert_eq!(compact_bytes(523 * 1024), "523K");
+        assert_eq!(compact_bytes(3 * 1024 * 1024 * 1024), "3.0G");
+        assert_eq!(compact_rate(0.0), "-");
+        assert_eq!(compact_rate(f64::NAN), "-");
+        assert_eq!(compact_rate(2048.0), "2.0K/s");
+        assert_eq!(compact_eta(None), "--");
+        assert_eq!(compact_eta(Some(f64::INFINITY)), "--");
+        assert_eq!(compact_eta(Some(45.0)), "45s");
+        assert_eq!(compact_eta(Some(249.0)), "4m09s");
+        assert_eq!(compact_eta(Some(3725.0)), "1h02m");
+        assert_eq!(compact_eta(Some(90_000.0)), "1d01h");
+        assert_eq!(limit_label(0), "unlimited");
+        assert_eq!(limit_label(2048), "2.00 KiB/s");
+    }
+
+    #[test]
+    fn row_cells_describe_a_torrent() {
+        let cells = torrent_cells(2, &view("x", DownloadState::Seeding));
+        assert_eq!(cells[0], "3");
+        assert_eq!(cells[1], "name-x");
+        assert_eq!(cells[2], "3.0G");
+        assert_eq!(cells[3], "50.0%");
+        assert_eq!(cells[4], "seeding");
+        assert_eq!(cells[5], "1.5M/s");
+        assert_eq!(cells[6], "-");
+        assert_eq!(cells[7], "1h02m");
+        assert_eq!(cells[8], "1");
+        assert_eq!(cells[9], "1.25");
+    }
+
+    #[test]
+    fn row_cells_survive_missing_metadata() {
+        let bare = TorrentView { ui: UiState::default(), ..view("x", DownloadState::Connecting) };
+        let cells = torrent_cells(0, &bare);
+        assert_eq!(cells[1], PENDING_NAME);
+        assert_eq!(cells[2], "?");
+        assert_eq!(cells[4], "connecting");
+    }
+
+    #[test]
+    fn table_rows_leave_room_for_details() {
+        assert_eq!(table_rows(0, 20), 4);
+        assert_eq!(table_rows(2, 20), 5);
+        assert_eq!(table_rows(50, 20), 9);
+        assert_eq!(table_rows(1, 8), 4);
+        assert_eq!(table_rows(1, 3), 3);
+    }
+
+    #[test]
+    fn narrow_widths_drop_columns() {
+        assert_eq!(visible_columns(120).len(), 10);
+        assert_eq!(visible_columns(60), &[0, 1, 3, 4, 5, 6]);
+        assert_eq!(visible_columns(40), &[0, 1, 3, 5]);
+    }
+
+    #[test]
+    fn header_summarises_the_session() {
+        let mut s = session(&["a"]);
+        s.download_rate = 2048.0;
+        s.port_status = "port 6881".to_string();
+        assert_eq!(header_summary(&s), "1 torrent  \u{2193} 2.00 KiB/s  \u{2191} 0 B/s  port 6881");
+        assert!(header_summary(&session(&[])).starts_with("0 torrents"));
+    }
+
+    #[test]
+    fn reselect_follows_the_id() {
+        assert_eq!(reselect(Some("b"), Some(0), &["x", "a", "b"]), Some(2));
+        assert_eq!(reselect(None, None, &["a", "b"]), Some(0));
+        assert_eq!(reselect(Some("gone"), Some(1), &["a", "b", "c"]), Some(1));
+        assert_eq!(reselect(Some("gone"), Some(2), &["a", "b"]), Some(1));
+        assert_eq!(reselect(Some("a"), Some(0), &[]), None);
+    }
+
+    #[test]
+    fn selection_is_stable_when_the_list_changes() {
+        let (mut app, _rx) = app_with(&session(&["a", "b", "c"]));
+        app.on_key(ch('j'));
+        app.on_key(ch('j'));
+        assert_eq!(app.selected_id.as_deref(), Some("c"));
+
+        app.sync(&session(&["x", "a", "c"]));
+        assert_eq!(app.selected, Some(2));
+        assert_eq!(app.selected_id.as_deref(), Some("c"));
+
+        app.sync(&session(&["x", "a"]));
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.selected_id.as_deref(), Some("a"));
+
+        app.sync(&session(&[]));
+        assert_eq!(app.selected, None);
+        assert_eq!(app.selected_id, None);
+        app.on_key(ch('d'));
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[test]
+    fn movement_sticks_at_the_ends() {
+        let (mut app, _rx) = app_with(&session(&["a", "b"]));
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.selected, Some(0));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.selected, Some(1));
+    }
+
+    #[test]
+    fn tabs_switch_by_key() {
+        let (mut app, _rx) = app_with(&session(&["a"]));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Peers);
+        app.on_key(ch('6'));
+        assert_eq!(app.tab, Tab::Session);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::General);
+        app.on_key(key(KeyCode::BackTab));
+        assert_eq!(app.tab, Tab::Session);
+        app.on_key(ch('3'));
+        assert_eq!(app.tab, Tab::Files);
+    }
+
+    #[test]
+    fn start_stop_depends_on_state() {
+        let mut state = session(&["a"]);
+        let (mut app, mut rx) = app_with(&state);
+        app.on_key(ch('s'));
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::Stop("a".into()));
+
+        state.torrents[0] = view("a", DownloadState::Stopped);
+        app.sync(&state);
+        app.on_key(ch('s'));
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::Start("a".into()));
+        app.on_key(ch('p'));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn pause_and_resume() {
+        let mut state = session(&["a"]);
+        let (mut app, mut rx) = app_with(&state);
+        app.on_key(ch('p'));
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::Torrent("a".into(), Command::Pause));
+
+        state.torrents[0] = view("a", DownloadState::Paused);
+        app.sync(&state);
+        app.on_key(ch('p'));
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::Torrent("a".into(), Command::Resume));
+    }
+
+    #[test]
+    fn remove_asks_keep_or_delete() {
+        let (mut app, mut rx) = app_with(&session(&["a", "b"]));
+        app.on_key(ch('j'));
+        app.on_key(ch('d'));
+        assert!(matches!(app.modal, Modal::Remove { .. }));
+        app.on_key(ch('x'));
+        assert!(matches!(app.modal, Modal::Remove { .. }));
+        app.on_key(key(KeyCode::Esc));
+        assert!(matches!(app.modal, Modal::None));
+        assert!(rx.try_recv().is_err());
+
+        app.on_key(ch('d'));
+        app.on_key(ch('k'));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SessionCommand::Remove { id: "b".into(), delete_data: false }
+        );
+        assert!(matches!(app.modal, Modal::None));
+
+        app.on_key(ch('d'));
+        app.on_key(ch('D'));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SessionCommand::Remove { id: "b".into(), delete_data: true }
+        );
+    }
+
+    #[test]
+    fn add_flow_with_default_and_explicit_dir() {
+        let (mut app, mut rx) = app_with(&session(&[]));
+        app.on_key(ch('a'));
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(&app.modal, Modal::Add(p) if p.error.is_some() && p.source.is_none()));
+
+        type_text(&mut app, "magnet:?xt=urn:btih:abc");
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(&app.modal, Modal::Add(p) if p.source.is_some()));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SessionCommand::Add { source: "magnet:?xt=urn:btih:abc".into(), dir: None }
+        );
+        assert!(matches!(app.modal, Modal::None));
+
+        app.on_key(ch('a'));
+        app.on_paste("'/tmp/x.torrent'\n");
+        app.on_key(key(KeyCode::Enter));
+        type_text(&mut app, "/data");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SessionCommand::Add { source: "/tmp/x.torrent".into(), dir: Some(PathBuf::from("/data")) }
+        );
+
+        app.on_key(ch('a'));
+        app.on_key(key(KeyCode::Esc));
+        assert!(matches!(app.modal, Modal::None));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn modal_swallows_global_keys() {
+        let (mut app, mut rx) = app_with(&session(&["a"]));
+        app.on_key(ch('a'));
+        type_text(&mut app, "qsdp");
+        assert!(!app.quit);
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(&app.modal, Modal::Add(p) if p.input.text == "qsdp"));
+    }
+
+    #[test]
+    fn limits_flow_converts_kib_to_bytes() {
+        let (mut app, mut rx) = app_with(&session(&["a"]));
+        app.on_key(ch('l'));
+        match &app.modal {
+            Modal::Limits { form, .. } => {
+                assert_eq!(form.fields[0].input.text, "100");
+                assert_eq!(form.fields[1].input.text, "0");
+            }
+            _ => panic!("limits modal expected"),
+        }
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Backspace));
+        type_text(&mut app, "250");
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Backspace));
+        type_text(&mut app, "8");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SessionCommand::SetTorrentLimits { id: "a".into(), download: 250 * 1024, upload: 8 * 1024 }
+        );
+    }
+
+    #[test]
+    fn limits_reject_non_numbers_inline() {
+        let (mut app, mut rx) = app_with(&session(&["a"]));
+        app.on_key(ch('l'));
+        type_text(&mut app, "x");
+        app.on_key(key(KeyCode::Enter));
+        assert!(rx.try_recv().is_err());
+        match &app.modal {
+            Modal::Limits { form, .. } => assert!(form.error.is_some()),
+            _ => panic!("modal should stay open"),
+        }
+        app.on_key(key(KeyCode::Backspace));
+        match &app.modal {
+            Modal::Limits { form, .. } => assert!(form.error.is_none()),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parse_kib_validates() {
+        assert_eq!(parse_kib("D", " 4 "), Ok(4096));
+        assert_eq!(parse_kib("D", "0"), Ok(0));
+        assert!(parse_kib("D", "").is_err());
+        assert!(parse_kib("D", "-1").is_err());
+        assert!(parse_kib("D", "1.5").is_err());
+        assert!(parse_kib("D", &u64::MAX.to_string()).is_err());
+    }
+
+    #[test]
+    fn settings_round_trip_and_edit() {
+        let mut state = session(&["a"]);
+        state.settings = Settings {
+            download_dir: PathBuf::from("/dl"),
+            listen_port: 7000,
+            download_limit: 2048,
+            upload_limit: 0,
+            ratio_target: 1.5,
+            max_peers: 30,
+            dht: true,
+            port_forwarding: false,
+        };
+        let (mut app, mut rx) = app_with(&state);
+        app.on_key(ch('o'));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::SetSettings(state.settings.clone()));
+
+        app.on_key(ch('o'));
+        for _ in 0..6 {
+            app.on_key(key(KeyCode::Tab));
+        }
+        app.on_key(ch(' '));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(ch(' '));
+        app.on_key(key(KeyCode::Enter));
+        match rx.try_recv().unwrap() {
+            SessionCommand::SetSettings(s) => {
+                assert!(!s.dht);
+                assert!(s.port_forwarding);
+                assert_eq!(s.listen_port, 7000);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_validation_blocks_bad_values() {
+        let base = settings_form(&Settings::default());
+        let set = |idx: usize, text: &str| {
+            let mut form = base.clone();
+            form.fields[idx].input = TextInput::new(text);
+            parse_settings(&form)
+        };
+        assert!(set(0, "  ").is_err());
+        assert!(set(1, "0").is_err());
+        assert!(set(1, "70000").is_err());
+        assert!(set(1, "abc").is_err());
+        assert!(set(2, "fast").is_err());
+        assert!(set(3, "-5").is_err());
+        assert!(set(4, "NaN").is_err());
+        assert!(set(4, "-1").is_err());
+        assert!(set(5, "0").is_err());
+        assert_eq!(set(4, "0").unwrap().ratio_target, 0.0);
+        assert_eq!(set(1, "6881").unwrap().listen_port, 6881);
+        assert!(parse_settings(&base).is_ok());
+    }
+
+    #[test]
+    fn files_tab_toggles_the_stable_file_index() {
+        let (mut app, mut rx) = app_with(&session(&["a"]));
+        app.on_key(ch(' '));
+        assert!(rx.try_recv().is_err());
+        app.on_key(ch('3'));
+        app.on_key(ch('J'));
+        app.on_key(ch(' '));
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::Torrent("a".into(), Command::ToggleFile(1)));
+    }
+
+    #[test]
+    fn quit_sends_quit_command() {
+        let (mut app, mut rx) = app_with(&session(&["a"]));
+        app.on_key(ch('q'));
+        assert!(app.quit);
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::Quit);
+    }
+
+    #[test]
+    fn keys_are_inert_without_a_channel_or_selection() {
+        let mut app = SessionApp::new();
+        app.sync(&session(&["a"]));
+        app.on_key(ch('s'));
+        app.on_key(ch('p'));
+        let mut empty = SessionApp::new();
+        empty.on_key(ch('l'));
+        empty.on_key(ch('s'));
+        assert!(matches!(empty.modal, Modal::None));
+    }
+
+    #[test]
+    fn text_input_edits() {
+        let mut input = TextInput::default();
+        for c in "abc".chars() {
+            assert!(input.handle(&ch(c)));
+        }
+        assert!(input.handle(&key(KeyCode::Backspace)));
+        assert_eq!(input.text, "ab");
+        input.paste("cd\nignored");
+        assert_eq!(input.text, "abcd");
+        assert!(!input.handle(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)));
+        assert!(input.handle(&KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)));
+        assert_eq!(input.text, "");
+        assert!(!input.handle(&key(KeyCode::Backspace)));
+        assert!(!input.handle(&key(KeyCode::Left)));
+    }
+
+    #[test]
+    fn tail_fit_keeps_the_cursor_end() {
+        assert_eq!(tail_fit("abc", 5), "abc");
+        assert_eq!(tail_fit("abcdef", 4), "\u{2026}def");
+        assert_eq!(tail_fit("abc", 0), "");
+        assert_eq!(clean_input("  \"/a b/c.torrent\" "), "/a b/c.torrent");
+    }
+
+    fn draw(width: u16, height: u16, state: &SessionState, app: &mut SessionApp) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let snapshot = Ok(state.clone());
+        terminal.draw(|f| render_session(f, &snapshot, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn renders_at_small_sizes_without_panicking() {
+        for (w, h) in [(80, 24), (40, 12)] {
+            for ids in [&[][..], &["a"][..], &["a", "b", "c", "d", "e", "f", "g"][..]] {
+                let state = session(ids);
+                let mut app = SessionApp::new();
+                for tab in Tab::ALL {
+                    app.set_tab(tab);
+                    let screen = draw(w, h, &state, &mut app);
+                    assert!(screen.contains("add"), "{w}x{h} {tab:?}:\n{screen}");
+                    assert!(screen.contains("quit") || w < 80, "{w}x{h}:\n{screen}");
+                    if ids.is_empty() {
+                        assert!(screen.contains("No torrents"), "{screen}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_render_shows_table_and_details() {
+        let mut state = session(&["a", "b"]);
+        state.port_status = "port 6881 forwarded".to_string();
+        let mut app = SessionApp::new();
+        let screen = draw(80, 24, &state, &mut app);
+        for needle in ["2 torrents", "port 6881", "name-a", "name-b", "Status", "Ratio", "1.25", "downloading", "General", "Infohash", "quit"] {
+            assert!(screen.contains(needle), "missing {needle}:\n{screen}");
+        }
+        app.set_tab(Tab::Trackers);
+        assert!(draw(80, 24, &state, &mut app).contains("tracker.example"));
+        app.set_tab(Tab::Log);
+        assert!(draw(80, 24, &state, &mut app).contains("log-a"));
+        app.set_tab(Tab::Peers);
+        assert!(draw(80, 24, &state, &mut app).contains("1.2.3.4"));
+        app.set_tab(Tab::Files);
+        assert!(draw(80, 24, &state, &mut app).contains("a.bin"));
+    }
+
+    #[test]
+    fn modals_render_at_both_sizes() {
+        let state = session(&["a"]);
+        for (w, h) in [(80, 24), (40, 12)] {
+            for key_char in ['a', 'd', 'l', 'o', '?'] {
+                let mut app = SessionApp::new();
+                draw(w, h, &state, &mut app);
+                app.on_key(ch(key_char));
+                let screen = draw(w, h, &state, &mut app);
+                assert!(!screen.trim().is_empty());
+            }
+        }
+        let mut app = SessionApp::new();
+        draw(80, 24, &state, &mut app);
+        app.on_key(ch('d'));
+        assert!(draw(80, 24, &state, &mut app).contains("delete data"));
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(ch('o'));
+        assert!(draw(80, 24, &state, &mut app).contains("Listen port"));
+    }
+
+    #[test]
+    fn too_small_and_warning() {
+        let mut state = session(&["a"]);
+        let mut app = SessionApp::new();
+        assert!(draw(20, 5, &state, &mut app).contains("too small"));
+        state.warning = Some("tracker down".to_string());
+        assert!(draw(80, 24, &state, &mut app).contains("tracker down"));
     }
 }
