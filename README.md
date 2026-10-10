@@ -3,8 +3,8 @@
 <p align="center">A BitTorrent client written from scratch in Rust, with a terminal UI and a web UI.</p>
 
 <p align="center">
-  <a href="https://github.com/KhaiNguyenIUH/torrust/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/KhaiNguyenIUH/torrust"></a>
-  <a href="https://github.com/KhaiNguyenIUH/torrust/actions/workflows/release.yml"><img alt="Release build" src="https://img.shields.io/github/actions/workflow/status/KhaiNguyenIUH/torrust/release.yml?label=build"></a>
+  <a href="https://github.com/KhaiNguyenIUH/torrust/releases/latest"><img alt="Download" src="https://img.shields.io/badge/download-latest%20release-brightgreen"></a>
+  <a href="https://github.com/KhaiNguyenIUH/torrust/actions/workflows/release.yml"><img alt="Release build" src="https://github.com/KhaiNguyenIUH/torrust/actions/workflows/release.yml/badge.svg"></a>
   <img alt="Platforms" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey">
   <img alt="Rust" src="https://img.shields.io/badge/rust-2021-orange">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
