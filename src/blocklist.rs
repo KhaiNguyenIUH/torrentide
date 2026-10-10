@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::Path;
 
@@ -49,13 +50,19 @@ impl BlockList {
 
     pub fn load(path: impl AsRef<Path>) -> Result<(BlockList, LoadStats)> {
         let path = path.as_ref();
-        let size = std::fs::metadata(path)
-            .with_context(|| format!("reading {}", path.display()))?
-            .len();
-        if size > MAX_FILE_SIZE {
-            bail!("block list {} is {size} bytes, over the {MAX_FILE_SIZE} byte limit", path.display());
+        let ctx = || format!("reading {}", path.display());
+        if !std::fs::metadata(path).with_context(ctx)?.is_file() {
+            bail!("block list {} is not a regular file", path.display());
         }
-        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let file = std::fs::File::open(path).with_context(ctx)?;
+        if !file.metadata().with_context(ctx)?.is_file() {
+            bail!("block list {} is not a regular file", path.display());
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_FILE_SIZE + 1).read_to_end(&mut bytes).with_context(ctx)?;
+        if bytes.len() as u64 > MAX_FILE_SIZE {
+            bail!("block list {} is over the {MAX_FILE_SIZE} byte limit", path.display());
+        }
         if bytes.starts_with(&[0x1f, 0x8b]) {
             bail!("block list {} is gzip-compressed; decompress it first", path.display());
         }
@@ -336,6 +343,23 @@ mod tests {
         let (l, s) = BlockList::load(&ok).unwrap();
         assert_eq!((l.len(), s.skipped_lines), (1, 1));
         assert!(BlockList::load(dir.join("missing")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_is_rejected_without_hanging() {
+        let dir = std::env::temp_dir().join(format!("torrust-bl-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(BlockList::load(&p).map(|_| ()).unwrap_err().to_string());
+        });
+        let err = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("load hung on a FIFO");
+        assert!(err.contains("not a regular file"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

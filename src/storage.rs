@@ -48,12 +48,27 @@ impl Storage {
     /// Prepare the download directory, creating any missing files at full size.
     ///
     /// Files are allocated sparse where the platform allows it, so a fresh
-    /// torrent does not immediately consume its full size on disk.
+    /// torrent does not immediately consume its full size on disk. A file that
+    /// already exists at a torrent path is only adopted when it has exactly the
+    /// torrent's length (the recheck then decides what is valid); any other
+    /// non-empty file is somebody else's data and is never resized.
     pub fn prepare(meta: &Metainfo, root: &Path) -> Result<Self> {
+        Self::prepare_with(meta, root, false)
+    }
+
+    /// Like [`Storage::prepare`], but resizes wrong-sized existing files: for
+    /// imported data the user pointed us at, where short files are padded and
+    /// over-long ones truncated.
+    pub fn prepare_repairing(meta: &Metainfo, root: &Path) -> Result<Self> {
+        Self::prepare_with(meta, root, true)
+    }
+
+    fn prepare_with(meta: &Metainfo, root: &Path, repair: bool) -> Result<Self> {
         for (path, _) in meta.files.iter() {
             if !is_safe_relative(path) || !root.join(path).starts_with(root) {
                 bail!("torrent path escapes the download directory: {}", path.display());
             }
+            check_no_symlinks(root, path)?;
         }
 
         fs::create_dir_all(root)
@@ -68,11 +83,9 @@ impl Storage {
                     .with_context(|| format!("creating directory {}", parent.display()))?;
             }
 
-            // Only resize when the existing file is the wrong size. Rewriting an
-            // already-correct file would discard any data we previously verified.
-            match fs::metadata(&disk_path) {
+            match fs::symlink_metadata(&disk_path) {
                 Ok(md) if md.is_file() && md.len() == length => {}
-                Ok(md) if md.is_file() => {
+                Ok(md) if md.is_file() && (repair || md.len() == 0) => {
                     let f = OpenOptions::new()
                         .write(true)
                         .open(&disk_path)
@@ -80,9 +93,16 @@ impl Storage {
                     f.set_len(length)
                         .with_context(|| format!("setting length on {}", disk_path.display()))?;
                 }
+                Ok(md) if md.is_file() => bail!(
+                    "a different file already exists at {}; move it away or choose another folder",
+                    disk_path.display()
+                ),
                 Ok(_) => bail!("{} exists and is not a regular file", disk_path.display()),
                 Err(_) => {
-                    File::create(&disk_path)
+                    OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&disk_path)
                         .with_context(|| format!("creating {}", disk_path.display()))?
                         .set_len(length)
                         .with_context(|| format!("setting length on {}", disk_path.display()))?;
@@ -209,6 +229,24 @@ impl Storage {
             None => bail!("piece {index} is out of range for this torrent"),
         }
     }
+}
+
+/// Fail if any component of `rel` that already exists under `root` is a
+/// symlink. `root` itself may be one.
+pub fn check_no_symlinks(root: &Path, rel: &Path) -> Result<()> {
+    let mut cur = root.to_path_buf();
+    for c in rel.components() {
+        cur.push(c);
+        match fs::symlink_metadata(&cur) {
+            Ok(md) if md.file_type().is_symlink() => {
+                bail!("{} is a symlink; refusing to follow it", cur.display())
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("checking {}", cur.display())),
+        }
+    }
+    Ok(())
 }
 
 /// SHA-1 of a byte slice, the hash function BitTorrent is built on.

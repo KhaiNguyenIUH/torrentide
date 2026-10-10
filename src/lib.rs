@@ -26,6 +26,7 @@ pub mod metainfo;
 pub mod peer;
 pub mod portmap;
 pub mod ratelimit;
+pub mod redact;
 pub mod rss;
 pub mod schedule;
 pub mod scheduler;

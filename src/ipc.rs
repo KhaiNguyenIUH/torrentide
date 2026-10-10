@@ -49,6 +49,19 @@ pub async fn send_add_to(store: &Store, source: &str, dir: Option<&Path>) -> Res
     Ok(Delivery::Queued)
 }
 
+/// Whether a session is answering on the data directory's socket.
+pub fn session_running(store: &Store) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(store.socket_path()).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = store;
+        false
+    }
+}
+
 #[cfg(unix)]
 pub use unix::listen;
 
@@ -104,22 +117,29 @@ mod unix {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if path.exists() {
-            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
-                bail!("another torrust session is already running ({})", path.display());
+        let bound = match UnixListener::bind(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                    bail!("another torrust session is already running ({})", path.display());
+                }
+                let _ = std::fs::remove_file(&path);
+                UnixListener::bind(&path)
             }
-            let _ = std::fs::remove_file(&path);
-        }
+            other => other,
+        };
         // Without the socket `torrust add` still works by queueing, so a bind
         // failure (e.g. a data dir path longer than SUN_LEN) must not stop the
         // session.
-        let listener = match UnixListener::bind(&path) {
+        let listener = match bound {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "cannot open the add socket; `torrust add` will queue instead");
                 return Ok(None);
             }
         };
+        if let Err(e) = std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)) {
+            tracing::warn!(path = %path.display(), error = %e, "cannot restrict the add socket");
+        }
         Ok(Some(tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -169,6 +189,31 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn tmp(tag: &str) -> PathBuf {
+            let d = std::env::temp_dir().join(format!("ts-ipc-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            d
+        }
+
+        #[tokio::test]
+        async fn socket_is_0600_stale_is_replaced_and_live_is_refused() {
+            use std::os::unix::fs::PermissionsExt;
+            let store = Store::at(tmp("sock"));
+            std::fs::create_dir_all(store.root()).unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+            drop(std::os::unix::net::UnixListener::bind(store.socket_path()).unwrap());
+            assert!(!crate::ipc::session_running(&store));
+            let h = listen(&store, tx.clone()).unwrap().unwrap();
+            let mode = std::fs::metadata(store.socket_path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            assert!(crate::ipc::session_running(&store));
+
+            let err = listen(&store, tx).unwrap_err().to_string();
+            assert!(err.contains("another torrust session is already running"), "{err}");
+            h.abort();
+        }
 
         #[test]
         fn parses_add_lines() {

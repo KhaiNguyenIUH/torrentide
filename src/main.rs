@@ -284,6 +284,10 @@ impl Drop for EchoOff {
 }
 
 async fn set_webui_password() -> Result<()> {
+    let store = torrust::store::Store::open();
+    if torrust::ipc::session_running(&store) {
+        bail!("a torrust session is running and would overwrite these settings when it quits; stop it, then run this command again");
+    }
     eprintln!("New web UI password (one line):");
     let echo = EchoOff::new();
     let read = tokio::task::spawn_blocking(|| {
@@ -306,14 +310,12 @@ async fn set_webui_password() -> Result<()> {
     if password.is_empty() {
         bail!("the password cannot be empty");
     }
-    let store = torrust::store::Store::open();
     let mut settings = store.load_settings();
     settings.webui.enabled = true;
     settings.webui.password = Some(torrust::store::hash_password(password));
     store.save_settings(&settings)?;
     println!("web UI enabled with the new password (stored as a salted hash)");
     println!("open http://localhost:{}/ (any user name) after the session restarts", settings.webui.port);
-    println!("a session that is already running keeps its old settings and overwrites these when it quits");
     Ok(())
 }
 
@@ -705,7 +707,7 @@ fn inspect_magnet(uri: &str) -> Result<()> {
 }
 
 fn log_path() -> PathBuf {
-    std::env::temp_dir().join("torrust.log")
+    torrust::store::data_dir().join("torrust.log")
 }
 
 /// With the TUI running, logs go to a file so they cannot corrupt the screen
@@ -716,11 +718,7 @@ fn init_tracing(to_file: bool) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("torrust=info,warn"));
     let file_layer = to_file.then(|| {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path())
-            .ok();
+        let file = torrust::store::open_log(&log_path()).ok();
         fmt::layer()
             .with_writer(file.map(std::sync::Mutex::new).map_or_else(
                 || tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::sink),

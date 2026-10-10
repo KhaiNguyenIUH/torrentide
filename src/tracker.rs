@@ -115,7 +115,7 @@ pub async fn announce(
     } else if url.starts_with("http://") || url.starts_with("https://") {
         announce_http(url, &params).await
     } else {
-        Err(TrackerError::UnsupportedScheme(url.to_owned()))
+        Err(TrackerError::UnsupportedScheme(crate::redact::url(url)))
     }
 }
 
@@ -131,7 +131,7 @@ pub async fn scrape(url: &str, infohash: InfoHash) -> Result<ScrapeResult, Track
         let body = http_fetch(&full).await?;
         parse_scrape_response(&body, infohash)
     } else {
-        Err(TrackerError::UnsupportedScheme(url.to_owned()))
+        Err(TrackerError::UnsupportedScheme(crate::redact::url(url)))
     }
 }
 
@@ -199,7 +199,7 @@ pub async fn announce_all(
                         r.seeders = r.seeders.or(Some(s.complete));
                         r.leechers = r.leechers.or(Some(s.incomplete));
                     }
-                    Err(e) => tracing::debug!(tracker = %url, error = %e, "scrape failed"),
+                    Err(e) => tracing::debug!(tracker = %crate::redact::url(url), error = %e, "scrape failed"),
                 }
                 Ok(r)
             }
@@ -215,15 +215,16 @@ pub async fn announce_all(
         match res {
             Ok(r) => {
                 if let Some(w) = &r.warning {
-                    tracing::warn!(tracker = %url, warning = %w, "tracker warning");
+                    tracing::warn!(tracker = %crate::redact::url(url), warning = %w, "tracker warning");
                 }
                 found.extend(r.peers);
                 out.seeders = out.seeders.max(r.seeders);
                 out.leechers = out.leechers.max(r.leechers);
             }
             Err(e) => {
-                tracing::debug!(tracker = %url, error = %e, "announce failed");
-                out.errors.push(format!("{url}: {e}"));
+                let shown = crate::redact::url(url);
+                tracing::debug!(tracker = %shown, error = %e, "announce failed");
+                out.errors.push(format!("{shown}: {e}"));
             }
         }
     }
@@ -1017,7 +1018,7 @@ mod tests {
         peers.sort_by_key(|p| p.port);
         assert_eq!(peers.iter().map(|p| p.port).collect::<Vec<_>>(), [1111, 2222]);
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].starts_with(&dead));
+        assert!(errors[0].starts_with(&crate::redact::url(&dead)));
         assert!(elapsed < Duration::from_millis(1100), "serial: {elapsed:?}");
 
         let reqs = seen.lock().unwrap();
@@ -1271,6 +1272,46 @@ mod tests {
         let both = counting_tracker(Some((3, 4)), (99, 99), seen_a.clone()).await;
         let out = announce_all(&[both, without], &test_meta(), 6881, 0, 0, 0, None).await;
         assert_eq!((out.seeders, out.leechers), (Some(10), Some(4)), "max across trackers");
+    }
+
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Capture {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn announce_logs_and_errors_never_contain_the_passkey() {
+        let cap = Capture::default();
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(cap.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(sub);
+
+        let url = "http://user:SECRETPW@127.0.0.1:1/SECRETPASSKEY/announce?k=SECRETQ".to_owned();
+        let out = announce_all(&[url, "ftp://h/SECRETPASSKEY".to_owned()], &test_meta(), 6881, 0, 0, 0, None).await;
+
+        assert_eq!(out.errors.len(), 2);
+        let logged = String::from_utf8(cap.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("announce failed"), "{logged}");
+        for text in out.errors.iter().map(String::as_str).chain([logged.as_str()]) {
+            assert!(!text.contains("SECRET"), "{text}");
+        }
     }
 
     #[tokio::test]

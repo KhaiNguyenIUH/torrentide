@@ -111,7 +111,11 @@ pub struct Store {
 
 impl Store {
     pub fn open() -> Self {
-        Store { root: data_dir() }
+        let root = data_dir();
+        if let Err(e) = secure_dir(&root) {
+            tracing::warn!(path = %root.display(), error = %e, "could not secure the data directory");
+        }
+        Store { root }
     }
 
     pub fn at(root: impl Into<PathBuf>) -> Self {
@@ -137,7 +141,7 @@ impl Store {
         let mut raw = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut raw);
         let token = hex::encode(raw);
-        write_private(&path, token.as_bytes())?;
+        write_atomic(&path, token.as_bytes())?;
         Ok(token)
     }
 
@@ -176,7 +180,7 @@ impl Store {
     }
 
     pub fn save_settings(&self, s: &Settings) -> Result<()> {
-        write_private(&self.root.join("settings.bencode"), &encode_settings(s))
+        write_atomic(&self.root.join("settings.bencode"), &encode_settings(s))
     }
 
     /// Stored feeds and the next free feed id. A missing or unreadable file means none.
@@ -195,7 +199,7 @@ impl Store {
     }
 
     pub fn save_feeds(&self, next_id: u64, feeds: &[StoredFeed]) -> Result<()> {
-        write_private(&self.root.join("feeds.bencode"), &encode_feeds(next_id, feeds))
+        write_atomic(&self.root.join("feeds.bencode"), &encode_feeds(next_id, feeds))
     }
 
     pub fn save_torrent(&self, id: &str, bytes: &[u8]) -> Result<()> {
@@ -291,46 +295,100 @@ impl Store {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_file(path, bytes, false)
-}
-
-/// Like [`write_atomic`], but readable by the owner only on unix: these files
-/// hold the web UI password hash and feed URLs, which often carry tokens.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_file(path, bytes, true)
-}
-
-fn write_file(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
     let parent = path.parent().context("path has no parent")?;
-    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    create_private_dir(parent).with_context(|| format!("creating {}", parent.display()))?;
     let tmp = path.with_extension(format!(
         "{}.tmp",
         path.extension().and_then(|e| e.to_str()).unwrap_or("")
     ));
-    write_tmp(&tmp, bytes, private).with_context(|| format!("writing {}", tmp.display()))?;
+    write_tmp(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, path).map_err(|e: io::Error| {
         let _ = fs::remove_file(&tmp);
         anyhow::Error::from(e).context(format!("replacing {}", path.display()))
-    })
+    })?;
+    sync_dir(parent).with_context(|| format!("syncing {}", parent.display()))
 }
 
-fn write_tmp(tmp: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
+fn write_tmp(tmp: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
-    if private {
+    {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
     let mut f = opts.open(tmp)?;
     #[cfg(unix)]
-    if private {
+    {
         use std::os::unix::fs::PermissionsExt;
         f.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    let _ = private;
-    f.write_all(bytes)
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// Open (creating, appending) the log file owner-only, refusing a symlink.
+pub fn open_log(path: &Path) -> io::Result<fs::File> {
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "log path is a symlink"));
+    }
+    if let Some(parent) = path.parent() {
+        create_private_dir(parent)?;
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(f)
+}
+
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let mut b = fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
+}
+
+/// Create `dir` owner-only, and tighten it if an earlier version left it
+/// readable by group or others.
+fn secure_dir(dir: &Path) -> io::Result<()> {
+    create_private_dir(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(dir)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+            tracing::warn!(path = %dir.display(), "data directory was accessible to others; set to owner-only");
+        }
+    }
+    Ok(())
 }
 
 const HASH_SCHEME: &str = "torrust-sha1";
@@ -402,11 +460,24 @@ fn parse_hash(stored: &str) -> Option<(u32, Vec<u8>, [u8; 20])> {
 }
 
 fn path_bytes(p: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        p.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
     p.to_string_lossy().into_owned().into_bytes()
 }
 
 fn bytes_path(v: &Value) -> Result<PathBuf> {
-    Ok(PathBuf::from(String::from_utf8_lossy(v.as_bytes()?).into_owned()))
+    let raw = v.as_bytes()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(raw)))
+    }
+    #[cfg(not(unix))]
+    Ok(PathBuf::from(String::from_utf8_lossy(raw).into_owned()))
 }
 
 fn int(n: u64) -> Value {
@@ -719,6 +790,75 @@ mod tests {
         d
     }
 
+    #[cfg(unix)]
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_is_0700_and_every_file_0600() {
+        let root = tmp("perms").join("fresh");
+        let store = Store::at(&root);
+        store.save_settings(&Settings::default()).unwrap();
+        store.save_feeds(1, &[]).unwrap();
+        store.save_torrent("abc", b"x").unwrap();
+        store.enqueue("magnet:?xt=urn:btih:aa", None).unwrap();
+        store.web_token().unwrap();
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&root.join("torrents")), 0o700);
+        assert_eq!(mode(&root.join("queue")), 0o700);
+        for f in ["settings.bencode", "feeds.bencode", "torrents/abc.torrent", "webui.token"] {
+            assert_eq!(mode(&root.join(f)), 0o600, "{f}");
+        }
+        let queued = fs::read_dir(root.join("queue")).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(mode(&queued), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_file_is_0600_and_symlinks_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("log");
+        let log = d.join("torrust.log");
+        fs::write(&log, b"old\n").unwrap();
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+        drop(open_log(&log).unwrap());
+        assert_eq!(mode(&log), 0o600);
+        assert_eq!(fs::read(&log).unwrap(), b"old\n");
+
+        let target = d.join("victim");
+        fs::write(&target, b"keep").unwrap();
+        let link = d.join("linked.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(open_log(&link).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_dir_tightens_an_existing_open_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("tighten");
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+        secure_dir(&d).unwrap();
+        assert_eq!(mode(&d), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_round_trip() {
+        use std::os::unix::ffi::OsStrExt;
+        let odd = PathBuf::from(std::ffi::OsStr::from_bytes(b"/d/caf\xe9/\xff"));
+        let store = Store::at(tmp("nonutf8"));
+        let s = Settings { download_dir: odd.clone(), ..Settings::default() };
+        store.save_settings(&s).unwrap();
+        assert_eq!(store.load_settings().download_dir, odd);
+        store.enqueue("x", Some(&odd)).unwrap();
+        assert_eq!(store.take_queue()[0].dir.as_deref(), Some(odd.as_path()));
+    }
+
     #[test]
     fn settings_round_trip() {
         let store = Store::at(tmp("settings"));
@@ -754,7 +894,7 @@ mod tests {
     fn old_settings_file_loads_new_fields_as_defaults() {
         let store = Store::at(tmp("oldsettings"));
         let old = bencode::encode(&Value::Dict(BTreeMap::from([(b"listen_port".to_vec(), Value::Int(7000))])));
-        write_private(&store.root.join("settings.bencode"), &old).unwrap();
+        write_atomic(&store.root.join("settings.bencode"), &old).unwrap();
         let s = store.load_settings();
         assert_eq!(s.listen_port, 7000);
         assert_eq!((s.blocklist, s.notifications, s.schedule), (None, true, Schedule::default()));

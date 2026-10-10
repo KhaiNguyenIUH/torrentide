@@ -626,7 +626,7 @@ fn state_json(st: &SessionState) -> String {
                 "{{\"id\":{},\"url\":{},\"title\":{},\"include\":{},\"exclude\":{},\"dir\":{},\
                  \"last_fetch\":{},\"last_error\":{},\"recent\":{}}}",
                 f.id,
-                json_str(&f.url),
+                json_str(&crate::redact::url(&f.url)),
                 json_opt(f.title.as_deref()),
                 json_strs(&f.include),
                 json_strs(&f.exclude),
@@ -912,6 +912,17 @@ mod tests {
         assert_eq!(json_num(f64::NAN), "null");
         assert_eq!(base64_decode("dTpwdw==").unwrap(), b"u:pw");
         assert!(ct_eq(b"abc", b"abc") && !ct_eq(b"abc", b"abd") && !ct_eq(b"abc", b"abcd"));
+    }
+
+    #[tokio::test]
+    async fn api_state_redacts_feed_urls() {
+        let (state, _rx) = fake_state(true);
+        state.write().await.feeds[0].url = "https://user:pw@feeds.example:8443/SECRETPASS/rss?key=SECRETQ".into();
+        let addr = start_open(state, IO_TIMEOUT).await;
+        let (status, _, body) = raw(addr, &get(addr, "/api/state", COOKIE)).await;
+        assert_eq!(status, 200);
+        assert!(body.contains("\"url\":\"https://feeds.example:8443\""), "{body}");
+        assert!(!body.contains("SECRET") && !body.contains("pw@"), "{body}");
     }
 
     #[tokio::test]

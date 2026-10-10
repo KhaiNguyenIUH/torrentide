@@ -38,6 +38,7 @@ use crate::state::{
     SessionState, Settings, TorrentSummary, TorrentView, UiState,
 };
 use crate::utp::UtpSocket;
+use crate::storage::check_no_symlinks;
 use crate::store::{Record, Snapshot, Store, StoredFeed};
 
 const TICK: Duration = Duration::from_millis(250);
@@ -93,7 +94,7 @@ impl Drop for PendingFetch {
 
 /// A network fetch finished; handled on the core task so only it touches entries.
 enum Fetched {
-    Torrent { source: String, dir: Option<PathBuf>, result: Result<Vec<u8>> },
+    Torrent { source: String, dir: Option<PathBuf>, ack: Option<PathBuf>, result: Result<Vec<u8>> },
     Feed { id: FeedId, result: Result<ParsedFeed> },
 }
 
@@ -106,6 +107,7 @@ struct Entry {
     run: Option<Running>,
     down: Arc<RateLimiter>,
     up: Arc<RateLimiter>,
+    all_created: bool,
 }
 
 pub struct SessionHandle {
@@ -563,9 +565,12 @@ impl Core {
                 fetching: false,
             });
         }
+        for i in 0..self.entries.len() {
+            self.recover_move(i).await;
+        }
         self.rebalance().await;
-        for q in self.store.take_queue() {
-            self.add(q.source, q.dir).await;
+        for (path, source, dir) in queued_adds(&self.store) {
+            self.add(source, dir, Some(path)).await;
         }
         self.aggregate().await;
     }
@@ -669,7 +674,7 @@ impl Core {
                     f.next_poll = now;
                 }
             }
-            SessionCommand::Add { source, dir } => self.add(source, dir).await,
+            SessionCommand::Add { source, dir } => self.add(source, dir, None).await,
             SessionCommand::Remove { id, delete_data } => self.remove(&id, delete_data).await,
             SessionCommand::MoveQueue { id, up } => self.move_queue(&id, up).await,
             SessionCommand::SetLabel { id, label } => {
@@ -736,30 +741,47 @@ impl Core {
         self.entries.iter().position(|e| e.rec.id == id)
     }
 
-    async fn add(&mut self, source: String, dir: Option<PathBuf>) {
+    async fn add(&mut self, source: String, dir: Option<PathBuf>, ack: Option<PathBuf>) {
         if is_http(&source) {
             let pending = Arc::clone(&self.pending_fetches);
             if pending.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_FETCHES {
                 pending.fetch_sub(1, Ordering::AcqRel);
                 self.log(Level::Warn, format!("too many pending downloads, not adding {}", shown(&source))).await;
+                if let Some(a) = ack {
+                    let _ = std::fs::remove_file(a);
+                }
                 return;
             }
             let guard = PendingFetch(pending);
             let shown_source = source.clone();
             self.spawn_fetch(Arc::clone(&self.fetch_slots), shown_source, MAX_TORRENT_BYTES, move |tx, result| {
                 drop(guard);
-                let _ = tx.send(Fetched::Torrent { source, dir, result });
+                let _ = tx.send(Fetched::Torrent { source, dir, ack, result });
             });
             return;
         }
         self.add_loaded(source, None, dir).await;
+        if let Some(a) = ack {
+            let _ = std::fs::remove_file(a);
+        }
     }
 
     /// Add a torrent from a path, magnet, or the bytes already downloaded from `source`.
     async fn add_loaded(&mut self, source: String, raw: Option<Vec<u8>>, dir: Option<PathBuf>) {
         let dir = dir.unwrap_or_else(|| self.settings.download_dir.clone());
+        let raw = match raw {
+            None if !source.starts_with("magnet:") => match read_source(&source).await {
+                Ok(raw) => Some(raw),
+                Err(e) => {
+                    self.log(Level::Error, format!("cannot add {}: {e:#}", shown(&source))).await;
+                    return;
+                }
+            },
+            raw => raw,
+        };
         match self.prepare_add(&source, raw, dir) {
             Ok(entry) => {
+                remove_aux(&self.store, &entry.rec.id);
                 let name = match (&entry.meta, &entry.magnet) {
                     (Some(m), _) => m.name.clone(),
                     (_, Some(m)) => m.display_name.clone().unwrap_or_else(|| entry.rec.id.clone()),
@@ -792,10 +814,15 @@ impl Core {
 
     async fn on_fetched(&mut self, done: Fetched) {
         match done {
-            Fetched::Torrent { source, dir, result } => match result {
-                Ok(raw) => self.add_loaded(source, Some(raw), dir).await,
-                Err(e) => self.log(Level::Error, format!("cannot add {}: {e:#}", shown(&source))).await,
-            },
+            Fetched::Torrent { source, dir, ack, result } => {
+                match result {
+                    Ok(raw) => self.add_loaded(source, Some(raw), dir).await,
+                    Err(e) => self.log(Level::Error, format!("cannot add {}: {e:#}", shown(&source))).await,
+                }
+                if let Some(a) = ack {
+                    let _ = std::fs::remove_file(a);
+                }
+            }
             Fetched::Feed { id, result } => self.on_feed_fetched(id, result).await,
         }
     }
@@ -903,7 +930,7 @@ impl Core {
         for (title, source) in matches {
             if source.starts_with("magnet:") || is_http(&source) {
                 self.log(Level::Info, format!("feed {name}: new item {}", clip(&title))).await;
-                self.add(source, dir.clone()).await;
+                self.add(source, dir.clone(), None).await;
             } else {
                 self.log(Level::Warn, format!("feed {name}: ignoring item {} with a non-web link", clip(&title))).await;
             }
@@ -955,10 +982,7 @@ impl Core {
             rec.magnet = Some(source.to_owned());
             (m.infohash, None, Some(m))
         } else {
-            let raw = match raw {
-                Some(raw) => raw,
-                None => std::fs::read(source).with_context(|| format!("reading {source}"))?,
-            };
+            let raw = raw.context("no torrent data")?;
             let meta = Metainfo::from_bytes(&raw).context("parsing .torrent file")?;
             rec.id = meta.infohash.to_hex();
             if self.find(&rec.id).is_none() {
@@ -979,7 +1003,8 @@ impl Core {
             return;
         }
         e.rec.stopped = false;
-        if e.meta.is_some() {
+        if let Some(meta) = &e.meta {
+            note_created(&self.store, &e.rec.id, meta.files.iter().map(|(p, _)| p).filter(|p| std::fs::symlink_metadata(e.rec.dir.join(p)).is_err()));
             stub_ui(e, DownloadState::Connecting).await;
         }
         let (cmd_tx, cmd_rx) = unbounded_channel();
@@ -1124,7 +1149,12 @@ impl Core {
             return;
         };
         let from = self.entries[i].rec.dir.clone();
-        if dir == from {
+        if same_dir(&dir, &from) {
+            let _ = std::fs::remove_file(move_path(&self.store, &id));
+            return;
+        }
+        if let Err(err) = write_move_intent(&self.store, &id, &dir) {
+            self.log(Level::Error, format!("cannot move {id} to {}: {err:#}", dir.display())).await;
             return;
         }
         self.stop_entry(i, false).await;
@@ -1135,17 +1165,63 @@ impl Core {
             .and_then(|r| r);
         match moved {
             Ok(()) => {
-                let e = &mut self.entries[i];
-                e.rec.dir = dir.clone();
-                if let Some(t) = &mut e.ui.write().await.torrent {
-                    t.download_dir = dir.display().to_string();
-                }
-                self.save(i).await;
+                self.finish_move(i, dir.clone()).await;
                 self.log(Level::Info, format!("moved {id} to {}", dir.display())).await;
             }
-            Err(err) => self.log(Level::Error, format!("cannot move {id} to {}: {err:#}", dir.display())).await,
+            Err(err) => {
+                let _ = std::fs::remove_file(move_path(&self.store, &id));
+                self.log(Level::Error, format!("cannot move {id} to {}: {err:#}", dir.display())).await;
+            }
         }
         self.rebalance().await;
+    }
+
+    async fn finish_move(&mut self, i: usize, dir: PathBuf) {
+        let e = &mut self.entries[i];
+        e.rec.dir = dir.clone();
+        if let Some(t) = &mut e.ui.write().await.torrent {
+            t.download_dir = dir.display().to_string();
+        }
+        self.save(i).await;
+        let _ = std::fs::remove_file(move_path(&self.store, &self.entries[i].rec.id));
+    }
+
+    /// Finish, or failing that undo, a move a crash interrupted.
+    async fn recover_move(&mut self, i: usize) {
+        let id = self.entries[i].rec.id.clone();
+        let Some(to) = read_move_intent(&self.store, &id) else { return };
+        let from = self.entries[i].rec.dir.clone();
+        let Some(meta) = self.entries[i].meta.clone() else {
+            let _ = std::fs::remove_file(move_path(&self.store, &id));
+            return;
+        };
+        if same_dir(&from, &to) {
+            let _ = std::fs::remove_file(move_path(&self.store, &id));
+            return;
+        }
+        let (m, f, t) = (meta.clone(), from.clone(), to.clone());
+        let finished = tokio::task::spawn_blocking(move || move_files(&m, &f, &t)).await.map_err(anyhow::Error::from).and_then(|r| r);
+        match finished {
+            Ok(()) => {
+                self.finish_move(i, to.clone()).await;
+                self.log(Level::Info, format!("finished the interrupted move of {id} to {}", to.display())).await;
+                return;
+            }
+            Err(err) => self.log(Level::Warn, format!("cannot finish the interrupted move of {id}: {err:#}")).await,
+        }
+        let (f, t) = (from.clone(), to.clone());
+        let back = tokio::task::spawn_blocking(move || move_files_with(&meta, &t, &f, true)).await.map_err(anyhow::Error::from).and_then(|r| r);
+        match back {
+            Ok(()) => {
+                let _ = std::fs::remove_file(move_path(&self.store, &id));
+                self.log(Level::Info, format!("rolled back the interrupted move of {id}")).await;
+            }
+            Err(err) => {
+                self.entries[i].rec.stopped = true;
+                self.save(i).await;
+                self.log(Level::Error, format!("{id} is stopped: its files are split between {} and {}: {err:#}", from.display(), to.display())).await;
+            }
+        }
     }
 
     async fn move_queue(&mut self, id: &str, up: bool) {
@@ -1174,9 +1250,10 @@ impl Core {
         let e = self.entries.remove(i);
         if delete_data {
             if let Some(meta) = &e.meta {
-                delete_files(meta, &e.rec.dir);
+                delete_files(meta, &e.rec.dir, &read_created(&self.store, id));
             }
         }
+        remove_aux(&self.store, id);
         self.store.remove(id);
         self.rebalance().await;
         self.log(
@@ -1365,14 +1442,27 @@ impl Core {
 
             let before = (e.rec.priorities.clone(), e.rec.sequential, e.rec.trackers.clone(), e.rec.super_seed);
             refresh(e).await;
-            let finished = !e.rec.moved
-                && e.run.is_some()
+            let done = e.run.is_some()
                 && matches!(
                     e.ui.read().await.torrent.as_ref().map(|t| t.state),
                     Some(DownloadState::Seeding | DownloadState::Complete)
                 );
+            if done && !e.all_created {
+                if let Some(meta) = &e.meta {
+                    note_created(&self.store, &e.rec.id, meta.files.iter().map(|(p, _)| p));
+                    e.all_created = true;
+                }
+            }
+            let finished = !e.rec.moved && done;
             if finished {
                 e.rec.moved = true;
+                if let Some(to) = &self.settings.move_completed_dir {
+                    if !same_dir(to, &e.rec.dir) {
+                        if let Err(err) = write_move_intent(&self.store, &e.rec.id, to) {
+                            tracing::warn!("recording the move of {}: {err:#}", e.rec.id);
+                        }
+                    }
+                }
             }
             if dirty
                 || finished
@@ -1582,6 +1672,7 @@ fn make_entry(rec: Record, ih: InfoHash, meta: Option<Arc<Metainfo>>, magnet: Op
         ih,
         meta,
         magnet,
+        all_created: false,
     }
 }
 
@@ -1670,26 +1761,34 @@ async fn refresh(e: &mut Entry) {
 /// Persist a magnet's fetched info dict as a `.torrent`, keeping the magnet's
 /// trackers, and parse it back.
 fn store_metadata(store: &Store, id: &str, info: &[u8], trackers: &[String]) -> Result<Metainfo> {
-    let mut d = BTreeMap::new();
-    d.insert(b"info".to_vec(), bencode::decode(info).context("decoding fetched info")?);
-    if !trackers.is_empty() {
+    let mut raw = if trackers.is_empty() {
+        b"d".to_vec()
+    } else {
         let list = trackers
             .iter()
             .map(|t| Value::List(vec![Value::Bytes(t.as_bytes().to_vec())]))
             .collect();
-        d.insert(b"announce-list".to_vec(), Value::List(list));
-    }
-    let raw = bencode::encode(&Value::Dict(d));
+        let mut head = bencode::encode(&Value::Dict(BTreeMap::from([(b"announce-list".to_vec(), Value::List(list))])));
+        head.pop();
+        head
+    };
+    raw.extend_from_slice(b"4:info");
+    raw.extend_from_slice(info);
+    raw.push(b'e');
     let meta = Metainfo::from_bytes(&raw).context("parsing fetched metadata")?;
+    if meta.infohash.to_hex() != id {
+        anyhow::bail!("fetched metadata does not match {id}");
+    }
     store.save_torrent(id, &raw)?;
     Ok(meta)
 }
 
-/// Delete exactly the files the torrent describes under `dir`, then any
-/// directories that leave empty. Nothing else is touched.
-fn delete_files(meta: &Metainfo, dir: &Path) {
+/// Delete the files the torrent describes under `dir` that torrust created
+/// (or has fully verified), then any directories that leave empty. Nothing
+/// else is touched, and nothing behind a symlink.
+fn delete_files(meta: &Metainfo, dir: &Path, created: &BTreeSet<PathBuf>) {
     for (path, _) in meta.files.iter() {
-        if is_plain(path) {
+        if is_plain(path) && created.contains(path) && check_no_symlinks(dir, path).is_ok() {
             let _ = std::fs::remove_file(dir.join(path));
         }
     }
@@ -1718,7 +1817,9 @@ fn prune_dirs(meta: &Metainfo, dir: &Path) {
     let mut parents: Vec<PathBuf> = parents.into_iter().collect();
     parents.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
     for p in parents {
-        let _ = std::fs::remove_dir(p);
+        if p.strip_prefix(dir).is_ok_and(|rel| check_no_symlinks(dir, rel).is_ok()) {
+            let _ = std::fs::remove_dir(p);
+        }
     }
 }
 
@@ -1726,17 +1827,32 @@ fn prune_dirs(meta: &Metainfo, dir: &Path) {
 /// layout. Fails before touching anything if a different file is already at a
 /// destination; a failure midway puts the moved files back.
 fn move_files(meta: &Metainfo, from: &Path, to: &Path) -> Result<()> {
+    move_files_with(meta, from, to, false)
+}
+
+/// With `keep_conflicts`, a file that already differs at the destination is
+/// left where it is instead of failing: undoing a move must not touch what
+/// someone else put there.
+fn move_files_with(meta: &Metainfo, from: &Path, to: &Path, keep_conflicts: bool) -> Result<()> {
+    if same_dir(from, to) {
+        return Ok(());
+    }
     let mut pairs = Vec::new();
     for (path, _) in meta.files.iter() {
         if !is_plain(path) {
             continue;
         }
+        check_no_symlinks(from, path)?;
+        check_no_symlinks(to, path)?;
         let src = from.join(path);
         if !std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_file()) {
             continue;
         }
         let dst = to.join(path);
         if std::fs::symlink_metadata(&dst).is_ok() && !same_content(&src, &dst)? {
+            if keep_conflicts {
+                continue;
+            }
             anyhow::bail!("{} already exists and differs", dst.display());
         }
         pairs.push((src, dst));
@@ -1757,6 +1873,9 @@ fn move_files(meta: &Metainfo, from: &Path, to: &Path) -> Result<()> {
 
 fn move_file(src: &Path, dst: &Path) -> Result<()> {
     if dst.exists() {
+        if same_file(src, dst) {
+            return Ok(());
+        }
         return std::fs::remove_file(src).with_context(|| format!("removing {}", src.display()));
     }
     if let Some(parent) = dst.parent() {
@@ -1797,6 +1916,179 @@ fn same_content(a: &Path, b: &Path) -> Result<bool> {
     }
 }
 
+/// The resolved path of `p`, resolving as much as exists and applying the
+/// rest lexically.
+fn canonical(p: &Path) -> PathBuf {
+    let comps: Vec<_> = p.components().collect();
+    for n in (0..=comps.len()).rev() {
+        let head: PathBuf = if n == 0 { PathBuf::from(".") } else { comps[..n].iter().collect() };
+        if let Ok(mut out) = std::fs::canonicalize(&head) {
+            for c in &comps[n..] {
+                match c {
+                    Component::ParentDir => {
+                        out.pop();
+                    }
+                    Component::CurDir => {}
+                    c => out.push(c),
+                }
+            }
+            return out;
+        }
+    }
+    p.to_path_buf()
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return a.dev() == b.dev() && a.ino() == b.ino();
+        }
+    }
+    canonical(a) == canonical(b)
+}
+
+/// Whether two spellings name the same directory, which may not exist yet.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    same_file(a, b)
+}
+
+fn aux_path(store: &Store, id: &str, ext: &str) -> PathBuf {
+    store.root().join("torrents").join(format!("{id}.{ext}"))
+}
+
+fn move_path(store: &Store, id: &str) -> PathBuf {
+    aux_path(store, id, "move")
+}
+
+fn created_path(store: &Store, id: &str) -> PathBuf {
+    aux_path(store, id, "created")
+}
+
+fn remove_aux(store: &Store, id: &str) {
+    let _ = std::fs::remove_file(created_path(store, id));
+    let _ = std::fs::remove_file(move_path(store, id));
+}
+
+fn path_bytes(p: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        p.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    p.to_string_lossy().into_owned().into_bytes()
+}
+
+fn bytes_path(raw: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(raw))
+    }
+    #[cfg(not(unix))]
+    PathBuf::from(String::from_utf8_lossy(raw).into_owned())
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
+}
+
+fn write_move_intent(store: &Store, id: &str, to: &Path) -> Result<()> {
+    write_private_file(&move_path(store, id), &bencode::encode(&Value::Bytes(path_bytes(to))))
+}
+
+fn read_move_intent(store: &Store, id: &str) -> Option<PathBuf> {
+    let v = bencode::decode(&std::fs::read(move_path(store, id)).ok()?).ok()?;
+    Some(bytes_path(v.as_bytes().ok()?))
+}
+
+/// Torrent-relative paths of the files torrust made, or adopted and fully verified.
+fn read_created(store: &Store, id: &str) -> BTreeSet<PathBuf> {
+    let Ok(raw) = std::fs::read(created_path(store, id)) else { return BTreeSet::new() };
+    let Ok(v) = bencode::decode(&raw) else { return BTreeSet::new() };
+    let Ok(list) = v.as_list() else { return BTreeSet::new() };
+    list.iter().filter_map(|v| v.as_bytes().ok()).map(bytes_path).collect()
+}
+
+fn note_created<'a>(store: &Store, id: &str, paths: impl Iterator<Item = &'a Path>) {
+    let mut set = read_created(store, id);
+    let before = set.len();
+    set.extend(paths.filter(|p| is_plain(p)).map(Path::to_path_buf));
+    if set.len() == before {
+        return;
+    }
+    let list = set.iter().map(|p| Value::Bytes(path_bytes(p))).collect();
+    if let Err(e) = write_private_file(&created_path(store, id), &bencode::encode(&Value::List(list))) {
+        tracing::warn!("recording the files created for {id}: {e:#}");
+    }
+}
+
+/// Add files `torrust add` left in the queue, as (queue file, source, dir).
+/// A file is deleted only once its torrent has been saved.
+fn queued_adds(store: &Store) -> Vec<(PathBuf, String, Option<PathBuf>)> {
+    let Ok(rd) = std::fs::read_dir(store.root().join("queue")) else { return Vec::new() };
+    let mut paths: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("add"))
+        .collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for p in paths {
+        let parsed = std::fs::read(&p).map_err(anyhow::Error::from).and_then(|raw| {
+            let v = bencode::decode(&raw)?;
+            let source = v.get_str_opt("source").context("missing source")?.to_owned();
+            let dir = v.get_bytes_opt("dir").map(bytes_path);
+            Ok((source, dir))
+        });
+        match parsed {
+            Ok((source, dir)) => out.push((p, source, dir)),
+            Err(e) => {
+                tracing::warn!(path = %p.display(), error = %e, "skipping corrupt queue entry");
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+    out
+}
+
+/// Read a local .torrent off the core task. Only regular files, so a FIFO or
+/// device cannot hang or exhaust the session.
+async fn read_source(source: &str) -> Result<Vec<u8>> {
+    let path = PathBuf::from(source);
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        if !std::fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?.is_file() {
+            anyhow::bail!("{} is not a regular file", path.display());
+        }
+        let f = std::fs::File::open(&path).with_context(|| format!("reading {}", path.display()))?;
+        if !f.metadata()?.is_file() {
+            anyhow::bail!("{} is not a regular file", path.display());
+        }
+        let mut raw = Vec::new();
+        f.take(MAX_TORRENT_BYTES as u64 + 1).read_to_end(&mut raw)?;
+        if raw.len() > MAX_TORRENT_BYTES {
+            anyhow::bail!("{} is larger than {} bytes", path.display(), MAX_TORRENT_BYTES);
+        }
+        Ok(raw)
+    })
+    .await?
+}
+
 /// Never keep the web UI password in plaintext once the session has it.
 fn secure_password(settings: &mut Settings) {
     settings.webui.password = settings.webui.password.take().filter(|p| !p.is_empty()).map(|p| crate::store::hashed(&p));
@@ -1807,24 +2099,15 @@ fn is_http(s: &str) -> bool {
     b.len() > 8 && (b[..7].eq_ignore_ascii_case(b"http://") || b[..8].eq_ignore_ascii_case(b"https://"))
 }
 
-/// A URL without credentials, query or fragment, for logs: feed and download
-/// links often carry tokens.
 fn redacted(url: &str) -> String {
-    match url::Url::parse(url) {
-        Ok(mut u) => {
-            let _ = u.set_username("");
-            let _ = u.set_password(None);
-            u.set_query(None);
-            u.set_fragment(None);
-            u.to_string()
-        }
-        Err(_) => "(invalid url)".to_owned(),
-    }
+    crate::redact::url(url)
 }
 
 fn shown(source: &str) -> String {
     if is_http(source) {
         redacted(source)
+    } else if source.starts_with("magnet:") {
+        crate::redact::magnet(source)
     } else {
         source.to_owned()
     }
@@ -1911,10 +2194,42 @@ mod tests {
         ])));
         let dir = std::env::temp_dir().join(format!("ts-meta-{}", std::process::id()));
         let store = Store::at(&dir);
-        let meta = store_metadata(&store, "id", &info, &["http://t/announce".to_owned()]).unwrap();
+        let id = hex::encode(sha1_bytes(&info));
+        let meta = store_metadata(&store, &id, &info, &["http://t/announce".to_owned()]).unwrap();
         assert_eq!(meta.announce_list, vec!["http://t/announce".to_owned()]);
-        let again = Metainfo::from_bytes(&store.load_torrent("id").unwrap()).unwrap();
+        let again = Metainfo::from_bytes(&store.load_torrent(&id).unwrap()).unwrap();
         assert_eq!(again.infohash, meta.infohash);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetched_info_is_stored_byte_for_byte_and_must_match_the_id() {
+        let piece = vec![7u8; 16];
+        let mut info = b"d6:lengthi16e4:name1:f12:piece lengthi16384e6:pieces20:".to_vec();
+        info.extend_from_slice(&sha1_bytes(&piece));
+        info.push(b'e');
+        let dir = std::env::temp_dir().join(format!("ts-verbatim-{}", std::process::id()));
+        let store = Store::at(&dir);
+        let id = hex::encode(sha1_bytes(&info));
+        assert!(store_metadata(&store, "0".repeat(40).as_str(), &info, &[]).is_err());
+        assert!(store.load_torrent(&"0".repeat(40)).is_none());
+        let meta = store_metadata(&store, &id, &info, &["http://t/a".to_owned()]).unwrap();
+        assert_eq!(meta.infohash.to_hex(), id);
+        let stored = store.load_torrent(&id).unwrap();
+        assert!(stored.windows(info.len()).any(|w| w == info.as_slice()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moving_a_file_onto_itself_keeps_it() {
+        let dir = std::env::temp_dir().join(format!("ts-self-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("f");
+        std::fs::write(&f, b"data").unwrap();
+        move_file(&f, &dir.join("./f")).unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"data");
+        assert!(same_dir(&dir, &dir.join("nope/..")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

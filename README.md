@@ -36,7 +36,7 @@ The binary is `target/release/torrust`.
     torrust create <file|dir> [-o out.torrent] [-t URL]... [--web-seed URL]... [--private] \
         [--piece-size KiB] [--comment TEXT] [--source TEXT] [--no-date] [--force] [--seed]
 
-Builds a v1 `.torrent` from a file or directory (files sorted by path, symlinks skipped), hashing pieces on all CPU cores. The piece size is chosen automatically (about 1000-2000 pieces) unless `--piece-size` is given. The output defaults to `<name>.torrent` in the current directory and is not overwritten without `--force`. It prints the infohash and a magnet link. `--seed` hands the torrent to the running session (or queues it) with the parent of `<path>` as the download directory, so it seeds at once.
+Builds a v1 `.torrent` from a file or directory (files sorted by path, symlinks skipped; a symlink as the top-level input is refused), hashing pieces on all CPU cores. The piece size is chosen automatically (about 1000-2000 pieces) unless `--piece-size` is given. The output defaults to `<name>.torrent` in the current directory and is not overwritten without `--force`. It prints the infohash and a magnet link. `--seed` hands the torrent to the running session (or queues it) with the parent of `<path>` as the download directory, so it seeds at once.
 
 ## Session mode
 
@@ -84,7 +84,7 @@ A small browser interface for the session, off by default. It takes links and ma
       torrust webui-password        # type the password and press Enter
       torrust session --no-tui      # daemon mode: runs headless, serves the web UI, Ctrl-C quits
 
-  The password is stored only as a salted, iterated SHA-1 hash (`torrust-sha1$100000$salt$hash`) in `settings.bencode`, which is readable by you alone. The default port is 8080 (`webui.port` in the settings). The session logs the URL it listens on. Run `webui-password` while the session is stopped: a running session writes its own settings when it quits.
+  The password is stored only as a salted, iterated SHA-1 hash (`torrust-sha1$100000$salt$hash`) in `settings.bencode`, which is readable by you alone. The default port is 8080 (`webui.port` in the settings). The session logs the URL it listens on. `webui-password` refuses to run while a session is running, since the session writes its own settings when it quits.
 - Settings, feeds and web UI changes made while the session runs are saved at once and take effect after a restart.
 
 ## TUI keys
@@ -102,7 +102,7 @@ A small browser interface for the session, off by default. It takes links and ma
 
 ## Logging
 
-Logging uses `tracing`; set the level with `RUST_LOG` (default `torrust=info,warn`), e.g. `RUST_LOG=torrust=debug`. In TUI mode, logs are written to `torrust.log` in the system temp directory so they do not corrupt the display; with `--no-tui` they go to stderr.
+Logging uses `tracing`; set the level with `RUST_LOG` (default `torrust=info,warn`), e.g. `RUST_LOG=torrust=debug`. In TUI mode, logs are written to `torrust.log` in the data directory (owner-only, mode 0600; a symlink there is refused) so they do not corrupt the display; with `--no-tui` they go to stderr.
 
 ## Testing
 

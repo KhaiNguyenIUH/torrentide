@@ -152,6 +152,9 @@ pub fn build(opts: &CreateOptions) -> Result<CreatedTorrent> {
     }
     let name = torrent_name(&opts.path)?;
     let meta = std::fs::symlink_metadata(&opts.path)?;
+    if meta.file_type().is_symlink() {
+        bail!("{} is a symlink; pass the path it points to instead", opts.path.display());
+    }
     let single = !meta.is_dir();
     let mut entries = Vec::new();
     if single {
@@ -236,4 +239,35 @@ pub fn build(opts: &CreateOptions) -> Result<CreatedTorrent> {
         pieces: count,
         magnet,
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symlink_input_is_refused() {
+        let dir = std::env::temp_dir().join(format!("torrust-create-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.bin");
+        std::fs::write(&target, vec![7u8; 40_000]).unwrap();
+        let link = dir.join("link.bin");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let opts = |path| CreateOptions {
+            path,
+            trackers: vec![],
+            web_seeds: vec![],
+            private: false,
+            piece_len: None,
+            comment: None,
+            source: None,
+            no_date: true,
+            progress: false,
+        };
+        let err = build(&opts(link)).unwrap_err().to_string();
+        assert!(err.contains("is a symlink"), "{err}");
+        assert!(build(&opts(target)).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

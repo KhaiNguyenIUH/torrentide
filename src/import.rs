@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::metainfo::{is_safe_relative, Metainfo};
-use crate::storage::Storage;
+use crate::storage::{check_no_symlinks, Storage};
 
 /// qBittorrent's (default-on) suffix for incomplete files. Our parser looks
 /// for exact torrent names, so these must be recognised and stripped.
@@ -237,6 +237,7 @@ pub fn execute(plan: &Plan, output: &Path, mode: Mode) -> Result<TransferReport>
 
     for f in &plan.found {
         let dest = output.join(&f.rel);
+        check_no_symlinks(output, &f.rel)?;
         // Zero-length files carry no bytes: just ensure the path exists.
         // (The source may not exist at all, and there is nothing to copy.)
         if f.length == 0 {
@@ -356,7 +357,7 @@ pub struct VerifyReport {
 /// This also repairs sizes: short files are extended with zeros (their bytes
 /// fail verification and re-download) and over-long files are truncated.
 pub fn verify(meta: &Metainfo, output: &Path) -> Result<VerifyReport> {
-    let store = Storage::prepare(meta, output).context("preparing output directory")?;
+    let store = Storage::prepare_repairing(meta, output).context("preparing output directory")?;
 
     let mut pieces_verified = 0usize;
     let mut bytes_verified = 0u64;

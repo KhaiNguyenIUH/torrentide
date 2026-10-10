@@ -604,18 +604,18 @@ impl Engine {
                             }
                             Command::AddTracker(url) => match clean_tracker(&url) {
                                 None => {
-                                    self.log(Level::Warn, format!("not a tracker URL (need http, https or udp): {url}"))
+                                    self.log(Level::Warn, format!("not a tracker URL (need http, https or udp): {}", crate::redact::url(&url)))
                                         .await;
                                 }
                                 Some(u) if trackers.contains(&u) => {
-                                    self.log(Level::Info, format!("tracker already listed: {u}")).await;
+                                    self.log(Level::Info, format!("tracker already listed: {}", crate::redact::url(&u))).await;
                                 }
                                 Some(u) => {
                                     trackers.push(u.clone());
                                     if let Some(t) = &mut self.state.write().await.torrent {
                                         t.trackers = trackers.clone();
                                     }
-                                    self.log(Level::Info, format!("added tracker {u}")).await;
+                                    self.log(Level::Info, format!("added tracker {}", crate::redact::url(&u))).await;
                                     let downloaded = scheduler.block_map().bytes_downloaded(&self.meta);
                                     spawn_announce(
                                         vec![u],
@@ -636,7 +636,7 @@ impl Engine {
                                     if let Some(t) = &mut self.state.write().await.torrent {
                                         t.trackers = trackers.clone();
                                     }
-                                    self.log(Level::Info, format!("removed tracker {url}")).await;
+                                    self.log(Level::Info, format!("removed tracker {}", crate::redact::url(url))).await;
                                 }
                             }
                             Command::SetSequential(on) => {
