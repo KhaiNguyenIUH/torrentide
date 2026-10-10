@@ -507,6 +507,7 @@ impl Core {
             inbound: Some(in_rx),
             port: self.port,
             file_priorities: e.rec.priorities.clone(),
+            extra_peers: None,
         };
         let ui = Arc::clone(&e.ui);
         let dir = e.rec.dir.clone();

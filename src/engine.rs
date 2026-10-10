@@ -83,6 +83,9 @@ pub struct EngineOptions {
     /// Per-file priorities to restore; ignored if its length does not match
     /// or it skips every file.
     pub file_priorities: Option<Vec<FilePriority>>,
+    /// Extra peer addresses from session-level discovery (local peer
+    /// discovery). Dialled like tracker peers.
+    pub extra_peers: Option<mpsc::UnboundedReceiver<Vec<SocketAddr>>>,
 }
 
 impl Default for EngineOptions {
@@ -99,6 +102,7 @@ impl Default for EngineOptions {
             inbound: None,
             port: LOCAL_PORT,
             file_priorities: None,
+            extra_peers: None,
         }
     }
 }
@@ -153,6 +157,7 @@ impl Engine {
         let mut scheduler = Scheduler::new(&self.meta);
         let port = self.opts.port;
         let mut inbound = self.opts.inbound.take();
+        let mut extra_peers = self.opts.extra_peers.take();
         let file_count = self.meta.files.iter().count();
         let mut priorities = initial_priorities(file_count, self.opts.file_priorities.take());
 
@@ -343,6 +348,10 @@ impl Engine {
                 biased;
 
                 Some((addr, ev)) = peer_rx.recv() => {
+                    if let FromPeer::PexPeers(addrs) = &ev {
+                        dial_addrs(&mut pool, addrs);
+                        continue;
+                    }
                     handle_peer_event(&mut scheduler, &storage, &self.meta, &ev);
                     pool.on_event(addr, ev).await;
                 }
@@ -380,6 +389,15 @@ impl Engine {
                             pool.dial(&fresh);
                         }
                     }
+                }
+
+                Some(addrs) = async {
+                    match extra_peers.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    dial_addrs(&mut pool, &addrs);
                 }
 
                 Some(addrs) = async {
@@ -920,6 +938,18 @@ fn spawn_dht_lookups(
         }
     });
     (req_tx, res_rx)
+}
+
+/// Dial whichever of `addrs` the pool has not seen yet.
+fn dial_addrs(pool: &mut PeerPool, addrs: &[SocketAddr]) {
+    let lite: Vec<SocketAddrLite> = addrs
+        .iter()
+        .map(|a| SocketAddrLite { ip: a.ip(), port: a.port() })
+        .collect();
+    let fresh = pool.discover(&lite);
+    if !fresh.is_empty() {
+        pool.dial(&fresh);
+    }
 }
 
 /// Apply an inbound piece to the scheduler's block map.

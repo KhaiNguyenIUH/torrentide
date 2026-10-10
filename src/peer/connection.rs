@@ -90,6 +90,8 @@ pub enum FromPeer {
     /// A dialled peer failed before or during the handshake.
     ConnectFailed(SocketAddr, String),
     Disconnected(String),
+    /// Addresses a peer told us about through peer exchange (BEP 11).
+    PexPeers(Vec<SocketAddr>),
 }
 
 /// Mutable state shared between the engine and the connection's reader task.

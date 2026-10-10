@@ -314,7 +314,7 @@ async fn http_fetch(url: &str) -> Result<Vec<u8>, TrackerError> {
 ///
 /// Cached in a `OnceLock` because building the root store parses hundreds of
 /// certificates, and we would otherwise redo that on every announce.
-fn tls_connector() -> tokio_rustls::TlsConnector {
+pub(crate) fn tls_connector() -> tokio_rustls::TlsConnector {
     use std::sync::OnceLock;
     static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
     CONNECTOR
