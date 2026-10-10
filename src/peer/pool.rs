@@ -639,6 +639,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                 let dialed_at = self.dial_gen.remove(&addr);
                 if self.peers.len() >= self.max_peers {
                     tracing::debug!(peer = %addr, "pool full, dropping new connection");
+                    let _ = handle.tx.send(ToPeer::Close);
                     return;
                 }
                 if self.blocked(&addr) {
@@ -941,7 +942,7 @@ mod tests {
         st.they_choke = choke;
         st.interested = !choke;
         for i in 0..outstanding {
-            st.outstanding.insert((i as u32, 0), Instant::now());
+            st.outstanding.insert((i as u32, 0), (Instant::now(), BLOCK_SIZE));
         }
         let (tx, rx) = mpsc::unbounded_channel();
         (
@@ -1499,7 +1500,8 @@ mod tests {
         let ih = InfoHash([9; 20]);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (c_tx, _c_rx) = mpsc::unbounded_channel();
+        let (c_tx, mut c_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move { while c_rx.recv().await.is_some() {} });
         let client = tokio::spawn(connect(
             addr,
             ih,
@@ -1528,14 +1530,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_full_pool_tells_the_new_connection_to_close() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = PeerPool::new(small_meta(16), None, 6881, tx, Limits::default(), 0, true);
+        let (handle, mut rx) = fake_handle_with_rx(Bitfield::with_pieces(16), true, 0);
+        pool.on_event("10.0.0.1:1000".parse().unwrap(), FromPeer::Connected(Box::new(handle))).await;
+        assert!(matches!(rx.try_recv(), Ok(ToPeer::Close)));
+        assert_eq!(pool.connected(), 0);
+    }
+
+    #[tokio::test]
     async fn ut_pex_message_reaches_the_engine_as_pex_peers() {
         let (a, _b, mut b_rx) = loopback(Some(6881), Some(6882)).await;
-        let id = loop {
-            if let Some(id) = a.state.lock().await.pex_id {
-                break id;
+        let id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = a.state.lock().await.pex_id {
+                    break id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        })
+        .await
+        .expect("extended handshake never arrived");
         let addrs: Vec<SocketAddr> = vec!["1.2.3.4:6881".parse().unwrap(), "[2001:db8::1]:51413".parse().unwrap()];
         a.tx.send(ToPeer::Extended { ext_id: id, payload: pex::encode(&addrs, &[]) }).unwrap();
         loop {

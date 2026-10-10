@@ -157,7 +157,14 @@ async fn seeder_for(fx: &Fixture) -> SocketAddr {
     let seeder = build_seeder(storage, &meta, &vec![true; meta.piece_count()]);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (addr, _h) = torrust::peer::pool::listen(Arc::new(meta), seeder, 0, tx).await.unwrap();
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    tokio::spawn(async move {
+        let mut live = vec![];
+        while let Some((_, ev)) = rx.recv().await {
+            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+                live.push(h);
+            }
+        }
+    });
     addr
 }
 

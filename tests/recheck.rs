@@ -146,7 +146,14 @@ async fn recheck_finds_corruption_and_redownloads() {
     let (seed_addr, _h) = torrust::peer::pool::listen(Arc::new(placeholder), seeder, 0, events_tx)
         .await
         .unwrap();
-    tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
+    tokio::spawn(async move {
+        let mut live = vec![];
+        while let Some((_, ev)) = events_rx.recv().await {
+            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+                live.push(h);
+            }
+        }
+    });
 
     let tracker = mock_tracker(seed_addr).await;
     let raw = build_torrent(&format!("http://{tracker}/announce"), &contents);

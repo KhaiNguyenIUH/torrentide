@@ -412,7 +412,7 @@ where
             if size == 0 {
                 break;
             }
-            if body.len() + size > expected {
+            if size > expected.saturating_sub(body.len()) {
                 return Err(other("chunked body longer than requested"));
             }
             read_n(&mut r, &mut body, size, limits).await?;
@@ -670,5 +670,11 @@ mod tests {
         assert_eq!(backoff(1), Duration::from_secs(30));
         assert_eq!(backoff(2), Duration::from_secs(60));
         assert_eq!(backoff(50), Duration::from_secs(1800));
+    }
+
+    #[tokio::test]
+    async fn huge_chunk_size_is_rejected() {
+        let huge = b"HTTP/1.1 206 X\r\nContent-Range: bytes 0-3/10\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\nFFFFFFFFFFFFFFFF\r\n";
+        assert!(run(huge, 0, 4, 10).await.is_err());
     }
 }

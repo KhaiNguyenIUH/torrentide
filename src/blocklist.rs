@@ -158,11 +158,11 @@ fn parse_cidr(ip: &str, prefix: &str) -> Option<(Addr, Addr)> {
     let prefix: u32 = prefix.parse().ok()?;
     match parse_addr(ip)? {
         Addr::V4(a) if prefix <= 32 => {
-            let host = if prefix == 0 { u32::MAX } else { u32::MAX >> prefix };
+            let host = u32::MAX.checked_shr(prefix).unwrap_or(0);
             Some((Addr::V4(a & !host), Addr::V4(a | host)))
         }
         Addr::V6(a) if prefix <= 128 => {
-            let host = if prefix == 0 { u128::MAX } else { u128::MAX >> prefix };
+            let host = u128::MAX.checked_shr(prefix).unwrap_or(0);
             Some((Addr::V6(a & !host), Addr::V6(a | host)))
         }
         _ => None,
@@ -374,5 +374,18 @@ mod tests {
             check(b.wrapping_add(1));
             check(a.wrapping_sub(1));
         }
+    }
+
+    #[test]
+    fn cidr_host_prefix_edges() {
+        let (l, s) = BlockList::parse("1.2.3.4/32\n::1/128\n10.0.0.0/31\n");
+        assert_eq!(s.skipped_lines, 0);
+        assert!(l.contains(v4("1.2.3.4")) && !l.contains(v4("1.2.3.5")) && !l.contains(v4("9.9.9.9")));
+        assert!(l.contains(v6("::1")) && !l.contains(v6("::2")));
+        assert!(l.contains(v4("10.0.0.0")) && l.contains(v4("10.0.0.1")) && !l.contains(v4("10.0.0.2")));
+        let (l, _) = BlockList::parse("0.0.0.0/0\n");
+        assert!(l.contains(v4("8.8.8.8")));
+        let (l, _) = BlockList::parse("::/0\n");
+        assert!(l.contains(v6("2001::1")));
     }
 }

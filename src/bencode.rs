@@ -26,8 +26,10 @@ pub enum Error {
     UnexpectedByte(u8, usize),
     #[error("invalid integer {0:?}")]
     InvalidInt(String),
-    #[error("dictionary keys are not sorted (at offset {0})")]
+    #[error("dictionary keys are not sorted or repeat (at offset {0})")]
     UnsortedDict(usize),
+    #[error("nesting deeper than {MAX_DEPTH} levels (at offset {0})")]
+    TooDeep(usize),
     #[error("trailing bytes after value at offset {0}")]
     TrailingData(usize),
 }
@@ -144,14 +146,17 @@ pub fn decode(input: &[u8]) -> Result<Value> {
 
 /// Decode one value, returning it plus whatever unconsumed input remains.
 pub fn decode_partial(input: &[u8]) -> Result<(Value, &[u8])> {
-    let mut p = Parser { buf: input, pos: 0 };
+    let mut p = Parser { buf: input, pos: 0, depth: 0 };
     let v = p.value()?;
     Ok((v, &input[p.pos..]))
 }
 
+const MAX_DEPTH: usize = 64;
+
 struct Parser<'a> {
     buf: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -162,11 +167,21 @@ impl<'a> Parser<'a> {
     fn value(&mut self) -> Result<Value> {
         match self.peek()? {
             b'i' => self.integer(),
-            b'l' => self.list(),
-            b'd' => self.dict(),
+            b'l' => self.nested(Self::list),
+            b'd' => self.nested(Self::dict),
             b'0'..=b'9' => self.bytes(),
             other => Err(Error::UnexpectedByte(other, self.pos)),
         }
+    }
+
+    fn nested(&mut self, parse: fn(&mut Self) -> Result<Value>) -> Result<Value> {
+        if self.depth >= MAX_DEPTH {
+            return Err(Error::TooDeep(self.pos));
+        }
+        self.depth += 1;
+        let v = parse(self);
+        self.depth -= 1;
+        v
     }
 
     fn integer(&mut self) -> Result<Value> {
@@ -265,7 +280,7 @@ impl<'a> Parser<'a> {
                         }
                     };
                     if let Some(p) = &prev_key {
-                        if *p > key {
+                        if *p >= key {
                             return Err(Error::UnsortedDict(self.pos));
                         }
                     }
@@ -393,5 +408,21 @@ mod tests {
             (b"a".to_vec(), Value::Int(2)),
         ]));
         assert_eq!(encode(&v), b"d1:ai2e1:zi1ee");
+    }
+
+    #[test]
+    fn rejects_deep_nesting() {
+        let mut deep = vec![b'l'; 100_000];
+        deep.extend(std::iter::repeat(b'e').take(100_000));
+        assert!(decode(&deep).is_err());
+        let mut ok = vec![b'l'; MAX_DEPTH];
+        ok.extend(std::iter::repeat(b'e').take(MAX_DEPTH));
+        assert!(decode(&ok).is_ok());
+    }
+
+    #[test]
+    fn rejects_duplicate_dict_keys() {
+        assert!(decode(b"d1:ai1e1:ai2ee").is_err());
+        assert!(decode(b"d1:ai1e1:bi2ee").is_ok());
     }
 }

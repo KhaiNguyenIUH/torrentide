@@ -1,6 +1,7 @@
 //! Parsing of `.torrent` metainfo files and `magnet:` URIs into a common
 //! [`Metainfo`] type.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -8,6 +9,43 @@ use anyhow::{bail, Context, Result};
 use sha1::{Digest, Sha1};
 
 use crate::bencode::{self, Value};
+
+const MAX_FILES: usize = 100_000;
+
+const WINDOWS_RESERVED: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Whether `seg` is safe as a single file or directory name under the download
+/// directory: no traversal, separators, NULs, and on Windows no drive letters,
+/// device names or names Windows silently rewrites.
+pub fn is_safe_component(seg: &str) -> bool {
+    if seg.is_empty()
+        || seg == "."
+        || seg == ".."
+        || seg.contains(['/', '\\', '\0'])
+    {
+        return false;
+    }
+    if cfg!(windows) {
+        let stem = seg.split('.').next().unwrap_or("").trim_end();
+        if seg.contains(':')
+            || seg.ends_with(['.', ' '])
+            || WINDOWS_RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `path` is non-empty and made only of normal components, so joining
+/// it onto a base directory can never leave that directory.
+pub fn is_safe_relative(path: &Path) -> bool {
+    path.components().next().is_some()
+        && path.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+}
 
 /// An infohash is always SHA-1 over the bencoded `info` dictionary.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -144,6 +182,9 @@ impl Metainfo {
             .get("name")
             .and_then(|v| v.as_str().map(|s| s.to_owned()))
             .context("info dict has no valid name")?;
+        if !is_safe_component(&name) {
+            bail!("unsafe torrent name: {name:?}");
+        }
 
         let piece_length = info
             .get("piece length")
@@ -218,7 +259,7 @@ impl Metainfo {
 
         // Sanity check: the piece count implied by the file sizes must match the
         // number of hashes present, otherwise the torrent is corrupt.
-        let expected = ((total_length + piece_length - 1) / piece_length) as usize;
+        let expected = total_length.div_ceil(piece_length) as usize;
         if expected != pieces.len() {
             bail!(
                 "piece count mismatch: {} hashes but {} pieces implied by total length {}",
@@ -263,7 +304,13 @@ fn parse_files(info: &Value, root_name: &str) -> Result<Files> {
         .context("info dict has neither 'length' nor 'files'")?
         .as_list()?;
 
+    if list.len() > MAX_FILES {
+        bail!("too many files in torrent: {}", list.len());
+    }
     let mut files = Vec::with_capacity(list.len());
+    let mut total = 0u64;
+    let mut seen_files = HashSet::new();
+    let mut seen_dirs = HashSet::new();
     for entry in list {
         let length = entry
             .get("length")
@@ -280,19 +327,34 @@ fn parse_files(info: &Value, root_name: &str) -> Result<Files> {
             let seg = part
                 .as_str()
                 .with_context(|| format!("path component {i} is not valid UTF-8"))?;
-            // Reject traversal and separators inside path components; a malicious
-            // torrent must not be able to write outside the download directory.
-            if seg.is_empty()
-                || seg == "."
-                || seg == ".."
-                || seg.contains('/')
-                || seg.contains('\\')
-                || seg.contains('\0')
-                || (i == 0 && (seg.contains(':') || seg.starts_with('/')))
-            {
+            // A malicious torrent must not be able to write outside the download
+            // directory.
+            if !is_safe_component(seg) {
                 bail!("unsafe path component in torrent: {seg:?}");
             }
             path.push(seg);
+        }
+        total = total
+            .checked_add(length)
+            .filter(|t| *t <= i64::MAX as u64)
+            .context("total torrent length is too large")?;
+
+        // Compared case-folded on every platform, so a torrent cannot behave
+        // differently (or overwrite itself) on a case-insensitive filesystem.
+        let parts: Vec<String> = path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect();
+        let key = parts.join("/");
+        if seen_dirs.contains(&key) || !seen_files.insert(key.clone()) {
+            bail!("duplicate or conflicting path in torrent: {}", path.display());
+        }
+        for end in 1..parts.len() {
+            let prefix = parts[..end].join("/");
+            if seen_files.contains(&prefix) {
+                bail!("duplicate or conflicting path in torrent: {}", path.display());
+            }
+            seen_dirs.insert(prefix);
         }
         files.push(FileEntry { path, length });
     }
@@ -725,5 +787,73 @@ mod tests {
             port: 6881,
         };
         assert_eq!(v6.to_string(), "[::1]:6881");
+    }
+
+    fn multi_info_paths(name: &str, entries: &[(&[&str], i64)], piece_len: u32, pieces: usize) -> crate::bencode::Value {
+        use crate::bencode::Value;
+        let files: Vec<Value> = entries
+            .iter()
+            .map(|(parts, len)| {
+                Value::Dict(std::collections::BTreeMap::from([
+                    (b"length".to_vec(), Value::Int(*len)),
+                    (
+                        b"path".to_vec(),
+                        Value::List(parts.iter().map(|p| Value::Bytes(p.as_bytes().to_vec())).collect()),
+                    ),
+                ]))
+            })
+            .collect();
+        Value::Dict(std::collections::BTreeMap::from([
+            (b"files".to_vec(), Value::List(files)),
+            (b"name".to_vec(), Value::Bytes(name.as_bytes().to_vec())),
+            (b"piece length".to_vec(), Value::Int(piece_len as i64)),
+            (b"pieces".to_vec(), Value::Bytes(vec![0u8; pieces * 20])),
+        ]))
+    }
+
+    #[test]
+    fn rejects_unsafe_torrent_name() {
+        for evil in ["../.zshrc", "..", ".", "", "a/b", "a\\b", "/etc/passwd", "a\0b"] {
+            let raw = single_file_torrent(16384, 100, evil);
+            assert!(Metainfo::from_bytes(&raw).is_err(), "single-file name {evil:?} should be rejected");
+            let raw = wrap(multi_file_info(evil, &[("a.txt", 10)], 10, 1));
+            assert!(Metainfo::from_bytes(&raw).is_err(), "multi-file name {evil:?} should be rejected");
+        }
+        assert!(Metainfo::from_bytes(&single_file_torrent(16384, 100, "a:b")).is_ok() == !cfg!(windows));
+    }
+
+    #[test]
+    fn rejects_length_sum_overflow() {
+        let m = i64::MAX;
+        let raw = wrap(multi_info_paths("r", &[(&["a"], m), (&["b"], m), (&["c"], m)], 16384, 0));
+        assert!(Metainfo::from_bytes(&raw).is_err());
+        let raw = wrap(multi_info_paths("r", &[(&["a"], m), (&["b"], 1)], 16384, 0));
+        assert!(Metainfo::from_bytes(&raw).is_err());
+    }
+
+    #[test]
+    fn rejects_too_many_files() {
+        let names: Vec<String> = (0..100_001).map(|i| format!("f{i}")).collect();
+        let owned: Vec<[&str; 1]> = names.iter().map(|n| [n.as_str()]).collect();
+        let entries: Vec<(&[&str], i64)> = owned.iter().map(|p| (&p[..], 0)).collect();
+        let raw = wrap(multi_info_paths("r", &entries, 16384, 0));
+        assert!(Metainfo::from_bytes(&raw).is_err());
+    }
+
+    #[test]
+    fn rejects_colliding_paths() {
+        let cases: [&[(&[&str], i64)]; 5] = [
+            &[(&["a"], 1), (&["a"], 1)],
+            &[(&["a"], 1), (&["A"], 1)],
+            &[(&["x"], 1), (&["x", "y"], 1)],
+            &[(&["x", "y"], 1), (&["x"], 1)],
+            &[(&["d", "A"], 1), (&["D", "a"], 1)],
+        ];
+        for entries in cases {
+            let raw = wrap(multi_info_paths("r", entries, 16384, 1));
+            assert!(Metainfo::from_bytes(&raw).is_err(), "{entries:?} should be rejected");
+        }
+        let ok = wrap(multi_info_paths("r", &[(&["x", "a"], 1), (&["x", "b"], 1), (&["y"], 1)], 16384, 1));
+        assert!(Metainfo::from_bytes(&ok).is_ok());
     }
 }

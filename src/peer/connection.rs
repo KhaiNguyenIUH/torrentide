@@ -5,7 +5,7 @@
 //! [`connect`] dials out as a leecher, [`accept`] takes an inbound socket as a
 //! seeder. Both end up with identical reader/writer tasks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
@@ -39,6 +39,13 @@ const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// is either buggy or trying to make us allocate without bound.
 const MAX_UPLOAD_BLOCK: u32 = 128 * 1024;
 
+/// Requests we hold per peer before refusing more. Each queued request is
+/// three integers; the block is only read when it is about to be written.
+const MAX_QUEUED_SERVES: usize = 64;
+
+/// How long a single write to a peer may take before we give up on it.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Commands the scheduler sends to a peer.
 #[derive(Debug)]
 pub enum ToPeer {
@@ -70,12 +77,12 @@ pub enum ToPeer {
         begin: u32,
         length: u32,
     },
-    /// A block we read from local storage in response to a peer's `Request`.
-    /// Sent internally; callers should not need this.
+    /// Read a block the peer asked for from local storage and send it.
+    /// Raised by the writer itself from the peer's queued requests.
     Serve {
         index: u32,
         begin: u32,
-        block: Vec<u8>,
+        length: u32,
     },
 }
 
@@ -131,7 +138,7 @@ pub struct PeerState {
     /// Bytes sent to this peer since the last rechoke.
     pub window_up: u64,
     /// Blocks requested but not yet received.
-    pub outstanding: HashMap<(u32, u32), Instant>,
+    pub outstanding: HashMap<(u32, u32), (Instant, u32)>,
     pub downloaded: u64,
     pub uploaded: u64,
     pub connected_at: Instant,
@@ -153,6 +160,8 @@ pub struct PeerState {
     pub metadata_id: Option<u8>,
     /// Start of the current minute and the metadata requests seen in it.
     pub metadata_window: (Instant, u32),
+    /// Blocks the peer asked for that are waiting to be read and written.
+    pub serve_queue: VecDeque<(u32, u32, u32)>,
 }
 
 const MAX_ALLOWED_FAST: usize = 512;
@@ -180,6 +189,7 @@ impl PeerState {
             super_seeded: false,
             metadata_id: None,
             metadata_window: (Instant::now(), 0),
+            serve_queue: VecDeque::new(),
         }
     }
 
@@ -280,13 +290,9 @@ impl Seeder {
         }
     }
 
-    /// Read a requested block, refusing anything that runs outside the piece.
-    pub fn read_requested(
-        &self,
-        index: u32,
-        begin: u32,
-        length: u32,
-    ) -> Option<(u32, u32, Vec<u8>)> {
+    /// Check a requested block, refusing anything that runs outside the piece.
+    /// Returns the file offset and the length to read.
+    fn block_range(&self, index: u32, begin: u32, length: u32) -> Option<(u64, u32)> {
         // Reject requests for pieces we do not have.
         if !self.bitfield.has(index) {
             return None;
@@ -302,7 +308,17 @@ impl Seeder {
         // Clamp to the piece boundary: a peer asking past the end gets the
         // remainder, never bytes from the following piece.
         let len = std::cmp::min(length, piece_len - begin);
-        let offset = index as u64 * self.piece_len as u64 + begin as u64;
+        Some((index as u64 * self.piece_len as u64 + begin as u64, len))
+    }
+
+    /// Read a requested block, refusing anything that runs outside the piece.
+    pub fn read_requested(
+        &self,
+        index: u32,
+        begin: u32,
+        length: u32,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        let (offset, len) = self.block_range(index, begin, length)?;
         match self.storage.read_at(offset, len as u64) {
             Ok(data) => Some((index, begin, data)),
             Err(e) => {
@@ -636,7 +652,9 @@ where
     let ext_enabled = ext.port.is_some();
     let reader_info = ext.info.clone();
     let reader_state = Arc::clone(&state);
-    let reader_tx = peer_tx.clone();
+    let reader_tx = peer_tx.downgrade();
+    let serve_wake = Arc::new(Notify::new());
+    let reader_wake = Arc::clone(&serve_wake);
     let close = Arc::new(Notify::new());
     let reader_close = Arc::clone(&close);
     let reader_limits = limits.clone();
@@ -719,48 +737,39 @@ where
                             begin,
                             block,
                         } => {
-                            st.outstanding.remove(&(index, begin));
-                            st.downloaded += block.len() as u64;
-                            st.window_down += block.len() as u64;
-                            charge_down = block.len();
-                            forward = Some(FromPeer::Piece {
-                                index,
-                                begin,
-                                block,
-                            });
+                            if st.outstanding.get(&(index, begin)).is_some_and(|o| o.1 as usize == block.len()) {
+                                st.outstanding.remove(&(index, begin));
+                                st.downloaded += block.len() as u64;
+                                st.window_down += block.len() as u64;
+                                charge_down = block.len();
+                                forward = Some(FromPeer::Piece {
+                                    index,
+                                    begin,
+                                    block,
+                                });
+                            }
                         }
                         Message::Request {
                             index,
                             begin,
                             length,
                         } => {
-                            let hit = if st.am_choking {
-                                None
-                            } else {
-                                reader_seeder
+                            let servable = !st.am_choking
+                                && st.serve_queue.len() < MAX_QUEUED_SERVES
+                                && reader_seeder
                                     .read()
                                     .unwrap()
                                     .as_ref()
-                                    .and_then(|s| s.read_requested(index, begin, length))
-                            };
-                            match hit {
-                                Some((i, b, data)) => {
-                                    st.uploaded += data.len() as u64;
-                                    st.window_up += data.len() as u64;
-                                    reply = Some(ToPeer::Serve {
-                                        index: i,
-                                        begin: b,
-                                        block: data,
-                                    });
-                                }
-                                None if st.fast => {
-                                    reply = Some(ToPeer::Reject {
-                                        index,
-                                        begin,
-                                        length,
-                                    });
-                                }
-                                None => {}
+                                    .is_some_and(|s| s.block_range(index, begin, length).is_some());
+                            if servable {
+                                st.serve_queue.push_back((index, begin, length));
+                                reader_wake.notify_one();
+                            } else if st.fast {
+                                reply = Some(ToPeer::Reject {
+                                    index,
+                                    begin,
+                                    length,
+                                });
                             }
                         }
                         Message::HaveAll => {
@@ -792,7 +801,13 @@ where
                                 });
                             }
                         }
-                        Message::Cancel { .. } => {}
+                        Message::Cancel {
+                            index,
+                            begin,
+                            length,
+                        } => {
+                            st.serve_queue.retain(|&r| r != (index, begin, length));
+                        }
                         Message::Port { .. } => {}
                         Message::Extended { ext_id, payload } => {
                             if ext_enabled {
@@ -848,7 +863,7 @@ where
                         }
                     }
                     if let Some(cmd) = reply {
-                        if reader_tx.send(cmd).is_err() {
+                        if reader_tx.upgrade().is_none_or(|tx| tx.send(cmd).is_err()) {
                             break;
                         }
                     }
@@ -856,6 +871,9 @@ where
             }
         }
 
+        if let Some(tx) = reader_tx.upgrade() {
+            let _ = tx.send(ToPeer::Close);
+        }
         let _ = inbound_tx.send(FromPeer::Disconnected(
             err_msg.unwrap_or_else(|| "connection closed".into()),
         ));
@@ -874,8 +892,28 @@ where
             payload: pex::encode_handshake(port, ext.info.as_ref().map(|i| i.len())),
         });
     }
+    let writer_seeder = Arc::clone(&seeder);
     tokio::spawn(async move {
-        while let Some(cmd) = peer_rx.recv().await {
+        loop {
+            let queued = writer_state.lock().await.serve_queue.pop_front();
+            let cmd = tokio::select! {
+                biased;
+                c = peer_rx.recv() => match c {
+                    Some(c) => {
+                        if let Some(r) = queued {
+                            writer_state.lock().await.serve_queue.push_front(r);
+                        }
+                        c
+                    }
+                    None => break,
+                },
+                _ = std::future::ready(()), if queued.is_some() => {
+                    let (index, begin, length) = queued.unwrap();
+                    ToPeer::Serve { index, begin, length }
+                }
+                _ = serve_wake.notified() => continue,
+            };
+            let mut served = 0u64;
             let msg = match cmd {
                 ToPeer::Request {
                     index,
@@ -886,7 +924,7 @@ where
                         .lock()
                         .await
                         .outstanding
-                        .insert((index, begin), Instant::now());
+                        .insert((index, begin), (Instant::now(), length));
                     Message::Request {
                         index,
                         begin,
@@ -953,21 +991,48 @@ where
                     begin,
                     length,
                 },
-                ToPeer::Serve { index, begin, block } => {
-                    limits.acquire_up(block.len()).await;
-                    Message::Piece {
-                        index,
-                        begin,
-                        block,
+                ToPeer::Serve { index, begin, length } => {
+                    let seeder = writer_seeder.read().unwrap().clone();
+                    let read = tokio::task::spawn_blocking(move || {
+                        seeder.and_then(|s| s.read_requested(index, begin, length))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    match read {
+                        Some((index, begin, block)) => {
+                            limits.acquire_up(block.len()).await;
+                            served = block.len() as u64;
+                            Message::Piece {
+                                index,
+                                begin,
+                                block,
+                            }
+                        }
+                        None if writer_state.lock().await.fast => Message::RejectRequest {
+                            index,
+                            begin,
+                            length,
+                        },
+                        None => continue,
                     }
                 }
             };
 
             let framed = wire::encode_framed(&msg);
-            if wr.write_all(&framed).await.is_err() {
+            let sent = tokio::time::timeout(WRITE_TIMEOUT, async {
+                wr.write_all(&framed).await?;
+                wr.flush().await
+            })
+            .await;
+            if !matches!(sent, Ok(Ok(()))) {
                 break;
             }
-            let _ = wr.flush().await;
+            if served > 0 {
+                let mut st = writer_state.lock().await;
+                st.uploaded += served;
+                st.window_up += served;
+            }
         }
         let _ = wr.shutdown().await;
         close.notify_one();

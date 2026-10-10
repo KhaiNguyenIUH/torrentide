@@ -51,7 +51,14 @@ async fn sequential_mode_is_published_and_toggles_live() {
     let (seed_addr, _h) = torrust::peer::pool::listen(Arc::clone(&meta), seeder, 0, events_tx)
         .await
         .unwrap();
-    tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
+    tokio::spawn(async move {
+        let mut live = vec![];
+        while let Some((_, ev)) = events_rx.recv().await {
+            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+                live.push(h);
+            }
+        }
+    });
 
     let (peers_tx, peers_rx) = mpsc::unbounded_channel();
     peers_tx.send(vec![format!("127.0.0.1:{}", seed_addr.port()).parse().unwrap()]).unwrap();

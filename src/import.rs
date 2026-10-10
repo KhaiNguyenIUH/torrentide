@@ -17,9 +17,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
-use crate::metainfo::Metainfo;
+use crate::metainfo::{is_safe_relative, Metainfo};
 use crate::storage::Storage;
 
 /// qBittorrent's (default-on) suffix for incomplete files. Our parser looks
@@ -121,6 +121,15 @@ pub fn plan(meta: &Metainfo, from: &Path) -> Plan {
         let rel = rel.to_path_buf();
         let mut hit: Option<(PathBuf, bool)> = None;
 
+        if !is_safe_relative(&rel) {
+            missing.push(MissingFile {
+                index,
+                rel,
+                length,
+            });
+            continue;
+        }
+
         // Zero-length files need no bytes; they always "match".
         if length == 0 {
             hit = Some((from.join(&rel), false));
@@ -221,6 +230,10 @@ pub struct TransferReport {
 /// cannot work.
 pub fn execute(plan: &Plan, output: &Path, mode: Mode) -> Result<TransferReport> {
     let mut report = TransferReport::default();
+
+    if let Some(f) = plan.found.iter().find(|f| !is_safe_relative(&f.rel)) {
+        bail!("torrent path escapes the output directory: {}", f.rel.display());
+    }
 
     for f in &plan.found {
         let dest = output.join(&f.rel);
@@ -637,5 +650,35 @@ mod tests {
         assert_eq!(Mode::from_str("MOVE").unwrap(), Mode::Move);
         assert_eq!(Mode::from_str("hardlink").unwrap(), Mode::Link);
         assert!(Mode::from_str("symlink").is_err());
+    }
+
+    #[test]
+    fn plan_and_execute_refuse_escaping_paths() {
+        let dir = TempDir::new("escape");
+        let from = dir.path().join("from");
+        let out = dir.path().join("out");
+        fs::create_dir_all(&from).unwrap();
+        fs::write(dir.path().join("secret.bin"), b"secret").unwrap();
+        let (mut meta, _) = meta_two_files(16, b"aaaaaaaa", b"bbbbbbbb");
+        meta.files = Files::Multi {
+            files: vec![FileEntry { path: PathBuf::from("..").join("secret.bin"), length: 6 }],
+        };
+        let p = plan(&meta, &from);
+        assert!(p.found.is_empty());
+        assert_eq!(p.missing.len(), 1);
+
+        let forged = Plan {
+            found: vec![FoundFile {
+                index: 0,
+                rel: PathBuf::from("..").join("secret.bin"),
+                source: dir.path().join("secret.bin"),
+                renamed: false,
+                length: 6,
+                source_len: 6,
+            }],
+            missing: vec![],
+        };
+        assert!(execute(&forged, &out, Mode::Move).is_err());
+        assert!(dir.path().join("secret.bin").exists());
     }
 }

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use sha1::{Digest, Sha1};
 
-use crate::metainfo::Metainfo;
+use crate::metainfo::{is_safe_relative, Metainfo};
 
 /// A half-open byte range `[start, end)` in the torrent's flat payload stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +50,12 @@ impl Storage {
     /// Files are allocated sparse where the platform allows it, so a fresh
     /// torrent does not immediately consume its full size on disk.
     pub fn prepare(meta: &Metainfo, root: &Path) -> Result<Self> {
+        for (path, _) in meta.files.iter() {
+            if !is_safe_relative(path) || !root.join(path).starts_with(root) {
+                bail!("torrent path escapes the download directory: {}", path.display());
+            }
+        }
+
         fs::create_dir_all(root)
             .with_context(|| format!("creating download directory {}", root.display()))?;
 
@@ -88,7 +94,7 @@ impl Storage {
                 start: offset,
                 length,
             });
-            offset += length;
+            offset = offset.checked_add(length).context("torrent length overflows")?;
         }
 
         Ok(Storage {
@@ -373,5 +379,18 @@ mod tests {
         let meta = meta_multifile(16, vec![("a.bin", 10)]);
         let store = Storage::prepare(&meta, dir.path()).unwrap();
         assert!(store.read_at(8, 5).is_err());
+    }
+
+    #[test]
+    fn prepare_refuses_paths_outside_root() {
+        let dir = TempDir::new("escape");
+        let root = dir.path().join("dl");
+        let mut meta = meta_multifile(16, vec![("a.bin", 10)]);
+        meta.files = Files::Single { name: "../evil.bin".into(), length: 10 };
+        assert!(Storage::prepare(&meta, &root).is_err());
+        assert!(!dir.path().join("evil.bin").exists());
+        meta.files = Files::Single { name: "/tmp/torrust-abs-evil".into(), length: 10 };
+        assert!(Storage::prepare(&meta, &root).is_err());
+        assert!(!Path::new("/tmp/torrust-abs-evil").exists());
     }
 }

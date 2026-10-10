@@ -199,7 +199,7 @@ fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
 }
 
 fn is_magnet(s: &str) -> bool {
-    s.len() >= 7 && s[..7].eq_ignore_ascii_case("magnet:")
+    s.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("magnet:"))
 }
 
 fn is_torrent_url(s: &str) -> bool {
@@ -699,4 +699,12 @@ mod tests {
     }
 
     const RSS_REL: &str = "<rss><channel><item><title>Rel</title><link>/dl/r.torrent</link></item></channel></rss>";
+
+    #[test]
+    fn is_magnet_survives_multibyte() {
+        assert!(!is_magnet("abcdef\u{e9}"));
+        assert!(is_magnet("MAGNET:?xt=x"));
+        let feed = "<rss><channel><item><title>t</title><link>abcdef\u{e9}</link></item></channel></rss>";
+        let _ = parse_inner(feed, None);
+    }
 }

@@ -1199,6 +1199,17 @@ fn handle_peer_event(
         block,
     } = ev
     {
+        let end = *begin as u64 + block.len() as u64;
+        if *index as usize >= meta.piece_count()
+            || scheduler.block_map().is_verified(*index)
+            || begin % BLOCK_SIZE != 0
+            || block.is_empty()
+            || block.len() > BLOCK_SIZE as usize
+            || end > meta.piece_size(*index as usize)
+        {
+            tracing::debug!(piece = *index, begin = *begin, len = block.len(), "dropping unsolicited block");
+            return;
+        }
         // Persist the block BEFORE telling the scheduler we have it. If the
         // write fails we must not mark the block as held, or the piece would
         // look complete and get "verified" against whatever stale bytes are on
@@ -1661,6 +1672,47 @@ mod tests {
         );
         assert!(s.block_map().have_block(1, 3));
         assert!(!s.block_map().have_block(1, 0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocks_that_do_not_belong_to_an_unverified_piece_are_never_written() {
+        let meta = Metainfo {
+            infohash: crate::metainfo::InfoHash([0; 20]),
+            name: "t".into(),
+            piece_length: BLOCK_SIZE * 2,
+            pieces: vec![[0u8; 20]; 3],
+            files: crate::metainfo::Files::Single {
+                name: "t".into(),
+                length: BLOCK_SIZE as u64 * 5,
+            },
+            total_length: BLOCK_SIZE as u64 * 5,
+            private: false,
+            announce: None,
+            announce_list: vec![],
+            web_seeds: vec![],
+            info_bytes: vec![],
+        };
+        let mut s = Scheduler::new(&meta);
+        let dir = std::env::temp_dir().join(format!("torrust-engine4-{}", std::process::id()));
+        let store = Storage::prepare(&meta, &dir).unwrap();
+        store.write_at(0, &vec![0x11; BLOCK_SIZE as usize * 5]).unwrap();
+        s.block_map_mut().mark_verified(0);
+
+        let mut give = |index: u32, begin: u32, len: usize| {
+            handle_peer_event(&mut s, &store, &meta, &FromPeer::Piece { index, begin, block: vec![0xEE; len] });
+        };
+        give(0, 0, BLOCK_SIZE as usize);
+        give(1, 1, 16);
+        give(1, 0, BLOCK_SIZE as usize * 2);
+        give(2, 0, BLOCK_SIZE as usize * 2);
+        give(2, BLOCK_SIZE, 0);
+        give(3, 0, 16);
+        let on_disk = store.read_at(0, BLOCK_SIZE as u64 * 5).unwrap();
+        assert!(on_disk.iter().all(|b| *b == 0x11), "an unsolicited block reached the disk");
+
+        give(2, 0, BLOCK_SIZE as usize);
+        assert_eq!(store.read_at(BLOCK_SIZE as u64 * 4, 4).unwrap(), vec![0xEE; 4]);
         let _ = fs::remove_dir_all(&dir);
     }
 

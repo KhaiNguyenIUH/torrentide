@@ -114,7 +114,14 @@ async fn seed_listener(pieces: usize, complete: bool) -> Seed {
     let seeder = complete.then(|| build_seeder(storage, &meta, &vec![true; pieces]).unwrap());
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (addr, _h) = torrust::peer::pool::listen(Arc::clone(&meta), seeder, 0, tx).await.unwrap();
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    tokio::spawn(async move {
+        let mut live = vec![];
+        while let Some((_, ev)) = rx.recv().await {
+            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+                live.push(h);
+            }
+        }
+    });
     Seed { addr: loopback(addr), meta, data, _dir: dir }
 }
 
@@ -130,7 +137,14 @@ async fn ut_metadata_client_fetches_the_info_dict_from_a_running_peer() {
     assert!(meta.info_bytes.len() > 2 * 16 * 1024 - 1, "needs three metadata pieces");
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (addr, _h) = torrust::peer::pool::listen(Arc::new(meta.clone()), None, 0, tx).await.unwrap();
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    tokio::spawn(async move {
+        let mut live = vec![];
+        while let Some((_, ev)) = rx.recv().await {
+            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+                live.push(h);
+            }
+        }
+    });
 
     let got = torrust::dht::fetch_metadata_from_peer(loopback(addr), meta.infohash, WAIT)
         .await
@@ -173,7 +187,14 @@ async fn metadata_requests_are_bounded_and_rate_limited() {
     let meta = fake_torrent(400, false);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (addr, _h) = torrust::peer::pool::listen(Arc::new(meta.clone()), None, 0, tx).await.unwrap();
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    tokio::spawn(async move {
+        let mut live = vec![];
+        while let Some((_, ev)) = rx.recv().await {
+            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+                live.push(h);
+            }
+        }
+    });
     let (mut s, hs) = raw_peer(loopback(addr), meta.infohash, false, true).await;
     assert!(hs.supports_extended());
     send(&mut s, &ext_handshake(7)).await;
@@ -197,7 +218,14 @@ async fn private_torrents_do_not_offer_the_extension_protocol() {
     let meta = fake_torrent(4, true);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (addr, _h) = torrust::peer::pool::listen(Arc::new(meta.clone()), None, 0, tx).await.unwrap();
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    tokio::spawn(async move {
+        let mut live = vec![];
+        while let Some((_, ev)) = rx.recv().await {
+            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+                live.push(h);
+            }
+        }
+    });
     let (_s, hs) = raw_peer(loopback(addr), meta.infohash, false, true).await;
     assert!(!hs.supports_extended());
 }
