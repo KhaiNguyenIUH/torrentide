@@ -1402,6 +1402,7 @@ async fn fetch_magnet_metadata(
     port: u16,
     dht_enabled: bool,
     shared_dht: Option<&DhtNode>,
+    encryption: EncryptionMode,
 ) -> Result<Vec<u8>> {
     const PEER_PHASE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -1431,7 +1432,7 @@ async fn fetch_magnet_metadata(
 
             tried = peers.len();
             let addrs = peers.iter().map(|p| SocketAddr::new(p.ip, p.port)).collect();
-            match crate::dht::fetch_metadata_from_peers(addrs, magnet.infohash, PEER_PHASE_TIMEOUT)
+            match crate::dht::fetch_metadata_from_peers(addrs, magnet.infohash, PEER_PHASE_TIMEOUT, encryption)
                 .await
             {
                 Ok(info) => {
@@ -1448,14 +1449,7 @@ async fn fetch_magnet_metadata(
 
     // ---- 2. the DHT ----
     if !dht_enabled {
-        let mut st = state.write().await;
-        st.log(
-            Level::Error,
-            format!(
-                "could not fetch metadata (tried {tried} peers); the DHT is disabled in settings"
-            ),
-        );
-        anyhow::bail!("fetching metadata for magnet link: no peer supplied it and the DHT is off");
+        anyhow::bail!("tried {tried} tracker peers and the DHT is off in settings");
     }
 
     state
@@ -1470,25 +1464,18 @@ async fn fetch_magnet_metadata(
 
     let timeout = Duration::from_secs(60);
     let fetched = match shared_dht {
-        Some(node) => crate::dht::fetch_metadata_with_node(node, magnet.infohash, timeout).await,
-        None => crate::dht::fetch_metadata(magnet.infohash, &routers, timeout).await,
+        Some(node) => crate::dht::fetch_metadata_with_node(node, magnet.infohash, timeout, encryption).await,
+        None => crate::dht::fetch_metadata(magnet.infohash, &routers, timeout, encryption).await,
     };
     match fetched {
         Ok(info) => Ok(info),
-        Err(e) => {
-            let mut st = state.write().await;
-            st.log(Level::Warn, format!("DHT lookup failed: {e:#}"));
-            st.log(
-                Level::Error,
-                format!(
-                    "could not fetch metadata (tried {tried} peers). \
-                     A magnet needs at least one reachable tracker or an active DHT."
-                ),
-            );
-            Err(anyhow::anyhow!("fetching metadata for magnet link: {e:#}"))
-        }
+        Err(e) => Err(anyhow::anyhow!("tried {tried} tracker peers, then the DHT: {e:#}")),
     }
 }
+
+/// Wait before the first metadata retry; it doubles up to the maximum.
+const METADATA_RETRY_FIRST: Duration = Duration::from_secs(15);
+const METADATA_RETRY_MAX: Duration = Duration::from_secs(300);
 
 /// A stand-in metainfo so the tracker client can announce a magnet, which has
 /// an infohash but no info dict yet. Only the infohash is used for announcing.
@@ -1549,13 +1536,28 @@ pub async fn run_magnet_with_options(
         st.log(Level::Info, "magnet link: locating peers for metadata");
     }
 
-    let fetch = fetch_magnet_metadata(
-        &magnet,
-        &state,
-        opts.port,
-        opts.dht_enabled,
-        opts.dht.as_deref(),
-    );
+    // Keep trying until it works or the torrent is stopped: right after a
+    // start the DHT may still be filling, and peers come and go.
+    let fetch = async {
+        let mut wait = METADATA_RETRY_FIRST;
+        loop {
+            match fetch_magnet_metadata(&magnet, &state, opts.port, opts.dht_enabled, opts.dht.as_deref(), opts.encryption).await {
+                Ok(info) => {
+                    state.write().await.warning = None;
+                    break Ok::<_, anyhow::Error>(info);
+                }
+                Err(e) => {
+                    let msg = format!("no metadata yet ({e:#}); retrying in {}s", wait.as_secs());
+                    let mut st = state.write().await;
+                    st.log(Level::Warn, msg.clone());
+                    st.warning = Some(msg);
+                    drop(st);
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(METADATA_RETRY_MAX);
+                }
+            }
+        }
+    };
     let wait_stop = async {
         while let Some(cmd) = commands.recv().await {
             if cmd == Command::Stop {
