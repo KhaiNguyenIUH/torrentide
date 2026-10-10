@@ -1,25 +1,28 @@
 <h1 align="center">torrust</h1>
 
-<p align="center">A BitTorrent client written from scratch in Rust, with a terminal UI and a web UI.</p>
+<p align="center">A free, open-source BitTorrent client written from scratch in Rust, with a terminal UI and a web UI.</p>
 
 <p align="center">
-  <a href="https://github.com/KhaiNguyenIUH/torrust/releases/latest"><img alt="Download" src="https://img.shields.io/badge/download-latest%20release-brightgreen"></a>
+  <a href="https://github.com/KhaiNguyenIUH/torrust/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/KhaiNguyenIUH/torrust"></a>
   <a href="https://github.com/KhaiNguyenIUH/torrust/actions/workflows/release.yml"><img alt="Release build" src="https://github.com/KhaiNguyenIUH/torrust/actions/workflows/release.yml/badge.svg"></a>
-  <img alt="Platforms" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey">
-  <img alt="Rust" src="https://img.shields.io/badge/rust-2021-orange">
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
+  <img alt="Platforms" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/KhaiNguyenIUH/torrust"></a>
 </p>
 
-torrust runs as a background session that you drive from a terminal UI (ratatui) or a small web UI, and it also has a plain-text mode. Closing either UI leaves downloads running. The crate is both a library (`torrust`) and a binary.
+torrust runs as a background session that you drive from a terminal UI or a small web UI. Closing either one leaves your downloads running. It speaks the parts of BitTorrent you would expect from a desktop client (trackers, DHT, peer exchange, uTP, encryption, magnet links, RSS) without depending on libtorrent or any other BitTorrent library. The crate is both a library (`torrust`) and a binary.
+
+The project is MIT licensed. Bug reports, ideas and pull requests are welcome; see [Contributing](#contributing).
 
 <p align="center">
   <img alt="Terminal UI" src="docs/tui.png" width="49%">
   <img alt="Web UI" src="docs/webui.png" width="49%">
 </p>
 
-## Download
+## Install
 
-No Rust needed. Grab the file for your system from the [latest release](https://github.com/KhaiNguyenIUH/torrust/releases/latest), unpack it and run `torrust`.
+### Prebuilt binaries
+
+Grab the file for your system from the [latest release](https://github.com/KhaiNguyenIUH/torrust/releases/latest), unpack it and run `torrust`. No Rust toolchain needed.
 
 | System | File | First run |
 | --- | --- | --- |
@@ -27,7 +30,17 @@ No Rust needed. Grab the file for your system from the [latest release](https://
 | macOS, Intel | `torrust-vX.Y.Z-x86_64-apple-darwin.tar.gz` | same as above |
 | Windows 64-bit | `torrust-vX.Y.Z-x86_64-pc-windows-msvc.zip` | SmartScreen warns: "More info", then "Run anyway" |
 
-The binaries are not signed, which is why each system asks once. The Windows build compiles in CI but has had little testing; on Windows the session runs inside the TUI instead of as a background service.
+The binaries are not signed, which is why each system asks once. The Windows build has had less testing than the macOS one, and on Windows the session runs inside the TUI instead of as a background service.
+
+### From source
+
+You need a recent stable Rust toolchain. This is also the way to run torrust on Linux, which has no prebuilt binary yet.
+
+    cargo install --git https://github.com/KhaiNguyenIUH/torrust
+
+or, from a clone:
+
+    cargo build --release      # binary at target/release/torrust
 
 ## Quick start
 
@@ -37,6 +50,19 @@ torrust add "magnet:?xt=urn:btih:..."    # add a magnet link or .torrent
 torrust webui-password                   # turn on the web UI at http://127.0.0.1:8080
 torrust stop                             # stop the session
 ```
+
+## Features
+
+| | |
+| --- | --- |
+| Sources | `.torrent` files, magnet links, `http(s)` links to torrents, RSS and Atom feeds |
+| Finding peers | HTTP, HTTPS and UDP trackers, Kademlia DHT, peer exchange, local peer discovery |
+| Connections | uTP and TCP, Message Stream Encryption (prefer or require), NAT-PMP and UPnP port forwarding |
+| Downloading | rarest-first with endgame, resume with recheck, skip files, per-torrent and global speed limits |
+| Seeding | seeds while downloading, ratio target, super-seeding, tit-for-tat choking |
+| Control | terminal UI with mouse support, web UI with upload and drag-and-drop, schedule, block list, notifications |
+| Other clients | import half-finished downloads, including qBittorrent's `.!qB` files |
+| Creating | build v1 `.torrent` files on all CPU cores and seed them at once |
 
 ## How it fits together
 
@@ -51,30 +77,6 @@ flowchart LR
     E --> D[DHT]
     E --> F[(Files on disk)]
 ```
-
-## Features
-
-| | |
-| --- | --- |
-| Sources | `.torrent` files, magnet links, `http(s)` links to torrents, RSS and Atom feeds |
-| Finding peers | HTTP, HTTPS and UDP trackers, Kademlia DHT, peer exchange, local peer discovery |
-| Connections | uTP and TCP, Message Stream Encryption (prefer or require), NAT-PMP and UPnP port forwarding |
-| Downloading | rarest-first with endgame, resume with recheck, skip files, per-torrent and global speed limits |
-| Seeding | seeds while downloading, ratio target, super-seeding, tit-for-tat choking |
-| Control | terminal UI, web UI with upload and drag-and-drop, schedule, block list, notifications |
-| Other clients | import half-finished downloads, including qBittorrent's `.!qB` files |
-| Creating | build v1 `.torrent` files on all CPU cores and seed them at once |
-
-## Build from source
-
-    cargo build --release
-
-The binary is `target/release/torrust`.
-
-To cut a release, bump `version` in `Cargo.toml`, commit, then push a tag. The release workflow builds the macOS and Windows binaries and writes the release notes from the commits since the previous tag.
-
-    git tag v0.1.2
-    git push origin v0.1.2
 
 ## Usage
 
@@ -112,7 +114,7 @@ One session runs many torrents behind a single listening port and DHT node. Fini
 - Settings, torrents and their state live in the data directory: `~/Library/Application Support/torrust` on macOS, `$XDG_DATA_HOME/torrust` (or `~/.local/share/torrust`) on Linux and `%APPDATA%\torrust` on Windows. Set `TORRUST_HOME` to use a different directory.
 - Speed limits are in bytes per second (0 means unlimited) and can be set globally or per torrent. Uploads use tit-for-tat choking with 4 unchoke slots plus one optimistic slot, re-evaluated every 10 s.
 - The listen port defaults to 6881 and falls back to a free port when that one is busy. With port forwarding on, the session asks the router for it over NAT-PMP, then UPnP. Port, DHT and forwarding changes apply after a restart.
-- A magnet link that finds no peers yet (for example right after startup, while the DHT is still filling) keeps retrying after 15 s, doubling up to 5 minutes, until the metadata arrives or you stop it. The reason shows on the torrent and in the log.
+- A magnet link keeps looking for its metadata until it arrives or you stop it. Every tracker in the link, the DHT and peers that connect to you are all used at once, over uTP and TCP. The torrent's status shows how long it has waited and how many trackers and peers it has heard from.
 - `scripts/macos` and `scripts/linux` install handlers that open `magnet:` links and `.torrent` files with `torrust add`.
 
 ## Encryption and uTP
@@ -172,22 +174,49 @@ In the multi-torrent session UI, mouse clicks (torrent rows, tabs, footer key hi
 
 Logging uses `tracing`. Set the level with `RUST_LOG` (default `torrust=info,warn`), e.g. `RUST_LOG=torrust=debug`. In TUI mode the logs go to `torrust.log` in the data directory so they don't garble the display. The file is owner-only (mode 0600), and a symlink in its place is refused. With `--no-tui` they go to stderr.
 
-## Testing
-
-    cargo test
-
-`tests/download.rs` runs the real engine against a local seeder and a mock HTTP tracker, so it needs no network access.
-
-## Modules
+## Project layout
 
 - `bencode`: bencode encoding and decoding
 - `metainfo`: `.torrent` parsing, infohash, magnet URIs
 - `storage`: maps the payload onto files; SHA-1 piece checks
-- `peer`: wire protocol (`wire`), per-peer connections (`connection`), peer pool and listener (`pool`)
+- `peer`: wire protocol (`wire`), per-peer connections (`connection`), peer pool and listener (`pool`), encryption (`mse`), peer exchange (`pex`)
+- `utp`: uTP transport (BEP 29)
 - `tracker`: HTTP/HTTPS/UDP announces
 - `dht`: Kademlia DHT and metadata exchange
 - `scheduler`: rarest-first piece selection, endgame
-- `engine`: ties the pieces above together
-- `state`: snapshots and commands shared with the UI
-- `tui`: terminal interface
+- `engine`: ties the pieces above together for one torrent
+- `session`: many torrents behind one port, settings, feeds, schedule
+- `state`: snapshots and commands shared with the UIs
+- `tui`, `webui`: the terminal and browser interfaces
 - `import`: adopting other clients' partial downloads
+- `create`: building `.torrent` files
+
+## Contributing
+
+Contributions of any size are welcome, from typo fixes to protocol work.
+
+- **Bugs and ideas**: open an [issue](https://github.com/KhaiNguyenIUH/torrust/issues). For a bug, include your OS, the torrust version (`torrust --version`), what you did and what you expected. A log helps a lot: run with `RUST_LOG=torrust=debug` and attach `torrust.log` from the data directory, after removing anything private.
+- **Pull requests**: keep each one to a single change, add or update a test when you change behaviour, and run the checks below before you push. For larger changes, open an issue first so we can agree on the approach.
+- **Style**: follow the code around you. Format with `cargo fmt` on the lines you touch and keep `cargo clippy` free of new warnings.
+
+Checks:
+
+    cargo test
+    cargo clippy --all-targets
+
+The integration tests in `tests/` run the real engine against local seeders and mock trackers, so they need no internet access. One of them, `peers_find_each_other_through_local_discovery_alone`, needs local-network multicast and can fail on machines or CI runners that block it.
+
+### Security
+
+Please don't report security problems in public issues. Use GitHub's [private vulnerability reporting](https://github.com/KhaiNguyenIUH/torrust/security/advisories/new) instead, and allow some time for a fix before disclosing.
+
+### Releasing
+
+For maintainers: bump `version` in `Cargo.toml`, commit, then push a tag. The release workflow builds the macOS and Windows binaries and writes the release notes from the commits since the previous tag.
+
+    git tag vX.Y.Z
+    git push origin vX.Y.Z
+
+## License
+
+torrust is released under the [MIT License](LICENSE).
