@@ -726,10 +726,10 @@ impl Core {
                 }
             }
             SessionCommand::Add { source, dir } => self.add(source, dir, None).await,
-            SessionCommand::AddTorrent { bytes } if bytes.len() > MAX_TORRENT_BYTES => {
+            SessionCommand::AddTorrent { bytes, .. } if bytes.len() > MAX_TORRENT_BYTES => {
                 self.log(Level::Error, format!("cannot add uploaded torrent: larger than {MAX_TORRENT_BYTES} bytes")).await;
             }
-            SessionCommand::AddTorrent { bytes } => self.add_loaded("uploaded .torrent".into(), Some(bytes), None).await,
+            SessionCommand::AddTorrent { bytes, dir } => self.add_loaded("uploaded .torrent".into(), Some(bytes), dir).await,
             SessionCommand::Remove { id, delete_data } => self.remove(&id, delete_data).await,
             SessionCommand::MoveQueue { id, up } => self.move_queue(&id, up).await,
             SessionCommand::SetLabel { id, label } => {

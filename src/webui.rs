@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -689,6 +690,15 @@ fn form(body: &[u8]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The query string of a target, parsed the same way as a form body.
+/// Used by `/api/upload`, whose body is the raw `.torrent`.
+fn query(req: &Request) -> Vec<(String, String)> {
+    req.target
+        .split_once('?')
+        .map(|(_, q)| form(q.split('#').next().unwrap_or("").as_bytes()))
+        .unwrap_or_default()
+}
+
 fn field<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
     fields
         .iter()
@@ -719,6 +729,60 @@ fn is_link(s: &str) -> bool {
     lower.starts_with("magnet:?") || lower.starts_with("http://") || lower.starts_with("https://")
 }
 
+/// Resolve a folder named by a web request against the roots it may use.
+///
+/// A plain name is a subfolder of the download folder. An absolute path is
+/// accepted only when it lies under the download folder or under one of the
+/// operator's extra `save_roots`, so the browser can reach another drive
+/// without being able to name an arbitrary place on the machine. Either way
+/// the result is canonicalized and re-checked, which also catches a symlink
+/// inside a root pointing out of it. `Ok(None)` means "use the default".
+fn save_dir(root: &Path, extra: &[PathBuf], raw: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let Some(name) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let list = || {
+        std::iter::once(root.display().to_string())
+            .chain(extra.iter().map(|p| p.display().to_string()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let rejected = || format!("the folder must be inside: {}", list());
+    if name.contains('\0') {
+        return Err(rejected());
+    }
+    let asked = Path::new(name);
+    let dir = if asked.is_absolute() {
+        asked.to_path_buf()
+    } else {
+        // A relative name may only descend into the download folder.
+        if !asked.components().all(|c| matches!(c, Component::Normal(_))) {
+            return Err(rejected());
+        }
+        root.join(asked)
+    };
+    // Check containment on the deepest ancestor that already exists *before*
+    // creating anything, so a rejected folder is never made on disk.
+    let mut probe = dir.as_path();
+    while !probe.exists() {
+        probe = probe.parent().ok_or_else(rejected)?;
+    }
+    let roots: Vec<PathBuf> =
+        std::iter::once(root).chain(extra.iter().map(|p| p.as_path())).filter_map(|r| std::fs::canonicalize(r).ok()).collect();
+    let inside = |p: &Path| roots.iter().any(|r| p.starts_with(r));
+    let real_probe = std::fs::canonicalize(probe).map_err(|e| format!("cannot use {}: {e}", dir.display()))?;
+    if !inside(&real_probe) {
+        return Err(rejected());
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot use {}: {e}", dir.display()))?;
+    // Re-check now that it exists, in case a link was on the way.
+    let real_dir = std::fs::canonicalize(&dir).map_err(|e| format!("cannot use {}: {e}", dir.display()))?;
+    if !inside(&real_dir) {
+        return Err(rejected());
+    }
+    Ok(Some(real_dir))
+}
+
 async fn route(req: &Request, body: &[u8], state: &RwLock<SessionState>) -> Vec<u8> {
     let path = req.target.split(['?', '#']).next().unwrap_or("/");
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
@@ -732,18 +796,22 @@ async fn route(req: &Request, body: &[u8], state: &RwLock<SessionState>) -> Vec<
             let Some(source) = field(&f, "source") else {
                 return error(400, "source is required");
             };
-            // Safe first: a remote browser may not name files or folders on
-            // this machine, only links. Paths and save folders stay a
-            // terminal-only feature.
+            // Safe first: a remote browser may name links, never a file on
+            // this machine. It may pick a folder to save into, but only a
+            // subfolder of the download root; see `subfolder`.
             if !is_link(source) {
                 return error(400, "only magnet: and http(s):// links can be added here");
             }
-            if field(&f, "dir").is_some() {
-                return error(400, "the save folder can only be set from the terminal");
-            }
+            let dir = {
+                let st = state.read().await;
+                match save_dir(&st.settings.download_dir, &st.settings.webui.save_roots, field(&f, "dir")) {
+                    Ok(dir) => dir,
+                    Err(message) => return error(400, &message),
+                }
+            };
             let cmd = SessionCommand::Add {
                 source: source.to_string(),
-                dir: None,
+                dir,
             };
             dispatch(&*state.read().await, cmd)
         }
@@ -751,7 +819,14 @@ async fn route(req: &Request, body: &[u8], state: &RwLock<SessionState>) -> Vec<
             if body.first() != Some(&b'd') {
                 return error(400, "not a .torrent file");
             }
-            dispatch(&*state.read().await, SessionCommand::AddTorrent { bytes: body.to_vec() })
+            let dir = {
+                let st = state.read().await;
+                match save_dir(&st.settings.download_dir, &st.settings.webui.save_roots, field(&query(req), "dir")) {
+                    Ok(dir) => dir,
+                    Err(message) => return error(400, &message),
+                }
+            };
+            dispatch(&*state.read().await, SessionCommand::AddTorrent { bytes: body.to_vec(), dir })
         }
         ("POST", ["api", "feeds"]) => {
             let f = form(body);
@@ -1104,7 +1179,7 @@ mod tests {
 
     #[test]
     fn bind_addr_is_loopback_without_password() {
-        let mut s = WebUiSettings { enabled: true, port: 9000, password: None, lan: false };
+        let mut s = WebUiSettings { enabled: true, port: 9000, password: None, lan: false, save_roots: Vec::new() };
         assert_eq!(bind_addr(&s), "127.0.0.1:9000".parse().unwrap());
         s.password = Some(String::new());
         assert!(bind_addr(&s).ip().is_loopback());
@@ -1186,7 +1261,7 @@ mod tests {
         let mut bytes = b"d4:infod4:name1:aee".to_vec();
         bytes.extend(std::iter::repeat(0xffu8).take(MAX_BODY * 3));
         assert_eq!(raw(addr, &upload_req(addr, &bytes, COOKIE)).await.0, 200);
-        assert_eq!(rx.try_recv().unwrap(), SessionCommand::AddTorrent { bytes });
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::AddTorrent { bytes, dir: None });
 
         for bad in [&b""[..], b"hello", b"l4:spame"] {
             assert_eq!(raw(addr, &upload_req(addr, bad, COOKIE)).await.0, 400);
@@ -1199,6 +1274,127 @@ mod tests {
         let nogate = format!("POST /api/upload HTTP/1.1\r\nHost: {addr}\r\n{COOKIE}Content-Length: 2\r\n\r\nde");
         assert_eq!(raw(addr, nogate.as_bytes()).await.0, 403);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Like `upload_req`, but with a query string on the request line.
+    fn upload_req_q(addr: SocketAddr, body: &[u8], query: &str, extra: &str) -> Vec<u8> {
+        let mut r = format!(
+            "POST /api/upload{query} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\n\
+             Content-Type: application/x-bittorrent\r\nContent-Length: {}\r\n{extra}\r\n",
+            body.len()
+        )
+        .into_bytes();
+        r.extend_from_slice(body);
+        r
+    }
+
+    /// A scratch download root so the folder tests never touch `$HOME`.
+    fn scratch_root(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("torrust-webui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(dir).unwrap()
+    }
+
+    #[test]
+    fn save_dir_accepts_nested_names_only() {
+        let root = scratch_root("nested");
+        let deep = save_dir(&root, &[], Some("Movies/2024")).unwrap().unwrap();
+        assert!(deep.starts_with(&root) && deep.is_dir());
+        assert!(save_dir(&root, &[], Some("   ")).unwrap().is_none());
+        assert!(save_dir(&root, &[], None).unwrap().is_none());
+        assert!(save_dir(&root, &[], Some("a/b/c")).unwrap().is_some());
+    }
+
+    #[test]
+    fn save_dir_refuses_to_escape_the_root() {
+        let root = scratch_root("escape");
+        for bad in ["..", "../evil", "a/../../evil", ".", "./.."] {
+            assert!(save_dir(&root, &[], Some(bad)).is_err(), "accepted {bad:?}");
+        }
+        // An absolute path is refused until a root allows it.
+        assert!(save_dir(&root, &[], Some(r"C:\Windows")).is_err());
+        // A link inside the root pointing out of it is refused too.
+        #[cfg(unix)]
+        {
+            let link = root.join("out");
+            std::os::unix::fs::symlink(std::env::temp_dir(), &link).unwrap();
+            assert!(save_dir(&root, &[], Some("out")).is_err());
+        }
+    }
+
+    #[test]
+    fn save_dir_honours_extra_roots() {
+        let root = scratch_root("home");
+        let other = scratch_root("drive");
+        let nested = other.join("Torrents");
+        // Not allowed before the root is configured.
+        assert!(save_dir(&root, &[], Some(&nested.display().to_string())).is_err());
+        // Allowed once it is, including below it.
+        let got = save_dir(&root, std::slice::from_ref(&other), Some(&nested.display().to_string())).unwrap().unwrap();
+        assert_eq!(got, std::fs::canonicalize(&nested).unwrap());
+        assert!(got.is_dir());
+        // But the root still bounds it.
+        assert!(save_dir(&root, std::slice::from_ref(&other), Some(r"C:\Windows")).is_err());
+        // A relative name stays pinned to the download folder, not the extra root.
+        assert_eq!(save_dir(&root, std::slice::from_ref(&other), Some("Anime")).unwrap().unwrap(), root.join("Anime"));
+    }
+
+    #[test]
+    fn a_refused_folder_is_not_created_on_the_way_out() {
+        let root = scratch_root("nocreate");
+        let outside = root.parent().unwrap().join("torrust-webui-should-not-exist");
+        let _ = std::fs::remove_dir_all(&outside);
+        let asked = outside.join("nested");
+        assert!(save_dir(&root, &[], Some(&asked.display().to_string())).is_err());
+        assert!(!outside.exists(), "a refused folder was created anyway");
+        // The same for a relative name that tries to climb out.
+        assert!(save_dir(&root, &[], Some("../torrust-webui-should-not-exist")).is_err());
+        assert!(!outside.exists(), "a refused folder was created anyway");
+    }
+
+    #[tokio::test]
+    async fn add_and_upload_carry_the_chosen_folder() {
+        let root = scratch_root("carry");
+        let (state, mut rx) = fake_state(true);
+        state.write().await.settings.download_dir = root.clone();
+        let addr = start_open(state, IO_TIMEOUT).await;
+
+        // A magnet plus a subfolder arrives as an absolute path inside the root.
+        let body = "source=magnet%3A%3Fxt%3Durn%3Abtih%3Aabc&dir=Anime";
+        assert_eq!(raw(addr, &post(addr, "/api/add", body, COOKIE)).await.0, 200);
+        match rx.try_recv().unwrap() {
+            SessionCommand::Add { source, dir } => {
+                assert!(source.starts_with("magnet:"));
+                assert_eq!(dir.unwrap(), root.join("Anime"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // The upload body is raw bytes, so the folder rides in the query.
+        assert_eq!(raw(addr, &upload_req_q(addr, b"de", "?dir=Shows", COOKIE)).await.0, 200);
+        match rx.try_recv().unwrap() {
+            SessionCommand::AddTorrent { dir, .. } => assert_eq!(dir.unwrap(), root.join("Shows")),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_folder_that_escapes_is_refused() {
+        let root = scratch_root("refuse");
+        let (state, mut rx) = fake_state(true);
+        state.write().await.settings.download_dir = root.clone();
+        let addr = start_open(state, IO_TIMEOUT).await;
+
+        for bad in ["..%2Fevil", "%2Fetc", "..", "%2E%2E%2F..%2Fevil"] {
+            let body = format!("source=magnet%3A%3Fxt%3Durn%3Abtih%3Aabc&dir={bad}");
+            assert_eq!(raw(addr, &post(addr, "/api/add", &body, COOKIE)).await.0, 400, "accepted {bad}");
+        }
+        // The same guard covers uploads, whatever route they arrive on.
+        for bad in ["dir=..%2Fevil", "dir=%2Fetc", "dir=.."] {
+            assert_eq!(raw(addr, &upload_req_q(addr, b"de", &format!("?{bad}"), COOKIE)).await.0, 400, "accepted {bad}");
+        }
+        assert!(rx.try_recv().is_err(), "an escaping folder reached the session");
     }
 
     #[tokio::test]

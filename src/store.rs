@@ -536,6 +536,10 @@ fn encode_settings(s: &Settings) -> Vec<u8> {
     }
     d.insert(b"notifications".to_vec(), int(s.notifications as u64));
     d.insert(b"webui_lan".to_vec(), int(s.webui.lan as u64));
+    if !s.webui.save_roots.is_empty() {
+        let roots: Vec<Value> = s.webui.save_roots.iter().map(|p| Value::Bytes(path_bytes(p))).collect();
+        d.insert(b"webui_save_roots".to_vec(), Value::List(roots));
+    }
     d.insert(b"allow_local_urls".to_vec(), int(s.allow_local_urls as u64));
     let sc = &s.schedule;
     d.insert(b"schedule_enabled".to_vec(), int(sc.enabled as u64));
@@ -599,6 +603,10 @@ fn decode_settings(raw: &[u8]) -> Result<Settings> {
     s.blocklist = v.get_opt("blocklist").map(bytes_path).transpose()?.filter(|p| !p.as_os_str().is_empty());
     if let Some(n) = v.get_int_opt("webui_lan") {
         s.webui.lan = n != 0;
+    }
+    if let Some(Value::List(l)) = v.get_opt("webui_save_roots") {
+        s.webui.save_roots =
+            l.iter().filter_map(|x| bytes_path(x).ok()).filter(|p| !p.as_os_str().is_empty()).collect();
     }
     if let Some(n) = v.get_int_opt("allow_local_urls") {
         s.allow_local_urls = n != 0;
@@ -1070,7 +1078,7 @@ mod tests {
         let s = Settings {
             encryption: EncryptionMode::Require,
             utp: false,
-            webui: crate::state::WebUiSettings { enabled: true, port: 9123, password: Some(hash_password("pw")), lan: true },
+            webui: crate::state::WebUiSettings { enabled: true, port: 9123, password: Some(hash_password("pw")), lan: true, save_roots: Vec::new() },
             allow_local_urls: true,
             ..Settings::default()
         };

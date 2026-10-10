@@ -48,6 +48,7 @@ td small.err { display:block; margin:2px 0 0; min-height:0; white-space:normal; 
 
 <form id="addform">
   <input type="text" name="source" placeholder="magnet link or https:// .torrent URL" aria-label="Source" required>
+  <input type="text" name="dir" id="folder" placeholder="folder (optional, inside the download folder)" aria-label="Folder">
   <button class="primary" type="submit">Add</button>
   <label class="file">Choose .torrent<input type="file" id="pick" accept=".torrent,application/x-bittorrent" multiple></label>
 </form>
@@ -211,13 +212,19 @@ function bind(id, path) {
     post(path, p).then(function () { f.reset(); });
   };
 }
+// The folder typed above, sent as a subfolder of the download folder.
+function folder() {
+  var e = $("folder");
+  return e && e.value.trim();
+}
 function upload(files) {
   var list = Array.prototype.slice.call(files);
   var bad = list.filter(function (f) { return !/\.torrent$/i.test(f.name); });
   if (bad.length) showErr("not a .torrent file: " + bad[0].name);
+  var q = folder() ? "?dir=" + encodeURIComponent(folder()) : "";
   return list.filter(function (f) { return bad.indexOf(f) < 0; }).reduce(function (p, f) {
     return p.then(function () {
-      return send("/api/upload", "application/x-bittorrent", f);
+      return send("/api/upload" + q, "application/x-bittorrent", f);
     });
   }, Promise.resolve());
 }
@@ -251,7 +258,7 @@ document.addEventListener("drop", function (ev) {
   var dt = ev.dataTransfer;
   if (dt.files && dt.files.length) { upload(dt.files); return; }
   var text = (dt.getData("text/uri-list") || dt.getData("text/plain") || "").split("\n")[0].trim();
-  if (text) post("/api/add", { source: text });
+  if (text) post("/api/add", { source: text, dir: folder() || "" });
 });
 
 bind("addform", "/api/add");

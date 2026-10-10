@@ -1873,7 +1873,14 @@ fn parse_settings(form: &Form, base: &Settings) -> Result<Settings, String> {
         move_completed_dir,
         encryption,
         utp: f[13].on,
-        webui: WebUiSettings { enabled: f[WEBUI_ON].on, port: webui_port, password, lan: f[WEBUI_LAN].on },
+        webui: WebUiSettings {
+            enabled: f[WEBUI_ON].on,
+            port: webui_port,
+            password,
+            lan: f[WEBUI_LAN].on,
+            // Not on the settings form, so keep whatever is stored.
+            save_roots: base.webui.save_roots.clone(),
+        },
         blocklist,
         notifications: f[NOTIFY_FIELD].on,
         schedule,
@@ -4815,7 +4822,7 @@ mod session_tests {
         Settings {
             encryption: EncryptionMode::Require,
             utp: false,
-            webui: WebUiSettings { enabled: true, port: 9090, password: Some("secret".to_string()), lan: false },
+            webui: WebUiSettings { enabled: true, port: 9090, password: Some("secret".to_string()), lan: false, save_roots: Vec::new() },
             ..Settings::default()
         }
     }
@@ -4832,7 +4839,7 @@ mod session_tests {
         let s = parse_settings(&form, &base).unwrap();
         assert_eq!(s.encryption, EncryptionMode::Disabled);
         assert!(s.utp);
-        assert_eq!(s.webui, WebUiSettings { enabled: false, port: 7000, password: Some("secret".to_string()), lan: false });
+        assert_eq!(s.webui, WebUiSettings { enabled: false, port: 7000, password: Some("secret".to_string()), lan: false, save_roots: Vec::new() });
         form.fields[12].input.text = "maybe".to_string();
         assert!(parse_settings(&form, &base).is_err());
         form.fields[12].input.text = "prefer".to_string();
