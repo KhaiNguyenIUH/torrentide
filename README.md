@@ -43,6 +43,7 @@ Builds a v1 `.torrent` from a file or directory (files sorted by path, symlinks 
     torrust                      # multi-torrent TUI
     torrust session --no-tui     # headless, prints a summary every few seconds; Ctrl-C quits
     torrust add <file.torrent|magnet:?...> [-o DIR]
+    torrust webui-password       # enable the web UI and set its password from stdin
 
 `torrust` with no subcommand runs a persistent session: many torrents at once behind one listening port and one DHT node. Finished torrents keep seeding until the ratio target (default 2.0; 0 seeds forever) is reached, then stop. The ratio is cumulative across restarts and applies to torrents started after you change it.
 
@@ -51,6 +52,31 @@ Builds a v1 `.torrent` from a file or directory (files sorted by path, symlinks 
 - Speed limits (bytes per second, 0 = unlimited) can be set globally and per torrent. Uploads use tit-for-tat choking: 4 unchoke slots plus one optimistic, re-evaluated every 10 s.
 - The listen port (default 6881, falling back to a free port if busy) is forwarded through the router with NAT-PMP, then UPnP, when port forwarding is on. Changes to the port, DHT and forwarding settings apply after a restart.
 - `scripts/macos` and `scripts/linux` install handlers that open `magnet:` links and `.torrent` files with `torrust add`.
+
+## Encryption and uTP
+
+Session mode prefers encrypted peer connections (Message Stream Encryption) and tries uTP (BEP 29) before TCP, on the same port number over UDP. Both are settings: encryption is `disabled`, `prefer` (default: encrypt when the peer can, otherwise plaintext) or `require` (encrypted peers only). Single-torrent `torrust download` stays plaintext TCP. Changes apply after a restart.
+
+## RSS feeds
+
+Subscribe to RSS or Atom feeds (`http(s)` only) and torrents matching your include/exclude words (case-insensitive, matched against the item title) are added automatically, into the feed's folder if one is set. Feeds are polled every 15 minutes, or on demand with a refresh.
+
+- Items already in the feed when you subscribe are not downloaded; only items that show up later are. The session logs `watching N existing items`.
+- Feeds and the items already seen are kept in `feeds.bencode` in the data directory, so a restart never re-adds anything.
+- A session also adds an `http(s)` link to a `.torrent` (up to 10 MiB), which is how feed items and the web UI's add box deliver torrents. `torrust add` accepts them too.
+
+## Web UI
+
+A small browser interface for the session, off by default. It takes links and magnets only and never shows or accepts local paths or folders.
+
+- Without a password it listens on `127.0.0.1` only. With a password it listens on all interfaces and asks for it (HTTP Basic, any user name) on every request. Use a reverse proxy with TLS if you expose it beyond your network; the connection itself is plain HTTP.
+- Enable it and set the password without putting the password in shell history:
+
+      torrust webui-password        # type the password and press Enter
+      torrust session --no-tui      # daemon mode: runs headless, serves the web UI, Ctrl-C quits
+
+  The password is stored only as a salted, iterated SHA-1 hash (`sha1$100000$salt$hash`) in `settings.bencode`, which is readable by you alone. The default port is 8080 (`webui.port` in the settings). The session logs the URL it listens on. Run `webui-password` while the session is stopped: a running session writes its own settings when it quits.
+- Settings, feeds and web UI changes made while the session runs are saved at once and take effect after a restart.
 
 ## TUI keys
 

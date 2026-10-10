@@ -230,7 +230,7 @@ async fn read_body(
     Ok(body)
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = a.len() ^ b.len();
     for i in 0..a.len().max(b.len()) {
         diff |= (a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0)) as usize;
@@ -279,7 +279,7 @@ fn authorized(req: &Request, password: &str) -> bool {
         Some(i) => &decoded[i + 1..],
         None => &decoded[..],
     };
-    ct_eq(given, password.as_bytes())
+    crate::store::verify_password(password, given)
 }
 
 fn host_of(url: &str) -> &str {

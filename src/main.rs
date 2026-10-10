@@ -33,6 +33,12 @@ enum Command {
         no_tui: bool,
     },
 
+    /// Set the web UI password (read from stdin) and enable the web UI
+    ///
+    /// The password is stored only as a salted hash, and reading it from stdin
+    /// keeps it out of shell history. Restart the session afterwards.
+    WebuiPassword,
+
     /// Hand a .torrent or magnet link to the running session, or queue it
     Add {
         /// Path to a .torrent file, or a magnet: URI
@@ -178,6 +184,7 @@ async fn main() -> Result<()> {
             let settings = torrust::store::Store::open().load_settings();
             torrust::session::Session::run(settings, !no_tui).await
         }
+        Command::WebuiPassword => set_webui_password(),
         Command::Add { source, output } => {
             use torrust::ipc::Delivery;
             match torrust::ipc::send_add(&source, output.as_deref()).await? {
@@ -245,6 +252,25 @@ async fn main() -> Result<()> {
             .await
         }
     }
+}
+
+fn set_webui_password() -> Result<()> {
+    eprintln!("New web UI password (one line):");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).context("reading the password")?;
+    let password = line.trim_end_matches(['\r', '\n']);
+    if password.is_empty() {
+        bail!("the password cannot be empty");
+    }
+    let store = torrust::store::Store::open();
+    let mut settings = store.load_settings();
+    settings.webui.enabled = true;
+    settings.webui.password = Some(torrust::store::hash_password(password));
+    store.save_settings(&settings)?;
+    println!("web UI enabled with the new password (stored as a salted hash)");
+    println!("open http://localhost:{}/ (any user name) after the session restarts", settings.webui.port);
+    println!("a session that is already running keeps its old settings and overwrites these when it quits");
+    Ok(())
 }
 
 async fn run_download(

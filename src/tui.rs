@@ -32,8 +32,9 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::RwLock;
 
 use crate::state::{
-    human_bytes, now_hms, Command, DownloadState, FilePriority, FileSummary, Level, LogEntry, PeerSummary,
-    SessionCommand, SessionState, Settings, TorrentId, TorrentSummary, TorrentView, UiState,
+    human_bytes, now_hms, Command, DownloadState, EncryptionMode, FeedId, FeedView, FilePriority, FileSummary,
+    Level, LogEntry, PeerSummary, SessionCommand, SessionState, Settings, TorrentId, TorrentSummary,
+    TorrentView, UiState, WebUiSettings,
 };
 
 /// Narrowest terminal the full layout is attempted in.
@@ -1128,18 +1129,19 @@ pub fn run_tui(state: Arc<RwLock<UiState>>) -> Result<()> {
 
 /// Key bindings advertised in the session footer and help overlay. The most
 /// used keys come first because the footer is clipped on narrow terminals.
-const SESSION_KEYS: [(&str, &str); 19] = [
+const SESSION_KEYS: [(&str, &str); 20] = [
     ("a", "add"),
     ("s", "start/stop"),
     ("p", "pause"),
     ("d", "remove"),
     ("l", "limits"),
-    ("o", "settings"),
+    ("o", "settings (encryption/uTP/web UI: restart)"),
     ("R", "force recheck"),
     ("L / m", "label / move data"),
     ("S / f", "sequential / label filter"),
     ("[ / ]", "queue up/down"),
-    ("tab/1-6", "panel"),
+    ("tab/1-7", "panel"),
+    ("a/d/r on Feeds", "add / remove / refresh feed"),
     ("j/k", "torrents"),
     ("J/K", "files"),
     ("space", "skip file"),
@@ -1167,6 +1169,17 @@ const SESSION_FOOTER_KEYS: [(&str, &str); 15] = [
     ("f", "filter"),
     ("S", "seq"),
     ("m", "move"),
+];
+
+const FEEDS_FOOTER_KEYS: [(&str, &str); 8] = [
+    ("a", "add feed"),
+    ("d", "remove feed"),
+    ("r", "refresh"),
+    ("j/k", "feeds"),
+    ("?", "keys"),
+    ("q", "quit"),
+    ("tab", "panel"),
+    ("o", "settings"),
 ];
 
 /// Text shown in the torrent table while the session holds nothing.
@@ -1483,6 +1496,7 @@ enum FieldKind {
     Text,
     Number,
     Toggle,
+    Secret,
 }
 
 #[derive(Debug, Clone)]
@@ -1500,6 +1514,10 @@ impl Field {
 
     fn number(label: &'static str, value: impl Into<String>) -> Self {
         Field { label, kind: FieldKind::Number, input: TextInput::new(value), on: false }
+    }
+
+    fn secret(label: &'static str) -> Self {
+        Field { label, kind: FieldKind::Secret, input: TextInput::default(), on: false }
     }
 
     fn toggle(label: &'static str, on: bool) -> Self {
@@ -1521,11 +1539,24 @@ struct Form {
     fields: Vec<Field>,
     focus: usize,
     error: Option<String>,
+    has_password: bool,
 }
 
 impl Form {
     fn new(title: &'static str, fields: Vec<Field>) -> Self {
-        Form { title, fields, focus: 0, error: None }
+        Form { title, fields, focus: 0, error: None, has_password: false }
+    }
+
+    fn notes(&self) -> Vec<(&'static str, Style)> {
+        if self.title != "settings" {
+            return Vec::new();
+        }
+        let mut notes = vec![("Encryption, uTP and web UI apply after restart", muted_style())];
+        let password = self.fields[WEBUI_PASSWORD].input.text.as_str();
+        if self.fields[WEBUI_ON].on && (password == "-" || (password.is_empty() && !self.has_password)) {
+            notes.push(("web UI will listen on localhost only", warn_style()));
+        }
+        notes
     }
 
     fn on_key(&mut self, key: &KeyEvent) -> FormAction {
@@ -1606,8 +1637,11 @@ fn parse_limits(form: &Form) -> Result<(u64, u64), String> {
     ))
 }
 
+const WEBUI_ON: usize = 14;
+const WEBUI_PASSWORD: usize = 16;
+
 fn settings_form(settings: &Settings) -> Form {
-    Form::new(
+    let mut form = Form::new(
         "settings",
         vec![
             Field::text("Download folder", settings.download_dir.display().to_string()),
@@ -1625,8 +1659,15 @@ fn settings_form(settings: &Settings) -> Form {
                 "Move completed to (empty = off)",
                 settings.move_completed_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
             ),
+            Field::text("Encryption (disabled/prefer/require)", settings.encryption.label()),
+            Field::toggle("uTP", settings.utp),
+            Field::toggle("Web UI", settings.webui.enabled),
+            Field::number("Web UI port", settings.webui.port.to_string()),
+            Field::secret("Web UI password (empty=keep, -=clear)"),
         ],
-    )
+    );
+    form.has_password = settings.webui.password.is_some();
+    form
 }
 
 /// Validate the settings form. Nothing is sent to the session unless every
@@ -1665,6 +1706,17 @@ fn parse_settings(form: &Form, base: &Settings) -> Result<Settings, String> {
     let move_completed_dir = Some(clean_input(&f[11].input.text))
         .filter(|d| !d.is_empty())
         .map(PathBuf::from);
+    let encryption = EncryptionMode::parse(&f[12].input.text)
+        .ok_or_else(|| "Encryption: enter disabled, prefer or require".to_string())?;
+    let webui_port = match f[15].input.text.trim().parse::<u16>() {
+        Ok(p) if p > 0 => p,
+        _ => return Err("Web UI port: enter a number from 1 to 65535".to_string()),
+    };
+    let password = match f[WEBUI_PASSWORD].input.text.as_str() {
+        "" => base.webui.password.clone(),
+        "-" => None,
+        typed => Some(typed.to_string()),
+    };
     Ok(Settings {
         download_dir: PathBuf::from(dir),
         listen_port,
@@ -1678,8 +1730,106 @@ fn parse_settings(form: &Form, base: &Settings) -> Result<Settings, String> {
         max_active_torrents,
         lsd: f[10].on,
         move_completed_dir,
+        encryption,
+        utp: f[13].on,
+        webui: WebUiSettings { enabled: f[WEBUI_ON].on, port: webui_port, password },
         ..base.clone()
     })
+}
+
+fn feed_form() -> Form {
+    Form::new(
+        "add feed",
+        vec![
+            Field::text("Feed URL (http/https)", ""),
+            Field::text("Include terms (comma separated)", ""),
+            Field::text("Exclude terms (comma separated)", ""),
+            Field::text("Folder (empty = default)", ""),
+        ],
+    )
+}
+
+fn split_terms(text: &str) -> Vec<String> {
+    text.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect()
+}
+
+fn parse_feed(form: &Form) -> Result<SessionCommand, String> {
+    let f = &form.fields;
+    let url = clean_input(&f[0].input.text);
+    let lower = url.to_ascii_lowercase();
+    let host = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://"));
+    if host.map_or(true, |h| h.is_empty() || h.starts_with('/')) {
+        return Err("Feed URL: enter an http:// or https:// address".to_string());
+    }
+    let dir = clean_input(&f[3].input.text);
+    Ok(SessionCommand::AddFeed {
+        url,
+        include: split_terms(&f[1].input.text),
+        exclude: split_terms(&f[2].input.text),
+        dir: if dir.is_empty() { None } else { Some(PathBuf::from(dir)) },
+    })
+}
+
+fn feed_name(feed: &FeedView) -> String {
+    feed.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| feed.url.clone())
+}
+
+fn fetch_age(last: Option<u64>, now: u64) -> String {
+    let Some(last) = last else { return "never".to_string() };
+    let secs = now.saturating_sub(last);
+    match secs {
+        0..=4 => "just now".to_string(),
+        5..=59 => format!("{secs}s ago"),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
+    }
+}
+
+fn feed_scroll(end: usize, height: usize, start: usize) -> usize {
+    end.saturating_sub(height).min(start)
+}
+
+fn terms_text(terms: &[String]) -> String {
+    if terms.is_empty() { "-".to_string() } else { terms.join(", ") }
+}
+
+fn feed_lines(feeds: &[FeedView], selected: Option<usize>, now: u64, width: usize) -> (Vec<Line<'static>>, usize, usize) {
+    let mut lines = Vec::new();
+    let (mut start, mut end) = (0, 0);
+    for (i, feed) in feeds.iter().enumerate() {
+        let first = lines.len();
+        let focused = selected == Some(i);
+        let name = truncate_line(&feed_name(feed), width.saturating_sub(2));
+        lines.push(Line::from(vec![
+            Span::styled(if focused { "> " } else { "  " }, heading_style()),
+            Span::styled(name, if focused { selection_style() } else { value_style() }),
+        ]));
+        let dir = feed.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "default".to_string());
+        let detail = format!(
+            "include: {}  exclude: {}  dir: {}  fetched: {}",
+            terms_text(&feed.include),
+            terms_text(&feed.exclude),
+            dir,
+            fetch_age(feed.last_fetch, now),
+        );
+        lines.push(Line::from(Span::styled(format!("  {}", truncate_line(&detail, width.saturating_sub(2))), muted_style())));
+        if let Some(error) = &feed.last_error {
+            lines.push(Line::from(Span::styled(
+                format!("  error: {}", truncate_line(error, width.saturating_sub(9))),
+                error_style(),
+            )));
+        }
+        if !feed.recent.is_empty() {
+            let recent = format!("added: {}", feed.recent.join("; "));
+            lines.push(Line::from(Span::styled(format!("  {}", truncate_line(&recent, width.saturating_sub(2))), value_style())));
+        }
+        if focused {
+            start = first;
+            end = lines.len();
+        }
+    }
+    (lines, start, end)
 }
 
 /// The add-torrent prompt: first the source, then the optional save folder.
@@ -1728,6 +1878,8 @@ enum Modal {
     Limits { id: TorrentId, form: Form },
     Settings(Form),
     Text(TextPrompt),
+    Feed(Form),
+    RemoveFeed { id: FeedId, name: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1793,11 +1945,12 @@ enum Tab {
     Trackers,
     Log,
     Session,
+    Feeds,
 }
 
 impl Tab {
-    const ALL: [Tab; 6] =
-        [Tab::General, Tab::Peers, Tab::Files, Tab::Trackers, Tab::Log, Tab::Session];
+    const ALL: [Tab; 7] =
+        [Tab::General, Tab::Peers, Tab::Files, Tab::Trackers, Tab::Log, Tab::Session, Tab::Feeds];
 
     fn label(self) -> &'static str {
         match self {
@@ -1807,6 +1960,7 @@ impl Tab {
             Tab::Trackers => "Trackers",
             Tab::Log => "Log",
             Tab::Session => "Session",
+            Tab::Feeds => "Feeds",
         }
     }
 
@@ -1865,6 +2019,9 @@ struct SessionApp {
     /// Peers/files/log view state, shared with the single-torrent renderers.
     view: App,
     settings: Settings,
+    feeds: Vec<FeedView>,
+    feed_selected: Option<usize>,
+    feed_id: Option<FeedId>,
     modal: Modal,
     cmd: Option<tokio::sync::mpsc::UnboundedSender<SessionCommand>>,
     quit: bool,
@@ -1884,6 +2041,9 @@ impl SessionApp {
             tab: Tab::default(),
             view: App::default(),
             settings: Settings::default(),
+            feeds: Vec::new(),
+            feed_selected: None,
+            feed_id: None,
             modal: Modal::None,
             cmd: None,
             quit: false,
@@ -1907,6 +2067,10 @@ impl SessionApp {
             })
             .collect();
         self.settings = state.settings.clone();
+        self.feeds = state.feeds.clone();
+        let kept = self.feed_id.and_then(|id| self.feeds.iter().position(|f| f.id == id));
+        self.feed_selected = clamp_selection(kept.or(self.feed_selected), self.feeds.len());
+        self.feed_id = self.feed_selected.map(|i| self.feeds[i].id);
         if self.cmd.is_none() {
             self.cmd = state.command_tx.clone();
         }
@@ -1977,6 +2141,27 @@ impl SessionApp {
         }
     }
 
+    fn move_feed(&mut self, delta: isize) {
+        self.feed_selected = move_selection(self.feed_selected, self.feeds.len(), delta);
+        self.feed_id = self.feed_selected.map(|i| self.feeds[i].id);
+    }
+
+    fn on_feeds_key(&mut self, key: &KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.move_feed(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_feed(-1),
+            KeyCode::Char('a') => self.modal = Modal::Feed(feed_form()),
+            KeyCode::Char('r') => self.send(SessionCommand::RefreshFeeds),
+            KeyCode::Char('d') => {
+                if let Some(feed) = self.feed_selected.and_then(|i| self.feeds.get(i)) {
+                    self.modal = Modal::RemoveFeed { id: feed.id, name: feed_name(feed) };
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn step_file_priority(&mut self, up: bool) {
         let Some(id) = self.current().map(|row| row.id.clone()) else { return };
         let Some(file) = self.view.file_selected.and_then(|i| self.view.files.get_mut(i)) else {
@@ -2007,6 +2192,9 @@ impl SessionApp {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.tab == Tab::Feeds && !ctrl && self.on_feeds_key(&key) {
+            return;
+        }
         match key.code {
             KeyCode::Char('c') if ctrl => self.quit_session(),
             KeyCode::Char('q') => self.quit_session(),
@@ -2022,7 +2210,7 @@ impl SessionApp {
             }
             KeyCode::Tab => self.set_tab(self.tab.step(1)),
             KeyCode::BackTab => self.set_tab(self.tab.step(-1)),
-            KeyCode::Char(c @ '1'..='6') => self.set_tab(Tab::ALL[usize::from(c as u8 - b'1')]),
+            KeyCode::Char(c @ '1'..='7') => self.set_tab(Tab::ALL[usize::from(c as u8 - b'1')]),
             KeyCode::Char(' ') if self.tab == Tab::Files => {
                 let file = self
                     .view
@@ -2185,6 +2373,28 @@ impl SessionApp {
                     Modal::Text(prompt)
                 }
             },
+            Modal::Feed(mut form) => match form.on_key(&key) {
+                FormAction::Cancel => Modal::None,
+                FormAction::Submit => match parse_feed(&form) {
+                    Ok(cmd) => {
+                        self.send(cmd);
+                        Modal::None
+                    }
+                    Err(message) => {
+                        form.error = Some(message);
+                        Modal::Feed(form)
+                    }
+                },
+                FormAction::None => Modal::Feed(form),
+            },
+            Modal::RemoveFeed { id, name } => match key.code {
+                KeyCode::Char('y') => {
+                    self.send(SessionCommand::RemoveFeed(id));
+                    Modal::None
+                }
+                KeyCode::Esc | KeyCode::Char('n') => Modal::None,
+                _ => Modal::RemoveFeed { id, name },
+            },
             Modal::Settings(mut form) => match form.on_key(&key) {
                 FormAction::Cancel => Modal::None,
                 FormAction::Submit => match parse_settings(&form, &self.settings) {
@@ -2213,7 +2423,7 @@ impl SessionApp {
                 prompt.input.paste(pasted);
                 prompt.error = None;
             }
-            Modal::Limits { form, .. } | Modal::Settings(form) => form.paste(pasted),
+            Modal::Limits { form, .. } | Modal::Settings(form) | Modal::Feed(form) => form.paste(pasted),
             _ => {}
         }
     }
@@ -2262,7 +2472,9 @@ fn render_session(frame: &mut Frame, snapshot: &Result<SessionState, String>, ap
     render_session_header(frame, chunks[0], state, &app.filter);
     render_torrent_table(frame, chunks[1], state, app);
     render_detail(frame, chunks[2], state, app);
-    render_footer(frame, chunks[3], state.warning.as_deref(), &SESSION_FOOTER_KEYS);
+    let footer_keys: &[(&'static str, &'static str)] =
+        if app.tab == Tab::Feeds { &FEEDS_FOOTER_KEYS } else { &SESSION_FOOTER_KEYS };
+    render_footer(frame, chunks[3], state.warning.as_deref(), footer_keys);
     render_modal(frame, area, app);
 }
 
@@ -2352,6 +2564,10 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &SessionState, app: &mut 
     frame.render_widget(Paragraph::new(tab_line(app.tab, area.width)), parts[0]);
     let body = parts[1];
 
+    if app.tab == Tab::Feeds {
+        render_feeds(frame, body, state, app);
+        return;
+    }
     let current = app.selected.and_then(|i| app.visible.get(i)).and_then(|&j| state.torrents.get(j));
     let Some(view) = current else {
         render_log(frame, body, &state.log, "session log", &mut app.view);
@@ -2364,7 +2580,28 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &SessionState, app: &mut 
         Tab::Trackers => render_trackers(frame, body, view),
         Tab::Log => render_log(frame, body, &view.ui.log, "log", &mut app.view),
         Tab::Session => render_log(frame, body, &state.log, "session log", &mut app.view),
+        Tab::Feeds => {}
     }
+}
+
+fn render_feeds(frame: &mut Frame, area: Rect, state: &SessionState, app: &SessionApp) {
+    let width = usize::from(area.width.saturating_sub(2));
+    let height = usize::from(area.height.saturating_sub(2));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (mut lines, start, end) = feed_lines(&state.feeds, app.feed_selected, now, width);
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled("No feeds \u{2014} press a to add one", muted_style())));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style())
+        .style(base_style())
+        .title(Span::styled(format!(" feeds ({}) ", state.feeds.len()), heading_style()));
+    let scroll = feed_scroll(end, height, start) as u16;
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block).scroll((scroll, 0)), area);
 }
 
 fn general_lines(view: &TorrentView) -> Vec<Line<'static>> {
@@ -2473,7 +2710,10 @@ fn render_modal(frame: &mut Frame, area: Rect, app: &SessionApp) {
         Modal::Text(prompt) => render_text_prompt(frame, area, prompt),
         Modal::Add(prompt) => render_add(frame, area, prompt),
         Modal::Remove { name, .. } => render_remove(frame, area, name),
-        Modal::Limits { form, .. } | Modal::Settings(form) => render_form(frame, area, form),
+        Modal::Limits { form, .. } | Modal::Settings(form) | Modal::Feed(form) => {
+            render_form(frame, area, form)
+        }
+        Modal::RemoveFeed { name, .. } => render_remove_feed(frame, area, name),
     }
 }
 
@@ -2538,12 +2778,29 @@ fn render_remove(frame: &mut Frame, area: Rect, name: &str) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(modal_block("remove torrent")), popup);
 }
 
+fn render_remove_feed(frame: &mut Frame, area: Rect, name: &str) {
+    let popup = popup_rect(70, 6, area);
+    let width = usize::from(popup.width.saturating_sub(4));
+    let lines = vec![
+        Line::from(Span::styled(truncate_line(name, width), value_style())),
+        Line::from(vec![
+            Span::styled("y", error_style().add_modifier(Modifier::BOLD)),
+            Span::raw(" remove feed   "),
+            Span::styled("Esc", heading_style()),
+            Span::raw(" cancel"),
+        ]),
+    ];
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(modal_block("remove feed")), popup);
+}
+
 fn render_form(frame: &mut Frame, area: Rect, form: &Form) {
-    const LABEL: usize = 31;
-    let popup = popup_rect(72, form.fields.len() as u16 + 3, area);
+    const LABEL: usize = 38;
+    let notes = form.notes();
+    let popup = popup_rect(72, (form.fields.len() + notes.len()) as u16 + 3, area);
     let inner_width = usize::from(popup.width.saturating_sub(2));
     let value_width = inner_width.saturating_sub(2 + LABEL + 1);
-    let visible = usize::from(popup.height.saturating_sub(3)).max(1);
+    let visible = usize::from(popup.height.saturating_sub(3 + notes.len() as u16)).max(1);
     let offset = ensure_visible(0, Some(form.focus), visible, form.fields.len());
 
     let mut lines: Vec<Line> = form
@@ -2558,6 +2815,11 @@ fn render_form(frame: &mut Frame, area: Rect, form: &Form) {
                 FieldKind::Toggle => {
                     if field.on { "[x] on".to_string() } else { "[ ] off".to_string() }
                 }
+                FieldKind::Secret => {
+                    let cursor = if focused { "_" } else { "" };
+                    let mask = "\u{2022}".repeat(field.input.text.chars().count());
+                    format!("{}{cursor}", tail_fit(&mask, value_width.saturating_sub(1)))
+                }
                 _ => {
                     let cursor = if focused { "_" } else { "" };
                     format!("{}{cursor}", tail_fit(&field.input.text, value_width.saturating_sub(1)))
@@ -2570,6 +2832,7 @@ fn render_form(frame: &mut Frame, area: Rect, form: &Form) {
             ])
         })
         .collect();
+    lines.extend(notes.iter().map(|(text, style)| Line::from(Span::styled(truncate_line(text, inner_width), *style))));
     lines.push(Line::from(match &form.error {
         Some(message) => Span::styled(truncate_line(message, inner_width), error_style()),
         None => Span::styled("Enter save  Esc cancel  Tab/Up/Down field", muted_style()),
@@ -3436,9 +3699,13 @@ mod session_tests {
         app.on_key(ch('6'));
         assert_eq!(app.tab, Tab::Session);
         app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Feeds);
+        app.on_key(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::General);
         app.on_key(key(KeyCode::BackTab));
-        assert_eq!(app.tab, Tab::Session);
+        assert_eq!(app.tab, Tab::Feeds);
+        app.on_key(ch('7'));
+        assert_eq!(app.tab, Tab::Feeds);
         app.on_key(ch('3'));
         assert_eq!(app.tab, Tab::Files);
     }
@@ -4070,5 +4337,223 @@ mod session_tests {
         assert!(draw(20, 5, &state, &mut app).contains("too small"));
         state.warning = Some("tracker down".to_string());
         assert!(draw(80, 24, &state, &mut app).contains("tracker down"));
+    }
+
+    fn feed(id: u64, error: Option<&str>) -> FeedView {
+        FeedView {
+            id,
+            url: format!("https://example.com/feed{id}.xml"),
+            title: if id % 2 == 0 { Some(format!("Feed {id}")) } else { None },
+            include: vec!["linux".to_string()],
+            exclude: vec![],
+            dir: Some(PathBuf::from("/tmp/feeds")),
+            last_fetch: Some(1),
+            last_error: error.map(str::to_string),
+            recent: vec!["Ubuntu ISO".to_string(), "Debian ISO".to_string()],
+        }
+    }
+
+    fn feeds_session(n: u64) -> SessionState {
+        SessionState {
+            feeds: (1..=n).map(|i| feed(i, if i == 2 { Some("HTTP 500") } else { None })).collect(),
+            ..session(&["a"])
+        }
+    }
+
+    #[test]
+    fn feeds_tab_keys_produce_feed_commands() {
+        let (mut app, mut rx) = app_with(&feeds_session(2));
+        app.on_key(ch('7'));
+        app.on_key(ch('r'));
+        assert!(matches!(rx.try_recv(), Ok(SessionCommand::RefreshFeeds)));
+        app.on_key(ch('j'));
+        app.on_key(ch('d'));
+        assert!(matches!(app.modal, Modal::RemoveFeed { id: 2, .. }));
+        app.on_key(ch('x'));
+        assert!(rx.try_recv().is_err());
+        app.on_key(ch('y'));
+        assert!(matches!(rx.try_recv(), Ok(SessionCommand::RemoveFeed(2))));
+        assert!(matches!(app.modal, Modal::None));
+
+        app.on_key(ch('a'));
+        type_text(&mut app, "ftp://x/feed");
+        app.on_key(key(KeyCode::Enter));
+        let Modal::Feed(form) = &app.modal else { panic!("form closed") };
+        assert!(form.error.is_some());
+        assert!(rx.try_recv().is_err());
+        app.on_key(key(KeyCode::Esc));
+
+        app.on_key(ch('a'));
+        type_text(&mut app, "https://example.com/rss");
+        app.on_key(key(KeyCode::Tab));
+        type_text(&mut app, " linux , ,iso,");
+        app.on_key(key(KeyCode::Tab));
+        type_text(&mut app, "cam");
+        app.on_key(key(KeyCode::Tab));
+        type_text(&mut app, "/tmp/x");
+        app.on_key(key(KeyCode::Enter));
+        let Ok(SessionCommand::AddFeed { url, include, exclude, dir }) = rx.try_recv() else {
+            panic!("no AddFeed")
+        };
+        assert_eq!(url, "https://example.com/rss");
+        assert_eq!(include, vec!["linux", "iso"]);
+        assert_eq!(exclude, vec!["cam"]);
+        assert_eq!(dir, Some(PathBuf::from("/tmp/x")));
+    }
+
+    #[test]
+    fn feed_url_must_be_http() {
+        for bad in ["", "example.com", "ftp://x", "http://", "https:///x", "magnet:?xt=1"] {
+            let mut form = feed_form();
+            form.fields[0].input.text = bad.to_string();
+            assert!(parse_feed(&form).is_err(), "{bad}");
+        }
+        let mut form = feed_form();
+        form.fields[0].input.text = "HTTP://a.b/x".to_string();
+        assert!(parse_feed(&form).is_ok());
+    }
+
+    #[test]
+    fn torrent_tab_a_and_d_are_unchanged() {
+        let (mut app, _rx) = app_with(&feeds_session(1));
+        app.on_key(ch('a'));
+        assert!(matches!(app.modal, Modal::Add(_)));
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(ch('d'));
+        assert!(matches!(app.modal, Modal::Remove { .. }));
+    }
+
+    #[test]
+    fn feed_selection_follows_the_feed_id() {
+        let (mut app, _rx) = app_with(&feeds_session(3));
+        app.on_key(ch('7'));
+        app.on_key(ch('j'));
+        app.on_key(ch('j'));
+        assert_eq!(app.feed_id, Some(3));
+        let mut state = feeds_session(3);
+        state.feeds.remove(0);
+        app.sync(&state);
+        assert_eq!(app.feed_selected, Some(1));
+        state.feeds.clear();
+        app.sync(&state);
+        assert_eq!((app.feed_selected, app.feed_id), (None, None));
+    }
+
+    #[test]
+    fn fetch_age_formats() {
+        assert_eq!(fetch_age(None, 100), "never");
+        assert_eq!(fetch_age(Some(100), 100), "just now");
+        assert_eq!(fetch_age(Some(100), 130), "30s ago");
+        assert_eq!(fetch_age(Some(0), 600), "10m ago");
+        assert_eq!(fetch_age(Some(0), 7200), "2h ago");
+        assert_eq!(fetch_age(Some(0), 200_000), "2d ago");
+        assert_eq!(fetch_age(Some(500), 100), "just now");
+    }
+
+    #[test]
+    fn feeds_tab_renders_at_all_sizes() {
+        for (w, h) in [(120, 30), (80, 24), (40, 12)] {
+            for n in [0, 1, 5] {
+                let state = feeds_session(n);
+                let mut app = SessionApp::new();
+                app.set_tab(Tab::Feeds);
+                draw(w, h, &state, &mut app);
+                for _ in 0..n {
+                    app.on_key(ch('j'));
+                    let screen = draw(w, h, &state, &mut app);
+                    assert!(screen.contains("feeds"), "{w}x{h}:\n{screen}");
+                }
+                app.on_key(ch('a'));
+                draw(w, h, &state, &mut app);
+                app.on_key(key(KeyCode::Esc));
+                app.on_key(ch('d'));
+                draw(w, h, &state, &mut app);
+            }
+        }
+        let state = feeds_session(2);
+        let mut app = SessionApp::new();
+        app.set_tab(Tab::Feeds);
+        let screen = draw(120, 30, &state, &mut app);
+        for needle in ["Feed 2", "HTTP 500", "Ubuntu ISO", "include: linux", "add feed", "refresh"] {
+            assert!(screen.contains(needle), "missing {needle}:\n{screen}");
+        }
+        assert!(draw(120, 30, &session(&["a"]), &mut app).contains("No feeds"));
+    }
+
+    fn custom_settings() -> Settings {
+        Settings {
+            encryption: EncryptionMode::Require,
+            utp: false,
+            webui: WebUiSettings { enabled: true, port: 9090, password: Some("secret".to_string()) },
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn settings_form_round_trips_network_fields() {
+        let base = custom_settings();
+        assert_eq!(parse_settings(&settings_form(&base), &base).unwrap(), base);
+        let mut form = settings_form(&base);
+        form.fields[12].input.text = "OFF".to_string();
+        form.fields[13].on = true;
+        form.fields[14].on = false;
+        form.fields[15].input.text = "7000".to_string();
+        let s = parse_settings(&form, &base).unwrap();
+        assert_eq!(s.encryption, EncryptionMode::Disabled);
+        assert!(s.utp);
+        assert_eq!(s.webui, WebUiSettings { enabled: false, port: 7000, password: Some("secret".to_string()) });
+        form.fields[12].input.text = "maybe".to_string();
+        assert!(parse_settings(&form, &base).is_err());
+        form.fields[12].input.text = "prefer".to_string();
+        for bad in ["0", "65536", "x", ""] {
+            form.fields[15].input.text = bad.to_string();
+            assert!(parse_settings(&form, &base).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn webui_password_keep_set_and_clear() {
+        let base = custom_settings();
+        let mut form = settings_form(&base);
+        form.fields[16].input.text = "new pass".to_string();
+        assert_eq!(parse_settings(&form, &base).unwrap().webui.password.as_deref(), Some("new pass"));
+        form.fields[16].input.text = "-".to_string();
+        assert_eq!(parse_settings(&form, &base).unwrap().webui.password, None);
+        assert!(settings_form(&base).fields[16].input.text.is_empty());
+    }
+
+    #[test]
+    fn webui_without_password_shows_localhost_note() {
+        let mut base = Settings::default();
+        let mut form = settings_form(&base);
+        assert!(!form.notes().iter().any(|(t, _)| t.contains("localhost")));
+        form.fields[14].on = true;
+        assert!(form.notes().iter().any(|(t, _)| t.contains("localhost only")));
+        form.fields[16].input.text = "pw".to_string();
+        assert!(!form.notes().iter().any(|(t, _)| t.contains("localhost")));
+        base.webui.password = Some("x".to_string());
+        let mut kept = settings_form(&base);
+        kept.fields[14].on = true;
+        assert!(!kept.notes().iter().any(|(t, _)| t.contains("localhost")));
+        kept.fields[16].input.text = "-".to_string();
+        assert!(kept.notes().iter().any(|(t, _)| t.contains("localhost")));
+        assert!(form.notes().iter().any(|(t, _)| t.contains("after restart")));
+    }
+
+    #[test]
+    fn password_is_masked_in_the_settings_form() {
+        let state = SessionState { settings: custom_settings(), ..session(&["a"]) };
+        let (mut app, _rx) = app_with(&state);
+        app.on_key(ch('o'));
+        for _ in 0..16 {
+            app.on_key(key(KeyCode::Tab));
+        }
+        type_text(&mut app, "hunter2zz");
+        let screen = draw(120, 40, &state, &mut app);
+        assert!(!screen.contains("hunter2zz") && !screen.contains("hunter") && !screen.contains("secret"), "{screen}");
+        assert!(screen.contains(&"\u{2022}".repeat(9)), "{screen}");
+        assert!(screen.contains("Web UI password"));
+        app.on_paste("pasted-pw");
+        assert!(!draw(120, 40, &state, &mut app).contains("pasted-pw"));
     }
 }

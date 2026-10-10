@@ -15,9 +15,15 @@ pub enum Delivery {
     Queued,
 }
 
+/// A magnet or http(s) link rather than a path.
+fn is_link(source: &str) -> bool {
+    let lower = source.to_ascii_lowercase();
+    lower.starts_with("magnet:") || lower.starts_with("http://") || lower.starts_with("https://")
+}
+
 /// Make a source usable from a session with a different working directory.
 fn absolutize(source: &str) -> String {
-    if source.starts_with("magnet:") {
+    if is_link(source) {
         return source.to_owned();
     }
     std::path::absolute(source)
@@ -153,8 +159,8 @@ mod unix {
         if source.is_empty() {
             return Err("missing source".into());
         }
-        if !source.starts_with("magnet:") && !Path::new(&source).is_file() {
-            return Err(format!("{source} is neither a magnet: URI nor a file"));
+        if !super::is_link(&source) && !Path::new(&source).is_file() {
+            return Err(format!("{source} is not a magnet: URI, an http(s) URL or a file"));
         }
         let dir = parts.next().filter(|d| !d.is_empty()).map(PathBuf::from);
         Ok(SessionCommand::Add { source, dir })
@@ -171,6 +177,8 @@ mod unix {
                 Ok(SessionCommand::Add { source: "magnet:?xt=urn:btih:ab".into(), dir: Some("/d".into()) })
             );
             assert!(matches!(parse("ADD\tmagnet:?x\t"), Ok(SessionCommand::Add { dir: None, .. })));
+            assert!(matches!(parse("ADD\thttps://example.com/a.torrent\t"), Ok(SessionCommand::Add { .. })));
+            assert_eq!(crate::ipc::absolutize("https://example.com/a.torrent"), "https://example.com/a.torrent");
             assert!(parse("ADD\t\t").is_err());
             assert!(parse("NOPE").is_err());
             assert!(parse("ADD\t/definitely/not/here.torrent\t").is_err());

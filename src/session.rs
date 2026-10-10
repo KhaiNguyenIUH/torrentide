@@ -10,9 +10,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use rand::Rng;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -28,12 +29,13 @@ use crate::peer::wire::{handshake_incoming, Handshake};
 use crate::peer::{mse, PeerStream};
 use crate::portmap;
 use crate::ratelimit::{Limits, RateLimiter};
+use crate::rss::{self, FeedState, ParsedFeed};
 use crate::state::{
-    human_bytes, Command, DownloadState, EncryptionMode, FilePriority, FileSummary, Level, SessionCommand, SessionState, Settings,
-    TorrentSummary, TorrentView, UiState,
+    human_bytes, Command, DownloadState, EncryptionMode, FeedId, FeedView, FilePriority, FileSummary, Level, SessionCommand,
+    SessionState, Settings, TorrentSummary, TorrentView, UiState,
 };
 use crate::utp::UtpSocket;
-use crate::store::{Record, Snapshot, Store};
+use crate::store::{Record, Snapshot, Store, StoredFeed};
 
 const TICK: Duration = Duration::from_millis(250);
 const PERSIST_EVERY: Duration = Duration::from_secs(30);
@@ -42,6 +44,14 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PENDING_HANDSHAKES: usize = 64;
 const MAPPING_LIFETIME: Duration = Duration::from_secs(3600);
 const SUMMARY_EVERY: Duration = Duration::from_secs(5);
+const FEED_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+const FETCH_SLOTS: usize = 2;
+const MAX_TORRENT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_FEED_BYTES: usize = 2 * 1024 * 1024;
+const MAX_FEEDS: usize = 64;
+const MAX_RECENT: usize = 10;
+const MAX_TITLE: usize = 200;
 
 type Inbound = (PeerStream, SocketAddr, Handshake);
 type Routes = Arc<Mutex<HashMap<[u8; 20], UnboundedSender<Inbound>>>>;
@@ -51,6 +61,25 @@ struct Running {
     cmd: UnboundedSender<Command>,
     handle: JoinHandle<Result<()>>,
     info: Option<oneshot::Receiver<Vec<u8>>>,
+}
+
+struct Feed {
+    id: FeedId,
+    state: FeedState,
+    title: Option<String>,
+    /// The items already in the feed have been recorded as seen.
+    primed: bool,
+    last_fetch: Option<u64>,
+    last_error: Option<String>,
+    recent: Vec<String>,
+    next_poll: Instant,
+    fetching: bool,
+}
+
+/// A network fetch finished; handled on the core task so only it touches entries.
+enum Fetched {
+    Torrent { source: String, dir: Option<PathBuf>, result: Result<Vec<u8>> },
+    Feed { id: FeedId, result: Result<ParsedFeed> },
 }
 
 struct Entry {
@@ -68,6 +97,7 @@ pub struct SessionHandle {
     state: Arc<RwLock<SessionState>>,
     tx: UnboundedSender<SessionCommand>,
     port: u16,
+    webui: Option<SocketAddr>,
     join: JoinHandle<Result<()>>,
 }
 
@@ -83,6 +113,11 @@ impl SessionHandle {
     /// The TCP port the session actually listens on.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Where the web UI listens, when it is enabled and bound.
+    pub fn webui_addr(&self) -> Option<SocketAddr> {
+        self.webui
     }
 
     /// Resolves once the session has shut down.
@@ -129,7 +164,8 @@ impl Session {
         Self::start_in(Store::open(), settings).await
     }
 
-    pub async fn start_in(store: Store, settings: Settings) -> Result<SessionHandle> {
+    pub async fn start_in(store: Store, mut settings: Settings) -> Result<SessionHandle> {
+        secure_password(&mut settings);
         let (tx, rx) = unbounded_channel();
         let state = Arc::new(RwLock::new(SessionState {
             settings: settings.clone(),
@@ -198,6 +234,30 @@ impl Session {
             None => None,
         };
 
+        let mut webui = None;
+        if settings.webui.enabled {
+            match TcpListener::bind(crate::webui::bind_addr(&settings.webui)).await {
+                Ok(l) => {
+                    let addr = l.local_addr()?;
+                    let protected = settings.webui.password.is_some();
+                    accepts.push(tokio::spawn(crate::webui::serve(l, Arc::clone(&state), settings.webui.password.clone())));
+                    let msg = if protected {
+                        format!("web UI on port {} (all interfaces, password required): http://localhost:{}", addr.port(), addr.port())
+                    } else {
+                        format!("web UI on http://127.0.0.1:{} (this machine only; set a password to allow other machines)", addr.port())
+                    };
+                    tracing::info!("{msg}");
+                    state.write().await.log(Level::Info, msg);
+                    webui = Some(addr);
+                }
+                Err(e) => {
+                    let msg = format!("web UI unavailable on port {}: {e}", settings.webui.port);
+                    tracing::warn!("{msg}");
+                    state.write().await.log(Level::Warn, msg);
+                }
+            }
+        }
+
         let lsd = if settings.lsd {
             match Lsd::start(port).await {
                 Ok(l) => Some(l),
@@ -248,6 +308,7 @@ impl Session {
             };
         }
 
+        let (fetch_tx, fetch_rx) = unbounded_channel();
         let mut core = Core {
             gdown: RateLimiter::new(settings.download_limit),
             gup: RateLimiter::new(settings.upload_limit),
@@ -261,12 +322,16 @@ impl Session {
             dht,
             lsd,
             mapping: None,
+            feeds: Vec::new(),
+            next_feed_id: 1,
+            fetch_tx,
+            fetch_slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
             tasks: accepts.into_iter().chain(mapper).chain(ipc).collect(),
         };
         core.init().await;
 
-        let join = tokio::spawn(core.run(rx, pm_rx));
-        Ok(SessionHandle { state, tx, port, join })
+        let join = tokio::spawn(core.run(rx, pm_rx, fetch_rx));
+        Ok(SessionHandle { state, tx, port, webui, join })
     }
 }
 
@@ -367,6 +432,11 @@ struct Core {
     gdown: Arc<RateLimiter>,
     gup: Arc<RateLimiter>,
     mapping: Option<portmap::Mapping>,
+    feeds: Vec<Feed>,
+    next_feed_id: FeedId,
+    fetch_tx: UnboundedSender<Fetched>,
+    /// Bounds concurrent feed and torrent downloads.
+    fetch_slots: Arc<Semaphore>,
     /// Accept loop, port-mapping renewal and IPC listener.
     tasks: Vec<JoinHandle<()>>,
 }
@@ -397,6 +467,25 @@ impl Core {
         for e in &self.entries {
             let state = if e.rec.stopped { DownloadState::Stopped } else { DownloadState::Queued };
             stub_ui(e, state).await;
+        }
+        let (next, stored) = self.store.load_feeds();
+        self.next_feed_id = next;
+        for f in stored {
+            let mut state = FeedState::with_seen(f.url, f.seen);
+            state.include = f.include;
+            state.exclude = f.exclude;
+            state.dir = f.dir;
+            self.feeds.push(Feed {
+                id: f.id,
+                state,
+                title: f.title,
+                primed: f.primed,
+                last_fetch: None,
+                last_error: None,
+                recent: Vec::new(),
+                next_poll: Instant::now() + Duration::from_secs(rand::thread_rng().gen_range(5..60)),
+                fetching: false,
+            });
         }
         self.rebalance().await;
         for q in self.store.take_queue() {
@@ -429,6 +518,7 @@ impl Core {
         mut self,
         mut rx: UnboundedReceiver<SessionCommand>,
         mut pm_rx: Option<MappingRx>,
+        mut fetch_rx: UnboundedReceiver<Fetched>,
     ) -> Result<()> {
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -439,7 +529,9 @@ impl Core {
                     Some(SessionCommand::Quit) | None => break,
                     Some(cmd) => self.handle(cmd).await,
                 },
+                Some(done) = fetch_rx.recv() => self.on_fetched(done).await,
                 _ = ticker.tick() => {
+                    self.poll_feeds();
                     self.poll_entries().await;
                     self.rebalance().await;
                     if last_persist.elapsed() >= PERSIST_EVERY {
@@ -486,10 +578,19 @@ impl Core {
 
     async fn handle(&mut self, cmd: SessionCommand) {
         match cmd {
-            SessionCommand::AddFeed { .. }
-            | SessionCommand::RemoveFeed(_)
-            | SessionCommand::RefreshFeeds => {
-                self.log(Level::Warn, "RSS feeds are not available yet").await
+            SessionCommand::AddFeed { url, include, exclude, dir } => self.add_feed(url, include, exclude, dir).await,
+            SessionCommand::RemoveFeed(id) => {
+                if let Some(i) = self.feeds.iter().position(|f| f.id == id) {
+                    let f = self.feeds.remove(i);
+                    self.save_feeds().await;
+                    self.log(Level::Info, format!("unsubscribed from {}", redacted(&f.state.url))).await;
+                }
+            }
+            SessionCommand::RefreshFeeds => {
+                let now = Instant::now();
+                for f in &mut self.feeds {
+                    f.next_poll = now;
+                }
             }
             SessionCommand::Add { source, dir } => self.add(source, dir).await,
             SessionCommand::Remove { id, delete_data } => self.remove(&id, delete_data).await,
@@ -559,8 +660,19 @@ impl Core {
     }
 
     async fn add(&mut self, source: String, dir: Option<PathBuf>) {
+        if is_http(&source) {
+            self.spawn_fetch(source.clone(), MAX_TORRENT_BYTES, move |tx, result| {
+                let _ = tx.send(Fetched::Torrent { source, dir, result });
+            });
+            return;
+        }
+        self.add_loaded(source, None, dir).await;
+    }
+
+    /// Add a torrent from a path, magnet, or the bytes already downloaded from `source`.
+    async fn add_loaded(&mut self, source: String, raw: Option<Vec<u8>>, dir: Option<PathBuf>) {
         let dir = dir.unwrap_or_else(|| self.settings.download_dir.clone());
-        match self.prepare_add(&source, dir) {
+        match self.prepare_add(&source, raw, dir) {
             Ok(entry) => {
                 let name = match (&entry.meta, &entry.magnet) {
                     (Some(m), _) => m.name.clone(),
@@ -575,11 +687,165 @@ impl Core {
                 self.save(i).await;
                 self.log(Level::Info, format!("added {name}")).await;
             }
-            Err(e) => self.log(Level::Error, format!("cannot add {source}: {e:#}")).await,
+            Err(e) => self.log(Level::Error, format!("cannot add {}: {e:#}", shown(&source))).await,
         }
     }
 
-    fn prepare_add(&self, source: &str, dir: PathBuf) -> Result<Entry> {
+    /// Download `url` (at most `max` bytes, two at a time) off the core task.
+    fn spawn_fetch(&self, url: String, max: usize, done: impl FnOnce(UnboundedSender<Fetched>, Result<Vec<u8>>) + Send + 'static) {
+        let tx = self.fetch_tx.clone();
+        let slots = Arc::clone(&self.fetch_slots);
+        tokio::spawn(async move {
+            let _slot = slots.acquire_owned().await;
+            let result = match tokio::time::timeout(FETCH_TIMEOUT, crate::webseed::get_capped(&url, max)).await {
+                Ok(r) => r.map_err(|e| anyhow!("{e}")),
+                Err(_) => Err(anyhow!("timed out")),
+            };
+            done(tx, result);
+        });
+    }
+
+    async fn on_fetched(&mut self, done: Fetched) {
+        match done {
+            Fetched::Torrent { source, dir, result } => match result {
+                Ok(raw) => self.add_loaded(source, Some(raw), dir).await,
+                Err(e) => self.log(Level::Error, format!("cannot add {}: {e:#}", shown(&source))).await,
+            },
+            Fetched::Feed { id, result } => self.on_feed_fetched(id, result).await,
+        }
+    }
+
+    async fn add_feed(&mut self, url: String, include: Vec<String>, exclude: Vec<String>, dir: Option<PathBuf>) {
+        let url = url.trim().to_owned();
+        let valid = is_http(&url) && url::Url::parse(&url).is_ok_and(|u| u.host_str().is_some());
+        if !valid {
+            self.log(Level::Error, format!("cannot subscribe to {}: not an http(s) URL", shown(&url))).await;
+            return;
+        }
+        if self.feeds.iter().any(|f| f.state.url == url) {
+            self.log(Level::Warn, format!("already subscribed to {}", redacted(&url))).await;
+            return;
+        }
+        if self.feeds.len() >= MAX_FEEDS {
+            self.log(Level::Error, format!("cannot subscribe: at most {MAX_FEEDS} feeds")).await;
+            return;
+        }
+        let clean = |l: Vec<String>| l.into_iter().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()).collect();
+        let mut state = FeedState::new(url.clone());
+        state.include = clean(include);
+        state.exclude = clean(exclude);
+        state.dir = dir;
+        let id = self.next_feed_id;
+        self.next_feed_id += 1;
+        self.feeds.push(Feed {
+            id,
+            state,
+            title: None,
+            primed: false,
+            last_fetch: None,
+            last_error: None,
+            recent: Vec::new(),
+            next_poll: Instant::now() + feed_delay(),
+            fetching: true,
+        });
+        self.save_feeds().await;
+        self.fetch_feed(id, url.clone());
+        self.log(Level::Info, format!("subscribed to {}", redacted(&url))).await;
+    }
+
+    fn fetch_feed(&self, id: FeedId, url: String) {
+        self.spawn_fetch(url.clone(), MAX_FEED_BYTES, move |tx, result| {
+            let result = result.and_then(|body| rss::parse_at(&String::from_utf8_lossy(&body), &url));
+            let _ = tx.send(Fetched::Feed { id, result });
+        });
+    }
+
+    fn poll_feeds(&mut self) {
+        let now = Instant::now();
+        for i in 0..self.feeds.len() {
+            let f = &mut self.feeds[i];
+            if f.fetching || f.next_poll > now {
+                continue;
+            }
+            f.fetching = true;
+            f.next_poll = now + feed_delay();
+            let (id, url) = (f.id, f.state.url.clone());
+            self.fetch_feed(id, url);
+        }
+    }
+
+    async fn on_feed_fetched(&mut self, id: FeedId, result: Result<ParsedFeed>) {
+        let Some(i) = self.feeds.iter().position(|f| f.id == id) else {
+            return;
+        };
+        let f = &mut self.feeds[i];
+        f.fetching = false;
+        let name = redacted(&f.state.url);
+        let mut matches = Vec::new();
+        let mut note = None;
+        match result {
+            Err(e) => {
+                note = Some((Level::Warn, format!("feed {name}: {e:#}")));
+                f.last_error = Some(format!("{e:#}"));
+            }
+            Ok(parsed) => {
+                f.last_error = None;
+                f.last_fetch = Some(unix_now());
+                if let Some(t) = parsed.title.filter(|t| !t.trim().is_empty()) {
+                    f.title = Some(clip(t.trim()));
+                }
+                if f.primed {
+                    matches = f.state.new_matches(&parsed.items);
+                    for (title, _) in &matches {
+                        f.recent.insert(0, clip(title));
+                    }
+                    f.recent.truncate(MAX_RECENT);
+                } else {
+                    let (include, exclude) = (std::mem::take(&mut f.state.include), std::mem::take(&mut f.state.exclude));
+                    let n = f.state.new_matches(&parsed.items).len();
+                    f.state.include = include;
+                    f.state.exclude = exclude;
+                    f.primed = true;
+                    note = Some((Level::Info, format!("feed {name}: watching {n} existing items")));
+                }
+            }
+        }
+        let dir = f.state.dir.clone();
+        self.save_feeds().await;
+        if let Some((level, msg)) = note {
+            self.log(level, msg).await;
+        }
+        for (title, source) in matches {
+            if source.starts_with("magnet:") || is_http(&source) {
+                self.log(Level::Info, format!("feed {name}: new item {}", clip(&title))).await;
+                self.add(source, dir.clone()).await;
+            } else {
+                self.log(Level::Warn, format!("feed {name}: ignoring item {} with a non-web link", clip(&title))).await;
+            }
+        }
+    }
+
+    async fn save_feeds(&self) {
+        let stored: Vec<StoredFeed> = self
+            .feeds
+            .iter()
+            .map(|f| StoredFeed {
+                id: f.id,
+                url: f.state.url.clone(),
+                include: f.state.include.clone(),
+                exclude: f.state.exclude.clone(),
+                dir: f.state.dir.clone(),
+                title: f.title.clone(),
+                primed: f.primed,
+                seen: f.state.seen().map(str::to_owned).collect(),
+            })
+            .collect();
+        if let Err(e) = self.store.save_feeds(self.next_feed_id, &stored) {
+            self.log(Level::Error, format!("saving feeds: {e:#}")).await;
+        }
+    }
+
+    fn prepare_add(&self, source: &str, raw: Option<Vec<u8>>, dir: PathBuf) -> Result<Entry> {
         let mut rec = Record {
             id: String::new(),
             dir,
@@ -602,7 +868,10 @@ impl Core {
             rec.magnet = Some(source.to_owned());
             (m.infohash, None, Some(m))
         } else {
-            let raw = std::fs::read(source).with_context(|| format!("reading {source}"))?;
+            let raw = match raw {
+                Some(raw) => raw,
+                None => std::fs::read(source).with_context(|| format!("reading {source}"))?,
+            };
             let meta = Metainfo::from_bytes(&raw).context("parsing .torrent file")?;
             rec.id = meta.infohash.to_hex();
             if self.find(&rec.id).is_none() {
@@ -826,7 +1095,8 @@ impl Core {
         .await;
     }
 
-    async fn set_settings(&mut self, new: Settings) {
+    async fn set_settings(&mut self, mut new: Settings) {
+        secure_password(&mut new);
         let old = std::mem::replace(&mut self.settings, new.clone());
         self.gdown.set_rate(new.download_limit);
         self.gup.set_rate(new.upload_limit);
@@ -842,6 +1112,9 @@ impl Core {
         }
         if new.listen_port != old.listen_port || new.dht != old.dht || new.lsd != old.lsd || new.port_forwarding != old.port_forwarding {
             self.log(Level::Info, "port, DHT, local discovery and port forwarding changes take effect after restart").await;
+        }
+        if new.encryption != old.encryption || new.utp != old.utp || new.webui != old.webui {
+            self.log(Level::Info, "web UI, encryption and uTP changes take effect after restart").await;
         }
         if new.ratio_target != old.ratio_target {
             self.log(Level::Info, "ratio target applies to torrents started from now on").await;
@@ -968,6 +1241,21 @@ impl Core {
             });
         }
         let mut st = self.state.write().await;
+        st.feeds = self
+            .feeds
+            .iter()
+            .map(|f| FeedView {
+                id: f.id,
+                url: f.state.url.clone(),
+                title: f.title.clone(),
+                include: f.state.include.clone(),
+                exclude: f.state.exclude.clone(),
+                dir: f.state.dir.clone(),
+                last_fetch: f.last_fetch,
+                last_error: f.last_error.clone(),
+                recent: f.recent.clone(),
+            })
+            .collect();
         st.torrents = views;
         st.download_rate = down;
         st.upload_rate = up;
@@ -1230,6 +1518,47 @@ fn same_content(a: &Path, b: &Path) -> Result<bool> {
             return Ok(false);
         }
     }
+}
+
+/// Never keep the web UI password in plaintext once the session has it.
+fn secure_password(settings: &mut Settings) {
+    settings.webui.password = settings.webui.password.take().filter(|p| !p.is_empty()).map(|p| crate::store::hashed(&p));
+}
+
+fn is_http(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() > 8 && (b[..7].eq_ignore_ascii_case(b"http://") || b[..8].eq_ignore_ascii_case(b"https://"))
+}
+
+/// A URL without credentials, query or fragment, for logs: feed and download
+/// links often carry tokens.
+fn redacted(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut u) => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string()
+        }
+        Err(_) => "(invalid url)".to_owned(),
+    }
+}
+
+fn shown(source: &str) -> String {
+    if is_http(source) {
+        redacted(source)
+    } else {
+        source.to_owned()
+    }
+}
+
+fn clip(s: &str) -> String {
+    s.chars().take(MAX_TITLE).collect()
+}
+
+fn feed_delay() -> Duration {
+    FEED_INTERVAL.mul_f64(rand::thread_rng().gen_range(0.9..1.1))
 }
 
 fn unix_now() -> u64 {

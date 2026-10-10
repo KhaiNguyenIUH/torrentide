@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::bencode::{self, Value};
-use crate::state::{FilePriority, Settings, TorrentId};
+use crate::state::{EncryptionMode, FilePriority, Settings, TorrentId};
 
 /// Where the session keeps its files. `TORRUST_HOME` overrides the platform
 /// default.
@@ -78,6 +78,21 @@ pub struct Snapshot {
     pub files: Vec<u64>,
 }
 
+/// An RSS subscription as kept on disk. `seen` is oldest first and holds the
+/// items already handed out, so a restart never re-adds them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredFeed {
+    pub id: u64,
+    pub url: String,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub dir: Option<PathBuf>,
+    pub title: Option<String>,
+    /// False until the first fetch has recorded the items already in the feed.
+    pub primed: bool,
+    pub seen: Vec<String>,
+}
+
 /// A `torrust add` left for the next session to pick up.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Queued {
@@ -138,7 +153,26 @@ impl Store {
     }
 
     pub fn save_settings(&self, s: &Settings) -> Result<()> {
-        write_atomic(&self.root.join("settings.bencode"), &encode_settings(s))
+        write_private(&self.root.join("settings.bencode"), &encode_settings(s))
+    }
+
+    /// Stored feeds and the next free feed id. A missing or unreadable file means none.
+    pub fn load_feeds(&self) -> (u64, Vec<StoredFeed>) {
+        let path = self.root.join("feeds.bencode");
+        let Ok(raw) = fs::read(&path) else {
+            return (1, Vec::new());
+        };
+        match decode_feeds(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "ignoring corrupt feeds file");
+                (1, Vec::new())
+            }
+        }
+    }
+
+    pub fn save_feeds(&self, next_id: u64, feeds: &[StoredFeed]) -> Result<()> {
+        write_private(&self.root.join("feeds.bencode"), &encode_feeds(next_id, feeds))
     }
 
     pub fn save_torrent(&self, id: &str, bytes: &[u8]) -> Result<()> {
@@ -234,17 +268,106 @@ impl Store {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_file(path, bytes, false)
+}
+
+/// Like [`write_atomic`], but readable by the owner only on unix: these files
+/// hold the web UI password hash and feed URLs, which often carry tokens.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_file(path, bytes, true)
+}
+
+fn write_file(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
     let parent = path.parent().context("path has no parent")?;
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let tmp = path.with_extension(format!(
         "{}.tmp",
         path.extension().and_then(|e| e.to_str()).unwrap_or("")
     ));
-    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    write_tmp(&tmp, bytes, private).with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, path).map_err(|e: io::Error| {
         let _ = fs::remove_file(&tmp);
         anyhow::Error::from(e).context(format!("replacing {}", path.display()))
     })
+}
+
+fn write_tmp(tmp: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
+    use std::io::Write;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(tmp)?;
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    let _ = private;
+    f.write_all(bytes)
+}
+
+const HASH_SCHEME: &str = "sha1";
+const HASH_ITERATIONS: u32 = 100_000;
+const MAX_HASH_ITERATIONS: u32 = 5_000_000;
+
+/// Whether `stored` is already a salted hash from [`hash_password`].
+pub fn is_password_hash(stored: &str) -> bool {
+    parse_hash(stored).is_some()
+}
+
+/// `sha1$<iterations>$<salt hex>$<hash hex>`: SHA-1 over salt and password,
+/// then iterated so each guess costs 100 000 rounds. The plaintext is never stored.
+pub fn hash_password(password: &str) -> String {
+    use rand::RngCore;
+    let mut salt = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut salt);
+    let hash = derive(&salt, password.as_bytes(), HASH_ITERATIONS);
+    format!("{HASH_SCHEME}${HASH_ITERATIONS}${}${}", hex::encode(salt), hex::encode(hash))
+}
+
+/// Keep a stored hash as is and hash anything else.
+pub fn hashed(password: &str) -> String {
+    if is_password_hash(password) {
+        password.to_owned()
+    } else {
+        hash_password(password)
+    }
+}
+
+/// Check a password a client sent against what the settings hold: a stored
+/// hash is recomputed and compared in constant time; plaintext (only ever
+/// present in memory, before the session hashes it) is compared directly.
+pub fn verify_password(stored: &str, given: &[u8]) -> bool {
+    match parse_hash(stored) {
+        Some((iterations, salt, hash)) => {
+            crate::webui::ct_eq(&derive(&salt, given, iterations), &hash)
+        }
+        None => crate::webui::ct_eq(given, stored.as_bytes()),
+    }
+}
+
+fn derive(salt: &[u8], password: &[u8], iterations: u32) -> [u8; 20] {
+    use sha1::{Digest, Sha1};
+    let mut h: [u8; 20] = Sha1::new().chain_update(salt).chain_update(password).finalize().into();
+    for _ in 1..iterations {
+        h = Sha1::new().chain_update(h).chain_update(salt).chain_update(password).finalize().into();
+    }
+    h
+}
+
+fn parse_hash(stored: &str) -> Option<(u32, Vec<u8>, [u8; 20])> {
+    let mut parts = stored.split('$');
+    if parts.next()? != HASH_SCHEME {
+        return None;
+    }
+    let iterations: u32 = parts.next()?.parse().ok().filter(|n| (1..=MAX_HASH_ITERATIONS).contains(n))?;
+    let salt = hex::decode(parts.next()?).ok().filter(|s| !s.is_empty())?;
+    let hash: [u8; 20] = hex::decode(parts.next()?).ok()?.try_into().ok()?;
+    parts.next().is_none().then_some((iterations, salt, hash))
 }
 
 fn path_bytes(p: &Path) -> Vec<u8> {
@@ -274,6 +397,13 @@ fn encode_settings(s: &Settings) -> Vec<u8> {
     d.insert(b"max_active_torrents".to_vec(), int(s.max_active_torrents as u64));
     if let Some(p) = &s.move_completed_dir {
         d.insert(b"move_completed_dir".to_vec(), Value::Bytes(path_bytes(p)));
+    }
+    d.insert(b"encryption".to_vec(), Value::Bytes(s.encryption.label().as_bytes().to_vec()));
+    d.insert(b"utp".to_vec(), int(s.utp as u64));
+    d.insert(b"webui_enabled".to_vec(), int(s.webui.enabled as u64));
+    d.insert(b"webui_port".to_vec(), int(s.webui.port as u64));
+    if let Some(p) = s.webui.password.as_deref().filter(|p| !p.is_empty()) {
+        d.insert(b"webui_password".to_vec(), Value::Bytes(hashed(p).into_bytes()));
     }
     bencode::encode(&Value::Dict(d))
 }
@@ -314,6 +444,19 @@ fn decode_settings(raw: &[u8]) -> Result<Settings> {
     if let Some(n) = v.get_int_opt("max_active_torrents") {
         s.max_active_torrents = n.max(0) as usize;
     }
+    if let Some(m) = v.get_str_opt("encryption").and_then(EncryptionMode::parse) {
+        s.encryption = m;
+    }
+    if let Some(n) = v.get_int_opt("utp") {
+        s.utp = n != 0;
+    }
+    if let Some(n) = v.get_int_opt("webui_enabled") {
+        s.webui.enabled = n != 0;
+    }
+    if let Some(n) = v.get_int_opt("webui_port") {
+        s.webui.port = u16::try_from(n).context("webui_port out of range")?;
+    }
+    s.webui.password = v.get_str_opt("webui_password").filter(|p| !p.is_empty()).map(str::to_owned);
     s.move_completed_dir = v.get_opt("move_completed_dir").map(bytes_path).transpose()?.filter(|p| !p.as_os_str().is_empty());
     Ok(s)
 }
@@ -411,6 +554,67 @@ fn decode_snapshot(v: &Value) -> Option<Snapshot> {
             _ => return None,
         },
     })
+}
+
+fn encode_feeds(next_id: u64, feeds: &[StoredFeed]) -> Vec<u8> {
+    let strings = |l: &[String]| Value::List(l.iter().map(|x| Value::Bytes(x.as_bytes().to_vec())).collect());
+    let list = feeds
+        .iter()
+        .map(|f| {
+            let mut d = BTreeMap::new();
+            d.insert(b"id".to_vec(), int(f.id));
+            d.insert(b"url".to_vec(), Value::Bytes(f.url.as_bytes().to_vec()));
+            d.insert(b"include".to_vec(), strings(&f.include));
+            d.insert(b"exclude".to_vec(), strings(&f.exclude));
+            if let Some(p) = &f.dir {
+                d.insert(b"dir".to_vec(), Value::Bytes(path_bytes(p)));
+            }
+            if let Some(t) = &f.title {
+                d.insert(b"title".to_vec(), Value::Bytes(t.as_bytes().to_vec()));
+            }
+            d.insert(b"primed".to_vec(), int(f.primed as u64));
+            d.insert(b"seen".to_vec(), strings(&f.seen));
+            Value::Dict(d)
+        })
+        .collect();
+    let mut d = BTreeMap::new();
+    d.insert(b"next_id".to_vec(), int(next_id));
+    d.insert(b"feeds".to_vec(), Value::List(list));
+    bencode::encode(&Value::Dict(d))
+}
+
+fn decode_feeds(raw: &[u8]) -> Result<(u64, Vec<StoredFeed>)> {
+    let strings = |v: &Value, key: &str| -> Vec<String> {
+        match v.get_opt(key) {
+            Some(Value::List(l)) => l
+                .iter()
+                .filter_map(|x| x.as_bytes().ok())
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let v = bencode::decode(raw)?;
+    let mut feeds = Vec::new();
+    if let Some(Value::List(l)) = v.get_opt("feeds") {
+        for f in l {
+            let (Some(id), Some(url)) = (f.get_int_opt("id").filter(|n| *n > 0), f.get_str_opt("url")) else {
+                continue;
+            };
+            feeds.push(StoredFeed {
+                id: id as u64,
+                url: url.to_owned(),
+                include: strings(f, "include"),
+                exclude: strings(f, "exclude"),
+                dir: f.get_opt("dir").map(bytes_path).transpose()?.filter(|p| !p.as_os_str().is_empty()),
+                title: f.get_str_opt("title").filter(|t| !t.is_empty()).map(str::to_owned),
+                primed: f.get_int_opt("primed").unwrap_or(0) != 0,
+                seen: strings(f, "seen"),
+            });
+        }
+    }
+    let next = feeds.iter().map(|f| f.id + 1).max().unwrap_or(1).max(v.get_int_opt("next_id").unwrap_or(1).max(1) as u64);
+    Ok((next, feeds))
 }
 
 fn decode_queued(raw: &[u8]) -> Result<Queued> {
@@ -576,6 +780,84 @@ mod tests {
         assert_eq!(s.listen_port, 7);
         assert_eq!(s.max_active_downloads, Settings::default().max_active_downloads);
         assert_eq!(s.move_completed_dir, None);
+    }
+
+    #[test]
+    fn new_settings_round_trip() {
+        let store = Store::at(tmp("newsettings"));
+        let s = Settings {
+            encryption: EncryptionMode::Require,
+            utp: false,
+            webui: crate::state::WebUiSettings { enabled: true, port: 9123, password: Some(hash_password("pw")) },
+            ..Settings::default()
+        };
+        store.save_settings(&s).unwrap();
+        assert_eq!(store.load_settings(), s);
+    }
+
+    #[test]
+    fn old_settings_get_new_defaults() {
+        let store = Store::at(tmp("oldnew"));
+        let raw = bencode::encode(&Value::Dict(BTreeMap::from([(b"listen_port".to_vec(), Value::Int(7))])));
+        write_atomic(&store.root.join("settings.bencode"), &raw).unwrap();
+        let s = store.load_settings();
+        let d = Settings::default();
+        assert_eq!((s.encryption, s.utp, s.webui.clone()), (d.encryption, d.utp, d.webui));
+    }
+
+    #[test]
+    fn password_is_never_written_in_plaintext() {
+        let root = tmp("pw");
+        let store = Store::at(&root);
+        let mut s = Settings::default();
+        s.webui.password = Some("correct horse battery".into());
+        store.save_settings(&s).unwrap();
+        let raw = fs::read(root.join("settings.bencode")).unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("correct horse"));
+        let stored = store.load_settings().webui.password.unwrap();
+        assert!(is_password_hash(&stored) && stored.starts_with("sha1$100000$"));
+        assert!(verify_password(&stored, b"correct horse battery"));
+        assert!(!verify_password(&stored, b"correct horse batterz"));
+        assert!(!verify_password(&stored, b""));
+        assert!(verify_password("plain", b"plain") && !verify_password("plain", b"other"));
+        assert_ne!(hash_password("x"), hash_password("x"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_and_feeds_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp("mode");
+        let store = Store::at(&root);
+        fs::write(root.join("settings.bencode.tmp"), b"x").unwrap();
+        fs::set_permissions(root.join("settings.bencode.tmp"), fs::Permissions::from_mode(0o644)).unwrap();
+        store.save_settings(&Settings::default()).unwrap();
+        store.save_feeds(1, &[]).unwrap();
+        for f in ["settings.bencode", "feeds.bencode"] {
+            let mode = fs::metadata(root.join(f)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{f}");
+        }
+    }
+
+    #[test]
+    fn feeds_round_trip_and_missing_or_corrupt_means_none() {
+        let root = tmp("feeds");
+        let store = Store::at(&root);
+        assert_eq!(store.load_feeds(), (1, vec![]));
+        let f = StoredFeed {
+            id: 4,
+            url: "http://h/feed".into(),
+            include: vec!["a".into()],
+            exclude: vec![],
+            dir: Some(PathBuf::from("/d")),
+            title: Some("T".into()),
+            primed: true,
+            seen: vec!["g1".into(), "g2".into()],
+        };
+        store.save_feeds(9, std::slice::from_ref(&f)).unwrap();
+        assert_eq!(store.load_feeds(), (9, vec![f]));
+        fs::write(root.join("feeds.bencode"), b"garbage").unwrap();
+        assert_eq!(store.load_feeds(), (1, vec![]));
     }
 
     #[test]
