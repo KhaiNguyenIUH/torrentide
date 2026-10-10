@@ -181,6 +181,7 @@ impl Session {
             let thread = std::thread::spawn(move || {
                 if let Err(e) = crate::tui::run_session_tui(state) {
                     tracing::error!("TUI exited with an error: {e}");
+                    eprintln!("TUI exited with an error: {e:#}");
                 }
             });
             let quit = tx.clone();
@@ -1541,6 +1542,7 @@ impl Core {
         for e in &self.entries {
             let mut ui = e.ui.read().await.clone();
             ui.command_tx = None;
+            flag_stalled(&mut ui, Instant::now());
             let total = ui.torrent.as_ref().map_or(0, |t| t.total_length);
             if let Some(t) = &ui.torrent {
                 down += t.download_rate;
@@ -1628,6 +1630,29 @@ impl Core {
         self.aggregate().await;
         self.state.write().await.shutdown = true;
     }
+}
+
+const STALL_AFTER: Duration = Duration::from_secs(5);
+
+fn flag_stalled(ui: &mut UiState, now: Instant) {
+    let (Some(t), Some(at)) = (ui.torrent.as_mut(), ui.stats_at) else {
+        return;
+    };
+    let age = now.saturating_duration_since(at);
+    if t.state != DownloadState::Downloading || age < STALL_AFTER {
+        return;
+    }
+    t.download_rate = 0.0;
+    t.upload_rate = 0.0;
+    t.eta_secs = None;
+    let msg = format!(
+        "no progress for {}s: the download engine is not responding (busy writing to disk?)",
+        age.as_secs()
+    );
+    ui.warning = Some(match ui.warning.take() {
+        Some(w) => format!("{msg}; {w}"),
+        None => msg,
+    });
 }
 
 fn push_sample(history: &mut Vec<(f64, f64)>, sample: (f64, f64)) {
@@ -2225,6 +2250,41 @@ fn summary_line(st: &SessionState) -> String {
 mod tests {
     use super::*;
     use crate::storage::sha1_bytes;
+
+    #[test]
+    fn stalled_engine_is_flagged_and_fresh_is_not() {
+        let now = Instant::now();
+        let mk = |age: u64| UiState {
+            torrent: Some(TorrentSummary {
+                state: DownloadState::Downloading,
+                download_rate: 500.0,
+                upload_rate: 10.0,
+                eta_secs: Some(60.0),
+                ..TorrentSummary::default()
+            }),
+            stats_at: Some(now - Duration::from_secs(age)),
+            ..UiState::default()
+        };
+
+        let mut stale = mk(10);
+        stale.warning = Some("tracker down".into());
+        flag_stalled(&mut stale, now);
+        let t = stale.torrent.as_ref().unwrap();
+        assert_eq!((t.download_rate, t.upload_rate, t.eta_secs), (0.0, 0.0, None));
+        let w = stale.warning.as_deref().unwrap();
+        assert!(w.contains("no progress for 10s") && w.contains("tracker down"));
+
+        let mut fresh = mk(1);
+        flag_stalled(&mut fresh, now);
+        let t = fresh.torrent.as_ref().unwrap();
+        assert_eq!((t.download_rate, t.eta_secs), (500.0, Some(60.0)));
+        assert!(fresh.warning.is_none());
+
+        let mut stopped = mk(10);
+        stopped.torrent.as_mut().unwrap().state = DownloadState::Stopped;
+        flag_stalled(&mut stopped, now);
+        assert!(stopped.warning.is_none());
+    }
 
     #[test]
     fn add_errors_name_the_torrent_briefly() {

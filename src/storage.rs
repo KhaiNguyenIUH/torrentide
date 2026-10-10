@@ -44,11 +44,50 @@ struct StoredFile {
     length: u64,
 }
 
+#[cfg(windows)]
+fn mark_sparse(f: &File) {
+    use std::os::windows::io::AsRawHandle;
+    extern "system" {
+        fn DeviceIoControl(
+            handle: *mut core::ffi::c_void,
+            code: u32,
+            in_buf: *const core::ffi::c_void,
+            in_len: u32,
+            out_buf: *mut core::ffi::c_void,
+            out_len: u32,
+            returned: *mut u32,
+            overlapped: *mut core::ffi::c_void,
+        ) -> i32;
+    }
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            f.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        tracing::debug!("filesystem does not support sparse files: {}", std::io::Error::last_os_error());
+    }
+}
+
+#[cfg(not(windows))]
+fn mark_sparse(_: &File) {}
+
 impl Storage {
     /// Prepare the download directory, creating any missing files at full size.
     ///
-    /// Files are allocated sparse where the platform allows it, so a fresh
-    /// torrent does not immediately consume its full size on disk. A file that
+    /// Files are allocated sparse where the platform allows it (Unix always;
+    /// on Windows they are explicitly flagged sparse, otherwise NTFS zero-fills
+    /// everything before the first write), so a fresh torrent does not
+    /// immediately consume its full size on disk. A file that
     /// already exists at a torrent path is only adopted when it has exactly the
     /// torrent's length (the recheck then decides what is valid); any other
     /// non-empty file is somebody else's data and is never resized.
@@ -84,12 +123,19 @@ impl Storage {
             }
 
             match fs::symlink_metadata(&disk_path) {
-                Ok(md) if md.is_file() && md.len() == length => {}
+                Ok(md) if md.is_file() && md.len() == length => {
+                    // Files made before the sparse flag still need it on Windows.
+                    #[cfg(windows)]
+                    if let Ok(f) = OpenOptions::new().write(true).open(&disk_path) {
+                        mark_sparse(&f);
+                    }
+                }
                 Ok(md) if md.is_file() && (repair || md.len() == 0) => {
                     let f = OpenOptions::new()
                         .write(true)
                         .open(&disk_path)
                         .with_context(|| format!("resizing {}", disk_path.display()))?;
+                    mark_sparse(&f);
                     f.set_len(length)
                         .with_context(|| format!("setting length on {}", disk_path.display()))?;
                 }
@@ -99,12 +145,13 @@ impl Storage {
                 ),
                 Ok(_) => bail!("{} exists and is not a regular file", disk_path.display()),
                 Err(_) => {
-                    OpenOptions::new()
+                    let f = OpenOptions::new()
                         .write(true)
                         .create_new(true)
                         .open(&disk_path)
-                        .with_context(|| format!("creating {}", disk_path.display()))?
-                        .set_len(length)
+                        .with_context(|| format!("creating {}", disk_path.display()))?;
+                    mark_sparse(&f);
+                    f.set_len(length)
                         .with_context(|| format!("setting length on {}", disk_path.display()))?;
                 }
             }

@@ -531,6 +531,9 @@ pub struct UiState {
     /// the normal loop instead of killing the UI thread mid-frame (which
     /// would leave a frozen stale frame painted on the terminal).
     pub shutdown: bool,
+    /// When the engine last published stats; a stale stamp means it is stuck.
+    #[serde(skip)]
+    pub stats_at: Option<std::time::Instant>,
     /// Channel into the engine for [`Command`]. `None` in tests and before the
     /// engine starts; the TUI disables its control keys while it is absent.
     #[serde(skip)]

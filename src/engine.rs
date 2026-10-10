@@ -931,6 +931,7 @@ impl Engine {
                             }
                         }
                         st.peers = peers;
+                        st.stats_at = Some(Instant::now());
                         let _ = connected;
                         drop(st);
                         if reached {

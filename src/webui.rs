@@ -21,7 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, Semaphore};
 
 use crate::session::MAX_TORRENT_BYTES;
-use crate::state::{Command, SessionCommand, SessionState, WebUiSettings};
+use crate::state::{Command, Level, SessionCommand, SessionState, WebUiSettings};
 
 const INDEX_HTML: &str = include_str!("webui/index.html");
 const MAX_HEAD: usize = 8 * 1024;
@@ -203,6 +203,16 @@ async fn serve_with(
         strikes: Mutex::default(),
         conns: Mutex::default(),
     });
+    {
+        let mut st = state.write().await;
+        let missing: Vec<PathBuf> = st.settings.webui.save_roots.iter().filter(|p| !p.exists()).cloned().collect();
+        for p in missing {
+            st.log(
+                Level::Warn,
+                format!("web UI save folder {} does not exist; paths under it are refused until it does", p.display()),
+            );
+        }
+    }
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -742,16 +752,23 @@ fn save_dir(root: &Path, extra: &[PathBuf], raw: Option<&str>) -> Result<Option<
         return Ok(None);
     };
     let list = || {
-        std::iter::once(root.display().to_string())
-            .chain(extra.iter().map(|p| p.display().to_string()))
+        std::iter::once(root)
+            .chain(extra.iter().map(|p| p.as_path()))
+            .map(|p| if p.exists() { p.display().to_string() } else { format!("{} (does not exist)", p.display()) })
             .collect::<Vec<_>>()
             .join(", ")
     };
     let rejected = || format!("the folder must be inside: {}", list());
-    // A backslash is a separator on Windows and never what a browser user
-    // means as part of a name elsewhere, so `C:\x` is refused everywhere.
-    if name.contains(['\0', '\\']) {
+    #[cfg(windows)]
+    let name = name.replace('\\', "/");
+    #[cfg(windows)]
+    let name = name.as_str();
+    if name.contains('\0') {
         return Err(rejected());
+    }
+    #[cfg(not(windows))]
+    if name.contains('\\') {
+        return Err(format!("use / instead of \\ in folder paths ({})", rejected()));
     }
     let asked = Path::new(name);
     let dir = if asked.is_absolute() {
@@ -891,7 +908,7 @@ async fn route(req: &Request, body: &[u8], state: &RwLock<SessionState>) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{DownloadState, FeedView, Level, TorrentSummary, TorrentView, UiState};
+    use crate::state::{DownloadState, FeedView, TorrentSummary, TorrentView, UiState};
     use tokio::sync::mpsc;
 
     const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1324,6 +1341,8 @@ mod tests {
         }
         // An absolute path is refused until a root allows it.
         assert!(save_dir(&root, &[], Some(r"C:\Windows")).is_err());
+        #[cfg(not(windows))]
+        assert!(save_dir(&root, &[], Some(r"a\b")).unwrap_err().contains("use / instead of \\"));
         // A link inside the root pointing out of it is refused too.
         #[cfg(unix)]
         {
@@ -1348,6 +1367,15 @@ mod tests {
         assert!(save_dir(&root, std::slice::from_ref(&other), Some(r"C:\Windows")).is_err());
         // A relative name stays pinned to the download folder, not the extra root.
         assert_eq!(save_dir(&root, std::slice::from_ref(&other), Some("Anime")).unwrap().unwrap(), root.join("Anime"));
+    }
+
+    #[test]
+    fn a_missing_extra_root_is_named_in_the_rejection() {
+        let root = scratch_root("missing");
+        let gone = root.join("gone-drive");
+        let err = save_dir(&root, std::slice::from_ref(&gone), Some("/nowhere/else")).unwrap_err();
+        assert!(err.contains(&format!("{} (does not exist)", gone.display())), "{err}");
+        assert!(!err.contains(&format!("{} (does not exist)", root.display())), "{err}");
     }
 
     #[test]

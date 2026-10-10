@@ -177,6 +177,19 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    #[cfg(windows)]
+    if cli.command.is_none() {
+        if let Err(e) = run(cli).await {
+            eprintln!("error: {e:#}\npress Enter to exit");
+            let _ = std::io::stdin().read_line(&mut String::new());
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    run(cli).await
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let command = cli.command.unwrap_or(Command::Session { no_tui: false, background: false });
     let uses_tui = matches!(
         command,
@@ -198,6 +211,14 @@ async fn main() -> Result<()> {
             }
             torrust::session::Session::run(store.load_settings(), !no_tui).await
         }
+        #[cfg(windows)]
+        Command::Stop => {
+            println!(
+                "torrust stop is not available on Windows: the session runs in the window that started it (torrust or torrust session); close it there with Q or Ctrl-C"
+            );
+            Ok(())
+        }
+        #[cfg(not(windows))]
         Command::Stop => {
             if torrust::ipc::stop(&torrust::store::Store::open()).await {
                 println!("stopping torrust");
