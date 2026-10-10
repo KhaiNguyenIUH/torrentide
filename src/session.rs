@@ -919,6 +919,9 @@ impl Core {
                 _ => None,
             },
             sequential: e.rec.sequential,
+            blocklist: None,
+            trackers: None,
+            super_seed: false,
         };
         let ui = Arc::clone(&e.ui);
         let dir = e.rec.dir.clone();

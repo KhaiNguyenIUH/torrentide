@@ -68,6 +68,8 @@ pub struct TorrentSummary {
     pub seeders_known: u32,
     /// Pieces are fetched in order (for watching while downloading).
     pub sequential: bool,
+    /// Super-seeding (BEP 16) is on.
+    pub super_seeding: bool,
     pub leecher_known: u32,
     /// Cumulative bytes uploaded for this torrent, including earlier runs.
     pub uploaded: u64,
@@ -95,6 +97,7 @@ impl Default for TorrentSummary {
             trackers: vec![],
             seeders_known: 0,
             sequential: false,
+            super_seeding: false,
             leecher_known: 0,
             uploaded: 0,
             files: vec![],
@@ -137,6 +140,9 @@ pub struct PeerSummary {
     pub choking_us: bool,
     /// Outstanding blocks requested from this peer.
     pub outstanding: usize,
+    /// uTorrent-style connection flags, e.g. "EPu": E encrypted, P uTP,
+    /// I incoming, X found via PEX, L local discovery, H DHT, F fast extension.
+    pub flags: String,
 }
 
 /// One file of a (usually multi-file) torrent, with its download progress.
@@ -196,7 +202,7 @@ impl FileSummary {
 /// The sender lives in [`UiState::command_tx`] so the UI thread can clone it
 /// out of any snapshot; the engine drains it once per tick. Sending is
 /// synchronous and never blocks, so it is safe to call from key handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Stop requesting new blocks. In-flight responses are still processed.
     Pause,
@@ -213,6 +219,12 @@ pub enum Command {
     SetFilePriority(usize, FilePriority),
     /// Download pieces in order instead of rarest-first.
     SetSequential(bool),
+    /// Initial-seeder mode: reveal pieces one peer at a time.
+    SetSuperSeed(bool),
+    /// Add a tracker URL to this torrent (http, https or udp).
+    AddTracker(String),
+    /// Remove a tracker URL from this torrent.
+    RemoveTracker(String),
     /// Change the connection cap while running.
     SetMaxPeers(usize),
 }
@@ -251,6 +263,12 @@ pub struct Settings {
     /// Try uTP (BEP 29) before TCP and accept uTP connections.
     pub utp: bool,
     pub webui: WebUiSettings,
+    /// IP block list file (ipfilter.dat, PeerGuardian or CIDR lines).
+    pub blocklist: Option<PathBuf>,
+    /// Bandwidth schedule by hour of the week.
+    pub schedule: crate::schedule::Schedule,
+    /// Desktop notification when a download finishes.
+    pub notifications: bool,
 }
 
 /// Whether peer connections are obfuscated with Message Stream Encryption.
@@ -349,6 +367,9 @@ impl Default for Settings {
             encryption: EncryptionMode::default(),
             utp: true,
             webui: WebUiSettings::default(),
+            blocklist: None,
+            schedule: crate::schedule::Schedule::default(),
+            notifications: true,
         }
     }
 }
@@ -395,6 +416,11 @@ pub struct SessionState {
     pub shutdown: bool,
     pub command_tx: Option<tokio::sync::mpsc::UnboundedSender<SessionCommand>>,
     pub feeds: Vec<FeedView>,
+    /// Total download/upload rates, one sample per second, oldest first,
+    /// at most 300 entries (five minutes) for the speed graph.
+    pub rate_history: Vec<(f64, f64)>,
+    /// Ranges loaded from the IP block list, or 0.
+    pub blocklist_ranges: usize,
 }
 
 impl SessionState {

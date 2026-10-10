@@ -94,6 +94,13 @@ pub struct EngineOptions {
     pub extra_peers: Option<mpsc::UnboundedReceiver<Vec<SocketAddr>>>,
     /// Start in sequential (in-order) download mode.
     pub sequential: bool,
+    /// Peers in these ranges are never dialled or accepted.
+    pub blocklist: Option<Arc<crate::blocklist::BlockList>>,
+    /// Trackers this torrent should use instead of the metainfo's list
+    /// (after the user added or removed some); `None` keeps the metainfo's.
+    pub trackers: Option<Vec<String>>,
+    /// Start in super-seeding mode.
+    pub super_seed: bool,
 }
 
 impl Default for EngineOptions {
@@ -114,6 +121,9 @@ impl Default for EngineOptions {
             file_priorities: None,
             extra_peers: None,
             sequential: false,
+            blocklist: None,
+            trackers: None,
+            super_seed: false,
         }
     }
 }
@@ -557,6 +567,9 @@ impl Engine {
                                 return Ok(());
                             }
                             Command::SetMaxPeers(n) => pool.set_max_peers(n),
+                            Command::SetSuperSeed(_)
+                            | Command::AddTracker(_)
+                            | Command::RemoveTracker(_) => {}
                             Command::SetSequential(on) => {
                                 sequential = on;
                                 scheduler.set_sequential(on);
@@ -806,6 +819,7 @@ impl Engine {
                             choked_by_us: false,
                             choking_us: w.backing_off(),
                             outstanding: usize::from(w.busy),
+                            flags: "W".to_string(),
                         }));
                         let connected = peers.len() as u32;
 
@@ -1128,6 +1142,7 @@ async fn snapshot_peers(pool: &PeerPool) -> Vec<PeerSummary> {
             choked_by_us: st.am_choking,
             choking_us: st.they_choke,
             outstanding: st.outstanding.len(),
+            flags: String::new(),
         });
     }
     out.sort_by(|a, b| b.downloaded.cmp(&a.downloaded));

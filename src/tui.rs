@@ -2896,7 +2896,7 @@ mod tests {
             progress,
             choked_by_us: false,
             choking_us: false,
-            outstanding: 0,
+            outstanding: 0, flags: String::new()
         }
     }
 
@@ -3539,7 +3539,7 @@ mod session_tests {
                     progress: 0.5,
                     choked_by_us: false,
                     choking_us: false,
-                    outstanding: 0,
+                    outstanding: 0, flags: String::new()
                 }],
                 log: vec![LogEntry { level: Level::Info, message: format!("log-{id}") }],
                 ..UiState::default()
