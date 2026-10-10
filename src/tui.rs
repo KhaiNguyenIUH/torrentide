@@ -1524,6 +1524,38 @@ fn tail_fit(text: &str, width: usize) -> String {
 }
 
 /// Strip whitespace and the quotes a terminal adds when a file is dragged in.
+/// Split what a terminal types for dropped files: shell-escaped paths
+/// (`My\ File.torrent`) or quoted ones, separated by spaces.
+fn dropped(text: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut cur = String::new();
+    let mut quote = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match (c, quote) {
+            ('\\', None) => cur.extend(chars.next()),
+            ('\'' | '"', None) => quote = Some(c),
+            (c, Some(q)) if c == q => quote = None,
+            (c, None) if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    items.push(std::mem::take(&mut cur));
+                }
+            }
+            (c, _) => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        items.push(cur);
+    }
+    items
+}
+
+/// A dropped or pasted item worth adding without asking.
+fn addable(item: &str) -> bool {
+    let lower = item.to_ascii_lowercase();
+    lower.starts_with("magnet:") || lower.starts_with("http://") || lower.starts_with("https://") || lower.ends_with(".torrent")
+}
+
 fn clean_input(text: &str) -> String {
     text.trim().trim_matches(['"', '\'']).trim().to_string()
 }
@@ -2602,12 +2634,21 @@ impl SessionApp {
         };
     }
 
-    /// Bracketed paste: goes into the open prompt, ignored otherwise.
+    /// Bracketed paste: goes into the open prompt. With no prompt open, a
+    /// dropped `.torrent` file or a pasted link is added straight away.
     fn on_paste(&mut self, pasted: &str) {
         match &mut self.modal {
             Modal::Add(prompt) => {
-                prompt.input.paste(pasted);
+                match dropped(pasted).as_slice() {
+                    [one] => prompt.input.paste(one),
+                    _ => prompt.input.paste(pasted),
+                }
                 prompt.error = None;
+            }
+            Modal::None => {
+                for source in dropped(pasted).into_iter().filter(|s| addable(s)) {
+                    self.send(SessionCommand::Add { source, dir: None });
+                }
             }
             Modal::Text(prompt) => {
                 prompt.input.paste(pasted);
@@ -3170,6 +3211,26 @@ mod tests {
             level,
             message: message.to_string(),
         }
+    }
+
+    #[test]
+    fn dropped_files_are_unescaped_and_split() {
+        assert_eq!(dropped("/Users/a/My\\ File.torrent "), vec!["/Users/a/My File.torrent"]);
+        assert_eq!(dropped("'/a/b c.torrent' /d/e.torrent"), vec!["/a/b c.torrent", "/d/e.torrent"]);
+        assert_eq!(dropped("magnet:?xt=urn:btih:ab&dn=x"), vec!["magnet:?xt=urn:btih:ab&dn=x"]);
+        assert!(addable("/a/b.TORRENT") && addable("magnet:?x") && !addable("hello"));
+    }
+
+    #[test]
+    fn a_drop_with_no_prompt_open_adds_each_torrent() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = SessionApp::new();
+        app.cmd = Some(tx);
+        app.on_paste("/x/One\\ Two.torrent /x/notes.txt magnet:?xt=urn:btih:ab");
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::Add { source: "/x/One Two.torrent".into(), dir: None });
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::Add { source: "magnet:?xt=urn:btih:ab".into(), dir: None });
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(app.modal, Modal::None));
     }
 
     #[test]

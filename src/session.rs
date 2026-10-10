@@ -53,7 +53,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const FETCH_SLOTS: usize = 2;
 const FEED_FETCH_SLOTS: usize = 1;
 const MAX_PENDING_FETCHES: usize = 32;
-const MAX_TORRENT_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_TORRENT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_FEED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FEEDS: usize = 64;
 const MAX_RECENT: usize = 10;
@@ -707,6 +707,10 @@ impl Core {
                 }
             }
             SessionCommand::Add { source, dir } => self.add(source, dir, None).await,
+            SessionCommand::AddTorrent { bytes } if bytes.len() > MAX_TORRENT_BYTES => {
+                self.log(Level::Error, format!("cannot add uploaded torrent: larger than {MAX_TORRENT_BYTES} bytes")).await;
+            }
+            SessionCommand::AddTorrent { bytes } => self.add_loaded("uploaded .torrent".into(), Some(bytes), None).await,
             SessionCommand::Remove { id, delete_data } => self.remove(&id, delete_data).await,
             SessionCommand::MoveQueue { id, up } => self.move_queue(&id, up).await,
             SessionCommand::SetLabel { id, label } => {

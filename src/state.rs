@@ -454,6 +454,8 @@ pub enum SessionCommand {
     /// A `.torrent` path or a `magnet:` URI; `dir` defaults to
     /// [`Settings::download_dir`].
     Add { source: String, dir: Option<PathBuf> },
+    /// The bytes of a `.torrent` file, added to [`Settings::download_dir`].
+    AddTorrent { bytes: Vec<u8> },
     /// Stop the torrent and forget it; with `delete_data` also remove its
     /// downloaded files once the engine has shut down.
     Remove { id: TorrentId, delete_data: bool },

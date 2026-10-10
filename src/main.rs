@@ -209,6 +209,13 @@ async fn main() -> Result<()> {
         Command::WebuiPassword => set_webui_password().await,
         Command::Add { source, output } => {
             use torrust::ipc::Delivery;
+            #[cfg(unix)]
+            {
+                let store = torrust::store::Store::open();
+                if !torrust::ipc::session_running(&store) {
+                    start_service(&store).await?;
+                }
+            }
             match torrust::ipc::send_add(&source, output.as_deref()).await? {
                 Delivery::Delivered => println!("added to running session"),
                 Delivery::Queued => println!("queued; it will start next time torrust runs"),

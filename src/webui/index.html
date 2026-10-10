@@ -18,6 +18,11 @@ input[type=text] { flex:1 1 180px; min-width:0; padding:6px 8px; border:1px soli
 button { padding:5px 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); cursor:pointer; }
 button:hover, button:focus-visible { border-color:var(--acc); outline:none; }
 button.primary { background:var(--acc); border-color:var(--acc); color:#fff; }
+.file { padding:5px 10px; border:1px solid var(--line); border-radius:6px; cursor:pointer; }
+.file:hover, .file:focus-within { border-color:var(--acc); }
+.file input { position:absolute; width:1px; height:1px; opacity:0; }
+#drop { position:fixed; inset:0; display:none; align-items:center; justify-content:center; font-size:22px; background:color-mix(in srgb, var(--bg) 85%, transparent); border:4px dashed var(--acc); color:var(--acc); pointer-events:none; z-index:10; }
+#drop.on { display:flex; }
 .wrap { overflow-x:auto; }
 table { border-collapse:collapse; width:100%; min-width:760px; }
 th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:middle; white-space:nowrap; }
@@ -40,7 +45,9 @@ td.num, th.num { text-align:right; }
 <form id="addform">
   <input type="text" name="source" placeholder="magnet link or https:// .torrent URL" aria-label="Source" required>
   <button class="primary" type="submit">Add</button>
+  <label class="file">Choose .torrent<input type="file" id="pick" accept=".torrent,application/x-bittorrent" multiple></label>
 </form>
+<div id="drop" aria-hidden="true">Drop .torrent to add</div>
 
 <div class="wrap">
 <table>
@@ -84,10 +91,13 @@ function el(tag, cls, text) {
 function showErr(msg) { $("err").textContent = msg || ""; }
 
 function post(path, params) {
-  var body = new URLSearchParams(params || {}).toString();
+  return send(path, "application/x-www-form-urlencoded", new URLSearchParams(params || {}).toString());
+}
+
+function send(path, type, body) {
   return fetch(path, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers: { "Content-Type": type },
     body: body
   }).then(function (r) {
     if (!r.ok) {
@@ -185,6 +195,49 @@ function bind(id, path) {
     post(path, p).then(function () { f.reset(); });
   };
 }
+function upload(files) {
+  var list = Array.prototype.slice.call(files);
+  var bad = list.filter(function (f) { return !/\.torrent$/i.test(f.name); });
+  if (bad.length) showErr("not a .torrent file: " + bad[0].name);
+  return list.filter(function (f) { return bad.indexOf(f) < 0; }).reduce(function (p, f) {
+    return p.then(function () {
+      return send("/api/upload", "application/x-bittorrent", f);
+    });
+  }, Promise.resolve());
+}
+$("pick").onchange = function (ev) {
+  var input = ev.target;
+  upload(input.files).then(function () { input.value = ""; });
+};
+
+var depth = 0;
+function dragging(ev) {
+  return Array.prototype.some.call((ev.dataTransfer && ev.dataTransfer.types) || [], function (t) {
+    return t === "Files" || t === "text/plain" || t === "text/uri-list";
+  });
+}
+document.addEventListener("dragenter", function (ev) {
+  if (!dragging(ev)) return;
+  ev.preventDefault();
+  depth++;
+  $("drop").classList.add("on");
+});
+document.addEventListener("dragover", function (ev) { if (dragging(ev)) ev.preventDefault(); });
+document.addEventListener("dragleave", function (ev) {
+  if (!dragging(ev)) return;
+  if (--depth <= 0) { depth = 0; $("drop").classList.remove("on"); }
+});
+document.addEventListener("drop", function (ev) {
+  if (!dragging(ev)) return;
+  ev.preventDefault();
+  depth = 0;
+  $("drop").classList.remove("on");
+  var dt = ev.dataTransfer;
+  if (dt.files && dt.files.length) { upload(dt.files); return; }
+  var text = (dt.getData("text/uri-list") || dt.getData("text/plain") || "").split("\n")[0].trim();
+  if (text) post("/api/add", { source: text });
+});
+
 bind("addform", "/api/add");
 bind("feedform", "/api/feeds");
 

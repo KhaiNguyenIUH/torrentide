@@ -19,6 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, Semaphore};
 
+use crate::session::MAX_TORRENT_BYTES;
 use crate::state::{Command, SessionCommand, SessionState, WebUiSettings};
 
 const INDEX_HTML: &str = include_str!("webui/index.html");
@@ -290,7 +291,9 @@ async fn respond(
         if !same_origin(&req) {
             return error(403, "cross-origin request refused");
         }
-        body = match tokio::time::timeout(io_timeout, read_body(stream, &req, leftover)).await {
+        let upload = req.method == "POST" && req.target.split(['?', '#']).next() == Some("/api/upload");
+        let max = if upload { MAX_TORRENT_BYTES } else { MAX_BODY };
+        body = match tokio::time::timeout(io_timeout, read_body(stream, &req, leftover, max)).await {
             Ok(Ok(b)) => b,
             Ok(Err(resp)) => return resp,
             Err(_) => return error(408, "request timed out"),
@@ -351,6 +354,7 @@ async fn read_body(
     stream: &mut TcpStream,
     req: &Request,
     mut body: Vec<u8>,
+    max: usize,
 ) -> Result<Vec<u8>, Vec<u8>> {
     if req.header("transfer-encoding").is_some() {
         return Err(error(400, "chunked bodies are not supported"));
@@ -359,7 +363,7 @@ async fn read_body(
         None => 0,
         Some(v) => v.parse().map_err(|_| error(400, "bad content-length"))?,
     };
-    if len > MAX_BODY {
+    if len > max {
         return Err(error(413, "body too large"));
     }
     while body.len() < len {
@@ -733,6 +737,12 @@ async fn route(req: &Request, body: &[u8], state: &RwLock<SessionState>) -> Vec<
                 dir: None,
             };
             dispatch(&*state.read().await, cmd)
+        }
+        ("POST", ["api", "upload"]) => {
+            if body.first() != Some(&b'd') {
+                return error(400, "not a .torrent file");
+            }
+            dispatch(&*state.read().await, SessionCommand::AddTorrent { bytes: body.to_vec() })
         }
         ("POST", ["api", "feeds"]) => {
             let f = form(body);
@@ -1129,6 +1139,57 @@ mod tests {
             MAX_BODY + 1
         );
         assert_eq!(raw(addr, req.as_bytes()).await.0, 413);
+    }
+
+    fn upload_req(addr: SocketAddr, body: &[u8], extra: &str) -> Vec<u8> {
+        let mut r = format!(
+            "POST /api/upload HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\n\
+             Content-Type: application/x-bittorrent\r\nContent-Length: {}\r\n{extra}\r\n",
+            body.len()
+        )
+        .into_bytes();
+        r.extend_from_slice(body);
+        r
+    }
+
+    #[tokio::test]
+    async fn upload_dispatches_torrent_bytes() {
+        let (state, mut rx) = fake_state(true);
+        let addr = start_open(state, IO_TIMEOUT).await;
+
+        let mut bytes = b"d4:infod4:name1:aee".to_vec();
+        bytes.extend(std::iter::repeat(0xffu8).take(MAX_BODY * 3));
+        assert_eq!(raw(addr, &upload_req(addr, &bytes, COOKIE)).await.0, 200);
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::AddTorrent { bytes });
+
+        for bad in [&b""[..], b"hello", b"l4:spame"] {
+            assert_eq!(raw(addr, &upload_req(addr, bad, COOKIE)).await.0, 400);
+        }
+        assert_eq!(raw(addr, &upload_req(addr, b"de", "")).await.0, 401);
+        let cross = format!(
+            "POST /api/upload HTTP/1.1\r\nHost: {addr}\r\n{COOKIE}Origin: http://evil.example\r\nContent-Length: 2\r\n\r\nde"
+        );
+        assert_eq!(raw(addr, cross.as_bytes()).await.0, 403);
+        let nogate = format!("POST /api/upload HTTP/1.1\r\nHost: {addr}\r\n{COOKIE}Content-Length: 2\r\n\r\nde");
+        assert_eq!(raw(addr, nogate.as_bytes()).await.0, 403);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn upload_size_limit_is_per_route() {
+        let (state, mut rx) = fake_state(true);
+        let addr = start_open(state, IO_TIMEOUT).await;
+
+        let head = |path: &str, len: usize| {
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: {addr}\r\n{COOKIE}Origin: http://{addr}\r\nContent-Length: {len}\r\n\r\n"
+            )
+        };
+        let r = raw(addr, head("/api/upload", MAX_TORRENT_BYTES + 1).as_bytes()).await;
+        assert_eq!(r.0, 413);
+        assert_eq!(raw(addr, head("/api/add", MAX_BODY + 1).as_bytes()).await.0, 413);
+        assert_eq!(raw(addr, head("/api/feeds", MAX_BODY + 1).as_bytes()).await.0, 413);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -274,6 +274,24 @@ async fn two_torrents_download_and_seed() {
 }
 
 #[tokio::test]
+async fn uploaded_torrent_bytes_are_added_once() {
+    let fx = Fixture::new("up", 5);
+    let dl = temp_dir("dl");
+    fx.write_to(&dl);
+    let t = mock_tracker(None).await;
+    let raw = fx.torrent(&format!("http://{}/announce", t.addr));
+    let id = Metainfo::from_bytes(&raw).unwrap().infohash.to_hex();
+
+    let h = Session::start_in(Store::at(&temp_dir("home")), settings(&dl)).await.unwrap();
+    h.command().send(SessionCommand::AddTorrent { bytes: b"d3:bar".to_vec() }).unwrap();
+    h.command().send(SessionCommand::AddTorrent { bytes: raw.clone() }).unwrap();
+    h.command().send(SessionCommand::AddTorrent { bytes: raw }).unwrap();
+    wait_for(&h, "uploaded torrent seeding", 30, |st| is_done(torrent_state(st, &id))).await;
+    assert_eq!(h.state().read().await.torrents.len(), 1);
+    quit(h).await;
+}
+
+#[tokio::test]
 async fn restart_keeps_uploaded_and_stopped() {
     let (one, two) = (Fixture::new("one", 3), Fixture::new("two", 4));
     let dl = temp_dir("dl");

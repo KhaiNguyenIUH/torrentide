@@ -48,7 +48,8 @@ Builds a v1 `.torrent` from a file or directory (files sorted by path, symlinks 
 
 `torrust` with no subcommand attaches the TUI to a background session, starting one first if none is running (Unix; the service logs to `torrust.log` in the data directory). `q` or Ctrl-C closes the TUI and leaves downloads and the web UI running; `Q` or `torrust stop` stops the session. On Windows the session runs inside the TUI process instead. The session runs many torrents at once behind one listening port and one DHT node. Finished torrents keep seeding until the ratio target (default 2.0; 0 seeds forever) is reached, then stop. The ratio is cumulative across restarts and applies to torrents started after you change it.
 
-- `torrust add` hands a torrent to the running session over a Unix socket (`torrust.sock` in the data directory). With no session running (or on Windows) it is queued and starts the next time `torrust` runs.
+- `torrust add` hands a torrent to the running session over a Unix socket (`torrust.sock` in the data directory), starting the background session first if none is running. On Windows it is queued and starts the next time `torrust` runs.
+- Dropping `.torrent` files (or pasting a magnet link) onto the TUI adds them straight away; inside the add prompt (`a`) a dropped path fills the field.
 - Settings, torrents and their state live in the data directory: `~/Library/Application Support/torrust` on macOS, `$XDG_DATA_HOME/torrust` (or `~/.local/share/torrust`) on Linux, `%APPDATA%\torrust` on Windows. Set `TORRUST_HOME` to use another directory.
 - Speed limits (bytes per second, 0 = unlimited) can be set globally and per torrent. Uploads use tit-for-tat choking: 4 unchoke slots plus one optimistic, re-evaluated every 10 s.
 - The listen port (default 6881, falling back to a free port if busy) is forwarded through the router with NAT-PMP, then UPnP, when port forwarding is on. Changes to the port, DHT and forwarding settings apply after a restart.
@@ -77,9 +78,10 @@ Subscribe to RSS or Atom feeds (`http(s)` only) and torrents matching your inclu
 
 ## Web UI
 
-A small browser interface for the session, off by default. It takes links and magnets only and never shows or accepts local paths or folders.
+A small browser interface for the session, off by default. It never shows or accepts local paths or folders.
 
 - Without a password it listens on `127.0.0.1` only and needs an access token: the session creates a random 128-bit token (kept in `webui.token` in the data directory, readable by you alone), logs the one-time URL `http://127.0.0.1:PORT/?token=...` and prints it when `torrust session` starts. Opening that URL stores the token in an HttpOnly cookie and redirects to `/`. Scripts can send `Authorization: Bearer <token>` instead. With a password it still listens on `127.0.0.1` only, and asks for the password (HTTP Basic, any user name) on every request; the `Host` header must be an IP address or `localhost`, which blocks DNS rebinding. The settings screen has "Web UI on LAN (needs password)" (`webui_lan`): only with that on and a password set does it listen on all interfaces, and the session then logs a warning, because the connection is plain HTTP. After five wrong passwords from one address it answers 429 for a growing time (up to 15 minutes). To reach it from another machine prefer an SSH tunnel over LAN mode: `ssh -L 8080:127.0.0.1:8080 host`, then open `http://127.0.0.1:8080/` locally. Use a reverse proxy with TLS if you must expose it beyond that.
+- Besides links and magnets it takes a `.torrent` file from the "Choose .torrent" button or dropped anywhere on the page (up to 10 MiB, `POST /api/upload` with the raw bytes); uploads always use the default download folder.
 - Enable it and set the password without putting the password in shell history:
 
       torrust webui-password        # type the password and press Enter
