@@ -1135,7 +1135,7 @@ pub fn run_tui(state: Arc<RwLock<UiState>>) -> Result<()> {
 
 /// Key bindings advertised in the session footer and help overlay. The most
 /// used keys come first because the footer is clipped on narrow terminals.
-const SESSION_KEYS: [(&str, &str); 23] = [
+const SESSION_KEYS: [(&str, &str); 24] = [
     ("a", "add"),
     ("s", "start/stop"),
     ("p", "pause"),
@@ -1157,7 +1157,8 @@ const SESSION_KEYS: [(&str, &str); 23] = [
     ("+ / -", "file priority"),
     ("PgUp/PgDn", "log"),
     ("?", "keys"),
-    ("q", "quit"),
+    ("q", "close (downloads keep running)"),
+    ("Q", "stop torrust"),
     ("Enter/Esc", "confirm/cancel"),
 ];
 
@@ -1168,7 +1169,7 @@ const SESSION_FOOTER_KEYS: [(&str, &str); 15] = [
     ("p", "pause"),
     ("d", "remove"),
     ("?", "keys"),
-    ("q", "quit"),
+    ("q", "close"),
     ("R", "recheck"),
     ("[/]", "queue"),
     ("l", "limits"),
@@ -1185,7 +1186,7 @@ const TRACKERS_FOOTER_KEYS: [(&str, &str); 8] = [
     ("d", "remove tracker"),
     ("j/k", "trackers"),
     ("?", "keys"),
-    ("q", "quit"),
+    ("q", "close"),
     ("tab", "panel"),
     ("U", "super-seed"),
     ("o", "settings"),
@@ -1197,7 +1198,7 @@ const FEEDS_FOOTER_KEYS: [(&str, &str); 8] = [
     ("r", "refresh"),
     ("j/k", "feeds"),
     ("?", "keys"),
-    ("q", "quit"),
+    ("q", "close"),
     ("tab", "panel"),
     ("o", "settings"),
 ];
@@ -2348,7 +2349,7 @@ impl SessionApp {
         self.view.log_scroll = 0;
     }
 
-    fn quit_session(&mut self) {
+    fn stop_session(&mut self) {
         self.send(SessionCommand::Quit);
         self.quit = true;
     }
@@ -2368,8 +2369,9 @@ impl SessionApp {
             return;
         }
         match key.code {
-            KeyCode::Char('c') if ctrl => self.quit_session(),
-            KeyCode::Char('q') => self.quit_session(),
+            KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('Q') => self.stop_session(),
             KeyCode::Char('j') | KeyCode::Down => self.move_torrent(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_torrent(-1),
             KeyCode::Char('J') => {
@@ -2632,6 +2634,10 @@ fn render_session(frame: &mut Frame, snapshot: &Result<SessionState, String>, ap
     }
     frame.render_widget(Block::default().style(base_style()), area);
 
+    // Sync even when too small to draw, so keys like `Q` still reach the session.
+    if let Ok(state) = snapshot {
+        app.sync(state);
+    }
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_too_small(frame, area);
         return;
@@ -2643,7 +2649,6 @@ fn render_session(frame: &mut Frame, snapshot: &Result<SessionState, String>, ap
             return;
         }
     };
-    app.sync(state);
 
     let footer_rows = if state.warning.is_some() { 2 } else { 1 };
     let strip_rows = if area.height >= STRIP_MIN_HEIGHT { STRIP_ROWS } else { 0 };
@@ -3133,7 +3138,7 @@ fn run_session_loop(state: Arc<RwLock<SessionState>>) -> Result<()> {
 /// Run the multi-torrent session UI until the user quits.
 ///
 /// Blocks the calling thread; the terminal is restored before returning.
-/// Quitting sends [`SessionCommand::Quit`] so the session persists and exits.
+/// `q` only closes the UI; `Q` sends [`SessionCommand::Quit`] to stop the session.
 pub fn run_session_tui(state: Arc<RwLock<SessionState>>) -> Result<()> {
     std::thread::Builder::new()
         .name("torrust-session-tui".to_string())
@@ -4320,9 +4325,14 @@ mod session_tests {
     }
 
     #[test]
-    fn quit_sends_quit_command() {
+    fn q_closes_the_ui_and_capital_q_stops_the_session() {
         let (mut app, mut rx) = app_with(&session(&["a"]));
         app.on_key(ch('q'));
+        assert!(app.quit);
+        assert!(rx.try_recv().is_err());
+
+        let (mut app, mut rx) = app_with(&session(&["a"]));
+        app.on_key(ch('Q'));
         assert!(app.quit);
         assert_eq!(rx.try_recv().unwrap(), SessionCommand::Quit);
     }
@@ -4513,7 +4523,7 @@ mod session_tests {
         }
         let mut app = SessionApp::new();
         let screen = draw(80, 24, &state, &mut app);
-        assert!(screen.contains("[movies] n") && screen.contains("quit"), "{screen}");
+        assert!(screen.contains("[movies] n") && screen.contains("close"), "{screen}");
     }
 
     fn draw(width: u16, height: u16, state: &SessionState, app: &mut SessionApp) -> String {
@@ -4541,7 +4551,7 @@ mod session_tests {
                     app.set_tab(tab);
                     let screen = draw(w, h, &state, &mut app);
                     assert!(screen.contains("add"), "{w}x{h} {tab:?}:\n{screen}");
-                    assert!(screen.contains("quit") || w < 80, "{w}x{h}:\n{screen}");
+                    assert!(screen.contains("close") || w < 80, "{w}x{h}:\n{screen}");
                     if ids.is_empty() {
                         assert!(screen.contains("No torrents"), "{screen}");
                     }
@@ -4556,7 +4566,7 @@ mod session_tests {
         state.port_status = "port 6881 forwarded".to_string();
         let mut app = SessionApp::new();
         let screen = draw(80, 24, &state, &mut app);
-        for needle in ["2 torrents", "port 6881", "name-a", "name-b", "Status", "Ratio", "1.25", "downloading", "General", "Infohash", "quit"] {
+        for needle in ["2 torrents", "port 6881", "name-a", "name-b", "Status", "Ratio", "1.25", "downloading", "General", "Infohash", "close"] {
             assert!(screen.contains(needle), "missing {needle}:\n{screen}");
         }
         app.set_tab(Tab::Trackers);
@@ -4978,7 +4988,7 @@ mod session_tests {
             for tab in Tab::ALL {
                 app.set_tab(tab);
                 let screen = draw(w, h, &state, &mut app);
-                assert!(screen.contains("quit") || w < 80, "{w}x{h} {tab:?}\n{screen}");
+                assert!(screen.contains("close") || w < 80, "{w}x{h} {tab:?}\n{screen}");
                 if h >= 24 {
                     assert!(screen.contains("pk"), "{w}x{h} {tab:?}\n{screen}");
                     assert!(screen.contains("downloading*"), "{w}x{h} {tab:?}\n{screen}");

@@ -151,6 +151,18 @@ impl SessionHandle {
 
 pub struct Session;
 
+async fn termination() {
+    #[cfg(unix)]
+    if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+        return;
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 impl Session {
     /// Run a session until quit. With `ui` the TUI owns the terminal;
     /// otherwise a summary line is printed periodically and Ctrl-C quits.
@@ -186,6 +198,18 @@ impl Session {
         }
     }
 
+    /// Run a session as a background service: no UI and no output, until
+    /// `STOP`, SIGINT or SIGTERM.
+    pub async fn run_background(settings: Settings) -> Result<()> {
+        let handle = Self::start(settings).await?;
+        let tx = handle.command();
+        tokio::spawn(async move {
+            termination().await;
+            let _ = tx.send(SessionCommand::Quit);
+        });
+        handle.wait().await
+    }
+
     pub async fn start(settings: Settings) -> Result<SessionHandle> {
         Self::start_in(Store::open(), settings).await
     }
@@ -207,7 +231,7 @@ impl Session {
             ..Default::default()
         }));
 
-        let ipc = crate::ipc::listen(&store, tx.clone())?;
+        let ipc = crate::ipc::listen(&store, tx.clone(), Arc::clone(&state))?;
 
         let (mut listener, mut port, ephemeral) = match TcpListener::bind(("0.0.0.0", settings.listen_port)).await {
             Ok(l) => {

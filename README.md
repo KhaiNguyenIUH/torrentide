@@ -40,12 +40,13 @@ Builds a v1 `.torrent` from a file or directory (files sorted by path, symlinks 
 
 ## Session mode
 
-    torrust                      # multi-torrent TUI
+    torrust                      # multi-torrent TUI (starts the background service if needed)
+    torrust stop                 # stop the background service
     torrust session --no-tui     # headless, prints a summary every few seconds; Ctrl-C quits
     torrust add <file.torrent|magnet:?...> [-o DIR]
     torrust webui-password       # enable the web UI and set its password from stdin
 
-`torrust` with no subcommand runs a persistent session: many torrents at once behind one listening port and one DHT node. Finished torrents keep seeding until the ratio target (default 2.0; 0 seeds forever) is reached, then stop. The ratio is cumulative across restarts and applies to torrents started after you change it.
+`torrust` with no subcommand attaches the TUI to a background session, starting one first if none is running (Unix; the service logs to `torrust.log` in the data directory). `q` or Ctrl-C closes the TUI and leaves downloads and the web UI running; `Q` or `torrust stop` stops the session. On Windows the session runs inside the TUI process instead. The session runs many torrents at once behind one listening port and one DHT node. Finished torrents keep seeding until the ratio target (default 2.0; 0 seeds forever) is reached, then stop. The ratio is cumulative across restarts and applies to torrents started after you change it.
 
 - `torrust add` hands a torrent to the running session over a Unix socket (`torrust.sock` in the data directory). With no session running (or on Windows) it is queued and starts the next time `torrust` runs.
 - Settings, torrents and their state live in the data directory: `~/Library/Application Support/torrust` on macOS, `$XDG_DATA_HOME/torrust` (or `~/.local/share/torrust`) on Linux, `%APPDATA%\torrust` on Windows. Set `TORRUST_HOME` to use another directory.

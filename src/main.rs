@@ -31,7 +31,14 @@ enum Command {
         /// Print a summary line every few seconds instead of starting the TUI
         #[arg(long)]
         no_tui: bool,
+
+        /// Run as the background service the TUI attaches to
+        #[arg(long, hide = true)]
+        background: bool,
     },
+
+    /// Stop the background torrust session
+    Stop,
 
     /// Set the web UI password (read from stdin) and enable the web UI
     ///
@@ -170,19 +177,34 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let command = cli.command.unwrap_or(Command::Session { no_tui: false });
+    let command = cli.command.unwrap_or(Command::Session { no_tui: false, background: false });
     let uses_tui = matches!(
         command,
-        Command::Session { no_tui: false }
+        Command::Session { no_tui: false, .. }
             | Command::Download { no_tui: false, .. }
             | Command::Import { no_tui: false, start: true, .. }
     );
     init_tracing(uses_tui);
 
     match command {
-        Command::Session { no_tui } => {
-            let settings = torrust::store::Store::open().load_settings();
-            torrust::session::Session::run(settings, !no_tui).await
+        Command::Session { no_tui, background } => {
+            let store = torrust::store::Store::open();
+            if background {
+                return torrust::session::Session::run_background(store.load_settings()).await;
+            }
+            #[cfg(unix)]
+            if !no_tui {
+                return attach_tui(&store).await;
+            }
+            torrust::session::Session::run(store.load_settings(), !no_tui).await
+        }
+        Command::Stop => {
+            if torrust::ipc::stop(&torrust::store::Store::open()).await {
+                println!("stopping torrust");
+            } else {
+                println!("no torrust session is running");
+            }
+            Ok(())
         }
         Command::WebuiPassword => set_webui_password().await,
         Command::Add { source, output } => {
@@ -281,6 +303,48 @@ impl Drop for EchoOff {
         #[cfg(unix)]
         let _ = std::process::Command::new("stty").arg(&self.0).status();
     }
+}
+
+#[cfg(unix)]
+async fn attach_tui(store: &torrust::store::Store) -> Result<()> {
+    if !torrust::ipc::session_running(store) {
+        start_service(store).await?;
+    }
+    let (state, sender) = torrust::ipc::attach(store).await?;
+    let ui = Arc::clone(&state);
+    let result = tokio::task::spawn_blocking(move || torrust::tui::run_session_tui(ui))
+        .await
+        .context("the TUI task panicked")?;
+    // Let a final command (`Q` sends Quit) reach the session before exiting.
+    state.write().await.command_tx = None;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), sender).await;
+    result
+}
+
+/// Start `torrust session --background`, detached from this terminal, and
+/// wait for it to answer on the socket.
+#[cfg(unix)]
+async fn start_service(store: &torrust::store::Store) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(std::env::current_exe().context("locating the torrust binary")?)
+        .args(["session", "--background"])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("starting the background session")?;
+    for _ in 0..100 {
+        if torrust::ipc::session_running(store) {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            bail!("the background session exited ({status}); see {}", log_path().display());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    bail!("the background session did not start within 10 s; see {}", log_path().display())
 }
 
 async fn set_webui_password() -> Result<()> {

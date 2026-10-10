@@ -7,7 +7,9 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DownloadState {
     Connecting,
     FetchingMetadata,
@@ -48,7 +50,7 @@ impl DownloadState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentSummary {
     pub name: String,
     pub infohash: String,
@@ -129,7 +131,7 @@ impl TorrentSummary {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerSummary {
     pub addr: String,
     pub downloaded: u64,
@@ -146,7 +148,7 @@ pub struct PeerSummary {
 }
 
 /// One file of a (usually multi-file) torrent, with its download progress.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSummary {
     /// Position in the torrent's file list; stable across snapshots.
     pub index: usize,
@@ -164,7 +166,7 @@ pub struct FileSummary {
 
 /// Download priority of one file. Pieces of higher-priority files are
 /// requested first; `Skip` files are not downloaded at all.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum FilePriority {
     Skip,
     Low,
@@ -202,7 +204,7 @@ impl FileSummary {
 /// The sender lives in [`UiState::command_tx`] so the UI thread can clone it
 /// out of any snapshot; the engine drains it once per tick. Sending is
 /// synchronous and never blocks, so it is safe to call from key handling.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     /// Stop requesting new blocks. In-flight responses are still processed.
     Pause,
@@ -233,7 +235,7 @@ pub enum Command {
 pub type TorrentId = String;
 
 /// Session-wide preferences, edited from the settings screen and persisted.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     /// Where new torrents are saved unless `add` names a directory.
     pub download_dir: PathBuf,
@@ -276,7 +278,7 @@ pub struct Settings {
 }
 
 /// Whether peer connections are obfuscated with Message Stream Encryption.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EncryptionMode {
     /// Plaintext only; encrypted inbound connections are refused.
     Disabled,
@@ -307,7 +309,7 @@ impl EncryptionMode {
 }
 
 /// The optional browser interface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebUiSettings {
     /// Off by default: it is a remote-control surface.
     pub enabled: bool,
@@ -334,7 +336,7 @@ impl Default for WebUiSettings {
 pub type FeedId = u64;
 
 /// One RSS/Atom subscription as the UI sees it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FeedView {
     pub id: FeedId,
     pub url: String,
@@ -384,7 +386,7 @@ impl Default for Settings {
 }
 
 /// One torrent as the session TUI sees it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentView {
     pub id: TorrentId,
     /// The engine's own snapshot (summary, peers, log). Its `command_tx` is
@@ -407,7 +409,7 @@ pub struct TorrentView {
 
 /// Everything the session TUI renders. Published by the session every
 /// 250 ms; the TUI only ever reads a cloned snapshot.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionState {
     /// In the order they were added.
     pub torrents: Vec<TorrentView>,
@@ -423,6 +425,7 @@ pub struct SessionState {
     pub warning: Option<String>,
     /// Set when the session is shutting down; the TUI exits its loop.
     pub shutdown: bool,
+    #[serde(skip)]
     pub command_tx: Option<tokio::sync::mpsc::UnboundedSender<SessionCommand>>,
     pub feeds: Vec<FeedView>,
     /// Total download/upload rates, one sample per second, oldest first,
@@ -446,7 +449,7 @@ impl SessionState {
 }
 
 /// Commands the session TUI (and `torrust add` over IPC) send to the session.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SessionCommand {
     /// A `.torrent` path or a `magnet:` URI; `dir` defaults to
     /// [`Settings::download_dir`].
@@ -475,7 +478,7 @@ pub enum SessionCommand {
     Quit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Level {
     Trace,
     Debug,
@@ -496,13 +499,13 @@ impl Level {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub level: Level,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UiState {
     pub torrent: Option<TorrentSummary>,
     pub peers: Vec<PeerSummary>,
@@ -516,6 +519,7 @@ pub struct UiState {
     pub shutdown: bool,
     /// Channel into the engine for [`Command`]. `None` in tests and before the
     /// engine starts; the TUI disables its control keys while it is absent.
+    #[serde(skip)]
     pub command_tx: Option<tokio::sync::mpsc::UnboundedSender<Command>>,
 }
 

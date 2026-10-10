@@ -7,7 +7,9 @@ use std::fmt;
 use std::process::Command;
 use std::sync::OnceLock;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Slot {
     #[default]
     Normal,
@@ -62,7 +64,7 @@ fn err<T>(msg: impl Into<String>) -> Result<T, ScheduleError> {
     Err(ScheduleError(msg.into()))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schedule {
     pub enabled: bool,
     pub grid: [[Slot; 24]; 7],
