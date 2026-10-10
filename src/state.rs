@@ -246,6 +246,85 @@ pub struct Settings {
     /// running in total (downloading + seeding). 0 means no limit.
     pub max_active_downloads: usize,
     pub max_active_torrents: usize,
+    /// Peer connection encryption (BEP 8 / MSE).
+    pub encryption: EncryptionMode,
+    /// Try uTP (BEP 29) before TCP and accept uTP connections.
+    pub utp: bool,
+    pub webui: WebUiSettings,
+}
+
+/// Whether peer connections are obfuscated with Message Stream Encryption.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EncryptionMode {
+    /// Plaintext only; encrypted inbound connections are refused.
+    Disabled,
+    /// Encrypt when the peer supports it, fall back to plaintext.
+    #[default]
+    Prefer,
+    /// Encrypted connections only.
+    Require,
+}
+
+impl EncryptionMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            EncryptionMode::Disabled => "disabled",
+            EncryptionMode::Prefer => "prefer",
+            EncryptionMode::Require => "require",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "disabled" | "off" => Some(EncryptionMode::Disabled),
+            "prefer" | "enabled" | "on" => Some(EncryptionMode::Prefer),
+            "require" | "required" | "forced" => Some(EncryptionMode::Require),
+            _ => None,
+        }
+    }
+}
+
+/// The optional browser interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebUiSettings {
+    /// Off by default: it is a remote-control surface.
+    pub enabled: bool,
+    pub port: u16,
+    /// Without a password the web UI only listens on 127.0.0.1.
+    pub password: Option<String>,
+}
+
+impl Default for WebUiSettings {
+    fn default() -> Self {
+        WebUiSettings {
+            enabled: false,
+            port: 8080,
+            password: None,
+        }
+    }
+}
+
+/// Stable identifier of an RSS feed within a session.
+pub type FeedId = u64;
+
+/// One RSS/Atom subscription as the UI sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeedView {
+    pub id: FeedId,
+    pub url: String,
+    /// Feed title once fetched.
+    pub title: Option<String>,
+    /// Case-insensitive substrings: an item is added when its title contains
+    /// any `include` term (or `include` is empty) and no `exclude` term.
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    /// Save folder for matched items; `None` uses the default.
+    pub dir: Option<PathBuf>,
+    /// Unix seconds of the last successful fetch.
+    pub last_fetch: Option<u64>,
+    pub last_error: Option<String>,
+    /// Titles of the most recently added items, newest first.
+    pub recent: Vec<String>,
 }
 
 impl Default for Settings {
@@ -267,6 +346,9 @@ impl Default for Settings {
             port_forwarding: true,
             lsd: true,
             move_completed_dir: None,
+            encryption: EncryptionMode::default(),
+            utp: true,
+            webui: WebUiSettings::default(),
         }
     }
 }
@@ -312,6 +394,7 @@ pub struct SessionState {
     /// Set when the session is shutting down; the TUI exits its loop.
     pub shutdown: bool,
     pub command_tx: Option<tokio::sync::mpsc::UnboundedSender<SessionCommand>>,
+    pub feeds: Vec<FeedView>,
 }
 
 impl SessionState {
@@ -347,6 +430,11 @@ pub enum SessionCommand {
     SetLabel { id: TorrentId, label: Option<String> },
     /// Move a torrent's data to another folder and keep seeding from there.
     MoveData { id: TorrentId, dir: PathBuf },
+    /// Subscribe to an RSS/Atom feed.
+    AddFeed { url: String, include: Vec<String>, exclude: Vec<String>, dir: Option<PathBuf> },
+    RemoveFeed(FeedId),
+    /// Fetch every feed now instead of waiting for its interval.
+    RefreshFeeds,
     SetSettings(Settings),
     /// Persist everything and shut down.
     Quit,

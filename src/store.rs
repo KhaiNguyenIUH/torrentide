@@ -455,6 +455,7 @@ mod tests {
             max_active_downloads: 2,
             max_active_torrents: 4,
             move_completed_dir: Some(PathBuf::from("/done")),
+            ..Settings::default()
         };
         store.save_settings(&s).unwrap();
         assert_eq!(store.load_settings(), s);

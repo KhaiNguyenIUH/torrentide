@@ -400,6 +400,11 @@ impl Core {
 
     async fn handle(&mut self, cmd: SessionCommand) {
         match cmd {
+            SessionCommand::AddFeed { .. }
+            | SessionCommand::RemoveFeed(_)
+            | SessionCommand::RefreshFeeds => {
+                self.log(Level::Warn, "RSS feeds are not available yet").await
+            }
             SessionCommand::Add { source, dir } => self.add(source, dir).await,
             SessionCommand::Remove { id, delete_data } => self.remove(&id, delete_data).await,
             SessionCommand::MoveQueue { id, up } => self.move_queue(&id, up).await,
