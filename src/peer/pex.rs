@@ -11,6 +11,16 @@ use crate::bencode::{self, Value};
 /// The extended-message id we ask peers to use for `ut_pex` messages to us.
 pub const OUR_PEX_ID: u8 = 1;
 
+/// The extended-message id we ask peers to use for `ut_metadata` requests to
+/// us (BEP 9). Distinct from [`OUR_PEX_ID`].
+pub const OUR_METADATA_ID: u8 = 2;
+
+/// BEP 9 metadata piece size.
+pub const METADATA_PIECE: usize = 16 * 1024;
+
+/// Metadata requests answered per peer per minute; more get a reject.
+pub const METADATA_MAX_PER_MINUTE: u32 = 64;
+
 /// Most addresses we will take from one incoming message, per list. Real
 /// clients send at most 50 per direction; this leaves slack without letting a
 /// peer make us dial thousands of addresses.
@@ -35,13 +45,20 @@ pub struct ExtHandshake {
     /// The peer's listen port, which is the only way to learn it for an
     /// inbound connection (its source port is ephemeral).
     pub port: Option<u16>,
+    /// The id the peer wants `ut_metadata` replies sent under.
+    pub metadata_id: Option<u8>,
 }
 
-/// Our extended handshake. `port` is our listen port; 0 omits it.
-pub fn encode_handshake(port: u16) -> Vec<u8> {
+/// Our extended handshake. `port` is our listen port; 0 omits it. A
+/// `metadata_size` advertises that we serve `ut_metadata` (BEP 9).
+pub fn encode_handshake(port: u16, metadata_size: Option<usize>) -> Vec<u8> {
     let mut m = BTreeMap::new();
     m.insert(b"ut_pex".to_vec(), Value::Int(OUR_PEX_ID as i64));
     let mut d = BTreeMap::new();
+    if let Some(size) = metadata_size {
+        m.insert(b"ut_metadata".to_vec(), Value::Int(OUR_METADATA_ID as i64));
+        d.insert(b"metadata_size".to_vec(), Value::Int(size as i64));
+    }
     d.insert(b"m".to_vec(), Value::Dict(m));
     if port != 0 {
         d.insert(b"p".to_vec(), Value::Int(port as i64));
@@ -62,7 +79,43 @@ pub fn decode_handshake(payload: &[u8]) -> Option<ExtHandshake> {
         .get_int_opt("p")
         .and_then(|p| u16::try_from(p).ok())
         .filter(|&p| p != 0);
-    Some(ExtHandshake { pex_id, port })
+    let metadata_id = v
+        .get_opt("m")
+        .and_then(|m| m.get_int_opt("ut_metadata"))
+        .and_then(|i| u8::try_from(i).ok())
+        .filter(|&i| i != 0);
+    Some(ExtHandshake {
+        pex_id,
+        port,
+        metadata_id,
+    })
+}
+
+/// The piece a `ut_metadata` request asks for, or `None` for any other
+/// message type or malformed input.
+pub fn metadata_request(payload: &[u8]) -> Option<u32> {
+    let (v, _) = bencode::decode_partial(payload).ok()?;
+    if v.get_int_opt("msg_type")? != 0 {
+        return None;
+    }
+    u32::try_from(v.get_int_opt("piece")?).ok()
+}
+
+/// Answer a request for `piece` of the raw `info` dict: a data message for a
+/// piece in range, a reject otherwise.
+pub fn metadata_reply(info: &[u8], piece: u32) -> Vec<u8> {
+    let start = piece as usize * METADATA_PIECE;
+    let mut d = BTreeMap::new();
+    d.insert(b"piece".to_vec(), Value::Int(piece as i64));
+    if start >= info.len() {
+        d.insert(b"msg_type".to_vec(), Value::Int(2));
+        return bencode::encode(&Value::Dict(d));
+    }
+    d.insert(b"msg_type".to_vec(), Value::Int(1));
+    d.insert(b"total_size".to_vec(), Value::Int(info.len() as i64));
+    let mut out = bencode::encode(&Value::Dict(d));
+    out.extend_from_slice(&info[start..(start + METADATA_PIECE).min(info.len())]);
+    out
 }
 
 /// A decoded `ut_pex` message, already filtered to dialable addresses.
@@ -226,10 +279,37 @@ mod tests {
 
     #[test]
     fn handshake_round_trips_with_pex_and_port() {
-        let hs = decode_handshake(&encode_handshake(51413)).unwrap();
-        assert_eq!(hs, ExtHandshake { pex_id: Some(OUR_PEX_ID), port: Some(51413) });
-        let hs = decode_handshake(&encode_handshake(0)).unwrap();
+        let hs = decode_handshake(&encode_handshake(51413, None)).unwrap();
+        assert_eq!(
+            hs,
+            ExtHandshake { pex_id: Some(OUR_PEX_ID), port: Some(51413), metadata_id: None }
+        );
+        let hs = decode_handshake(&encode_handshake(0, Some(40_000))).unwrap();
         assert_eq!(hs.port, None);
+        assert_eq!(hs.metadata_id, Some(OUR_METADATA_ID));
+    }
+
+    #[test]
+    fn metadata_replies_cover_data_and_out_of_range() {
+        let info: Vec<u8> = (0..METADATA_PIECE + 100).map(|i| i as u8).collect();
+        let req = |p: i64| {
+            let mut d = BTreeMap::new();
+            d.insert(b"msg_type".to_vec(), Value::Int(0));
+            d.insert(b"piece".to_vec(), Value::Int(p));
+            bencode::encode(&Value::Dict(d))
+        };
+        assert_eq!(metadata_request(&req(1)), Some(1));
+        assert_eq!(metadata_request(&req(-1)), None);
+        assert_eq!(metadata_request(b"junk"), None);
+        let data = metadata_reply(&info, 1);
+        let (v, rest) = bencode::decode_partial(&data).unwrap();
+        assert_eq!(v.get_int_opt("msg_type"), Some(1));
+        assert_eq!(v.get_int_opt("total_size"), Some(info.len() as i64));
+        assert_eq!(rest, &info[METADATA_PIECE..]);
+        let reject = metadata_reply(&info, 2);
+        let (v, rest) = bencode::decode_partial(&reject).unwrap();
+        assert_eq!(v.get_int_opt("msg_type"), Some(2));
+        assert!(rest.is_empty());
     }
 
     #[test]

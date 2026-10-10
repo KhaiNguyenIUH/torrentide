@@ -21,6 +21,7 @@ use tokio::sync::{oneshot, watch, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::bencode::{self, Value};
+use crate::blocklist::BlockList;
 use crate::dht::DhtNode;
 use crate::engine::{self, Engine, EngineOptions};
 use crate::lsd::Lsd;
@@ -30,6 +31,7 @@ use crate::peer::{mse, PeerStream};
 use crate::portmap;
 use crate::ratelimit::{Limits, RateLimiter};
 use crate::rss::{self, FeedState, ParsedFeed};
+use crate::schedule::{self, Effective};
 use crate::state::{
     human_bytes, Command, DownloadState, EncryptionMode, FeedId, FeedView, FilePriority, FileSummary, Level, SessionCommand,
     SessionState, Settings, TorrentSummary, TorrentView, UiState,
@@ -52,9 +54,11 @@ const MAX_FEED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FEEDS: usize = 64;
 const MAX_RECENT: usize = 10;
 const MAX_TITLE: usize = 200;
+const RATE_HISTORY: usize = 300;
 
 type Inbound = (PeerStream, SocketAddr, Handshake);
 type Routes = Arc<Mutex<HashMap<[u8; 20], UnboundedSender<Inbound>>>>;
+type SharedBlocklist = Arc<Mutex<Option<Arc<BlockList>>>>;
 type MappingRx = watch::Receiver<Option<std::result::Result<portmap::Mapping, String>>>;
 
 struct Running {
@@ -166,6 +170,14 @@ impl Session {
 
     pub async fn start_in(store: Store, mut settings: Settings) -> Result<SessionHandle> {
         secure_password(&mut settings);
+        if settings.schedule.utc_offset_minutes == 0 {
+            if let Some(offset) = schedule::system_utc_offset_minutes() {
+                settings.schedule.utc_offset_minutes = offset;
+                if let Err(e) = store.save_settings(&settings) {
+                    tracing::warn!("saving settings: {e:#}");
+                }
+            }
+        }
         let (tx, rx) = unbounded_channel();
         let state = Arc::new(RwLock::new(SessionState {
             settings: settings.clone(),
@@ -213,7 +225,9 @@ impl Session {
             routes: Arc::default(),
             pending: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
             encryption: settings.encryption,
+            blocklist: Arc::default(),
         };
+        let blocklist = Arc::clone(&router.blocklist);
         let routes = Arc::clone(&router.routes);
         let mut accepts = vec![tokio::spawn(accept_loop(listener, router.clone()))];
         match bind_v6(port) {
@@ -326,6 +340,10 @@ impl Session {
             next_feed_id: 1,
             fetch_tx,
             fetch_slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
+            blocklist,
+            last_eff: None,
+            sched_paused: BTreeSet::new(),
+            last_sample: Instant::now(),
             tasks: accepts.into_iter().chain(mapper).chain(ipc).collect(),
         };
         core.init().await;
@@ -353,10 +371,16 @@ struct Router {
     routes: Routes,
     pending: Arc<Semaphore>,
     encryption: EncryptionMode,
+    blocklist: SharedBlocklist,
 }
 
 impl Router {
     fn spawn_classify(&self, stream: PeerStream, addr: SocketAddr, transport: &'static str) {
+        let blocked = self.blocklist.lock().unwrap().as_ref().is_some_and(|b| b.contains(addr.ip()));
+        if blocked {
+            tracing::debug!(peer = %addr, transport, "inbound refused: blocked address");
+            return;
+        }
         let Ok(permit) = Arc::clone(&self.pending).try_acquire_owned() else {
             return;
         };
@@ -378,7 +402,7 @@ impl Router {
         let mut prefix = [0u8; 20];
         stream.read_exact(&mut prefix).await?;
         let mode = self.encryption;
-        let (stream, hs, crypto) = if prefix[0] == 19 && prefix[1..] == *b"BitTorrent protocol" {
+        let (stream, mut hs, crypto) = if prefix[0] == 19 && prefix[1..] == *b"BitTorrent protocol" {
             anyhow::ensure!(mode != EncryptionMode::Require, "plaintext peer refused: encryption required");
             let hs = handshake_incoming(&mut (&prefix[..]).chain(&mut stream)).await?;
             (stream, hs, "plain")
@@ -394,6 +418,8 @@ impl Router {
         let tx = self.routes.lock().unwrap().get(&hs.infohash).cloned();
         let tx = tx.context("no torrent for that infohash")?;
         tracing::debug!(peer = %addr, transport, crypto, "inbound classified");
+        hs.utp = transport == "utp";
+        hs.encrypted = crypto == "rc4";
         let _ = tx.send((stream, addr, hs));
         Ok(())
     }
@@ -437,6 +463,12 @@ struct Core {
     fetch_tx: UnboundedSender<Fetched>,
     /// Bounds concurrent feed and torrent downloads.
     fetch_slots: Arc<Semaphore>,
+    blocklist: SharedBlocklist,
+    /// What the schedule last applied.
+    last_eff: Option<Effective>,
+    /// Torrents the schedule paused, so only those are resumed when the slot ends.
+    sched_paused: BTreeSet<String>,
+    last_sample: Instant,
     /// Accept loop, port-mapping renewal and IPC listener.
     tasks: Vec<JoinHandle<()>>,
 }
@@ -464,6 +496,8 @@ impl Core {
                 Err(err) => self.log(Level::Warn, format!("skipping stored torrent {id}: {err:#}")).await,
             }
         }
+        self.load_blocklist().await;
+        self.apply_schedule().await;
         for e in &self.entries {
             let state = if e.rec.stopped { DownloadState::Stopped } else { DownloadState::Queued };
             stub_ui(e, state).await;
@@ -533,6 +567,7 @@ impl Core {
                 _ = ticker.tick() => {
                     self.poll_feeds();
                     self.poll_entries().await;
+                    self.apply_schedule().await;
                     self.rebalance().await;
                     if last_persist.elapsed() >= PERSIST_EVERY {
                         last_persist = std::time::Instant::now();
@@ -862,6 +897,8 @@ impl Core {
             label: None,
             sequential: false,
             moved: false,
+            trackers: None,
+            super_seed: false,
         };
         let (ih, meta, magnet) = if source.starts_with("magnet:") {
             let m = Magnet::parse(source)?;
@@ -919,9 +956,9 @@ impl Core {
                 _ => None,
             },
             sequential: e.rec.sequential,
-            blocklist: None,
-            trackers: None,
-            super_seed: false,
+            blocklist: self.blocklist.lock().unwrap().clone(),
+            trackers: e.rec.trackers.clone(),
+            super_seed: e.rec.super_seed,
         };
         let ui = Arc::clone(&e.ui);
         let dir = e.rec.dir.clone();
@@ -985,11 +1022,12 @@ impl Core {
     async fn rebalance(&mut self) {
         let (max_dl, max_all) = (self.settings.max_active_downloads, self.settings.max_active_torrents);
         let n = self.entries.len();
+        let off = self.last_eff.is_some_and(|e| e.uploads_paused);
         let (mut cand, mut done, mut plan) = (vec![false; n], vec![false; n], vec![false; n]);
         let (mut dl, mut all) = (0, 0);
         for i in 0..n {
             let e = &self.entries[i];
-            cand[i] = Self::is_candidate(e).await;
+            cand[i] = !off && Self::is_candidate(e).await;
             if !cand[i] {
                 continue;
             }
@@ -1101,8 +1139,6 @@ impl Core {
     async fn set_settings(&mut self, mut new: Settings) {
         secure_password(&mut new);
         let old = std::mem::replace(&mut self.settings, new.clone());
-        self.gdown.set_rate(new.download_limit);
-        self.gup.set_rate(new.upload_limit);
         if new.max_peers != old.max_peers {
             for e in &self.entries {
                 if let Some(run) = &e.run {
@@ -1123,7 +1159,92 @@ impl Core {
             self.log(Level::Info, "ratio target applies to torrents started from now on").await;
         }
         self.state.write().await.settings = new;
+        if self.settings.blocklist != old.blocklist {
+            self.load_blocklist().await;
+            self.log(Level::Info, "block list applies to inbound peers now and to running torrents after they restart").await;
+        }
+        self.apply_schedule().await;
         self.rebalance().await;
+    }
+
+    async fn load_blocklist(&mut self) {
+        let Some(path) = self.settings.blocklist.clone() else {
+            *self.blocklist.lock().unwrap() = None;
+            self.state.write().await.blocklist_ranges = 0;
+            return;
+        };
+        let p = path.clone();
+        let loaded = tokio::task::spawn_blocking(move || BlockList::load(p))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r);
+        let list = match loaded {
+            Ok((list, stats)) => {
+                self.log(
+                    Level::Info,
+                    format!(
+                        "block list {}: {} ranges, {} lines skipped",
+                        path.display(),
+                        stats.ranges,
+                        stats.skipped_lines
+                    ),
+                )
+                .await;
+                Some(Arc::new(list))
+            }
+            Err(e) => {
+                self.log(Level::Error, format!("block list not loaded: {e:#}")).await;
+                None
+            }
+        };
+        self.state.write().await.blocklist_ranges = list.as_ref().map_or(0, |l| l.len());
+        *self.blocklist.lock().unwrap() = list;
+    }
+
+    /// Apply the schedule's current slot: global rates, plus pausing downloads or
+    /// stopping every engine, remembering only what the schedule itself paused.
+    async fn apply_schedule(&mut self) {
+        let sched = &self.settings.schedule;
+        let eff = sched.effective_limits(unix_now(), self.settings.download_limit, self.settings.upload_limit);
+        self.gdown.set_rate(eff.down);
+        self.gup.set_rate(eff.up);
+        let prev = self.last_eff.replace(eff);
+        if prev != Some(eff) && (prev.is_some() || self.settings.schedule.enabled) {
+            self.log(Level::Info, format!("schedule: {}", describe(&eff))).await;
+        }
+        for i in 0..self.entries.len() {
+            let id = self.entries[i].rec.id.clone();
+            let running = self.entries[i].run.is_some();
+            if !running {
+                self.sched_paused.remove(&id);
+            }
+            let facts = TorrentFacts {
+                running,
+                complete: Self::is_complete(&self.entries[i]).await,
+                state: self.entries[i].ui.read().await.torrent.as_ref().map(|t| t.state),
+                sched_paused: self.sched_paused.contains(&id),
+            };
+            match schedule_action(&eff, &facts) {
+                ScheduleAction::None => {}
+                ScheduleAction::Pause => {
+                    if let Some(run) = &self.entries[i].run {
+                        let _ = run.cmd.send(Command::Pause);
+                        self.sched_paused.insert(id);
+                    }
+                }
+                ScheduleAction::Resume => {
+                    if let Some(run) = &self.entries[i].run {
+                        let _ = run.cmd.send(Command::Resume);
+                    }
+                    self.sched_paused.remove(&id);
+                }
+                ScheduleAction::Stop => {
+                    self.stop_entry(i, false).await;
+                    stub_ui(&self.entries[i], DownloadState::Queued).await;
+                    self.sched_paused.remove(&id);
+                }
+            }
+        }
     }
 
     async fn poll_entries(&mut self) {
@@ -1192,7 +1313,7 @@ impl Core {
                 dirty = true;
             }
 
-            let before = (e.rec.priorities.clone(), e.rec.sequential);
+            let before = (e.rec.priorities.clone(), e.rec.sequential, e.rec.trackers.clone(), e.rec.super_seed);
             refresh(e).await;
             let finished = !e.rec.moved
                 && e.run.is_some()
@@ -1203,10 +1324,17 @@ impl Core {
             if finished {
                 e.rec.moved = true;
             }
-            if dirty || finished || (e.rec.priorities.clone(), e.rec.sequential) != before {
+            if dirty
+                || finished
+                || (e.rec.priorities.clone(), e.rec.sequential, e.rec.trackers.clone(), e.rec.super_seed) != before
+            {
                 self.save(i).await;
             }
             if finished {
+                if self.settings.notifications {
+                    let name = self.entries[i].ui.read().await.torrent.as_ref().map(|t| t.name.clone());
+                    notify_complete(name.as_deref().unwrap_or(&self.entries[i].rec.id));
+                }
                 if let Some(to) = self.settings.move_completed_dir.clone() {
                     self.move_data(i, to).await;
                 }
@@ -1262,6 +1390,10 @@ impl Core {
         st.torrents = views;
         st.download_rate = down;
         st.upload_rate = up;
+        if self.last_sample.elapsed() >= Duration::from_secs(1) {
+            self.last_sample = Instant::now();
+            push_sample(&mut st.rate_history, (down, up));
+        }
     }
 
     async fn save(&self, i: usize) {
@@ -1303,6 +1435,93 @@ impl Core {
     }
 }
 
+fn push_sample(history: &mut Vec<(f64, f64)>, sample: (f64, f64)) {
+    history.push(sample);
+    if history.len() > RATE_HISTORY {
+        history.drain(..history.len() - RATE_HISTORY);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ScheduleAction {
+    None,
+    Pause,
+    Resume,
+    Stop,
+}
+
+struct TorrentFacts {
+    running: bool,
+    complete: bool,
+    state: Option<DownloadState>,
+    sched_paused: bool,
+}
+
+/// What the current slot asks of one torrent. Idempotent, so it can run every tick.
+fn schedule_action(eff: &Effective, t: &TorrentFacts) -> ScheduleAction {
+    if eff.uploads_paused {
+        return if t.running { ScheduleAction::Stop } else { ScheduleAction::None };
+    }
+    if eff.downloads_paused {
+        let pausable = t.running && !t.complete && t.state == Some(DownloadState::Downloading) && !t.sched_paused;
+        return if pausable { ScheduleAction::Pause } else { ScheduleAction::None };
+    }
+    if t.sched_paused {
+        ScheduleAction::Resume
+    } else {
+        ScheduleAction::None
+    }
+}
+
+fn describe(e: &Effective) -> String {
+    let rate = |n: u64| if n == 0 { "unlimited".to_owned() } else { format!("{}/s", human_bytes(n)) };
+    if e.uploads_paused {
+        "all transfers off".to_owned()
+    } else if e.downloads_paused {
+        format!("seed only, up {}", rate(e.up))
+    } else {
+        format!("down {}, up {}", rate(e.down), rate(e.up))
+    }
+}
+
+/// An AppleScript string literal body: backslash and quote escaped, line breaks and other control characters flattened to spaces.
+fn applescript_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn notify_complete(name: &str) {
+    const TITLE: &str = "torrust: download complete";
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("osascript");
+        c.arg("-e").arg(format!(
+            "display notification \"{}\" with title \"{TITLE}\"",
+            applescript_escape(name)
+        ));
+        c
+    } else if cfg!(target_os = "linux") {
+        let mut c = std::process::Command::new("notify-send");
+        c.arg("--").arg(TITLE).arg(name.replace(|c: char| c.is_control(), " "));
+        c
+    } else {
+        return;
+    };
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    if let Ok(mut child) = cmd.spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
 fn make_entry(rec: Record, ih: InfoHash, meta: Option<Arc<Metainfo>>, magnet: Option<Magnet>) -> Entry {
     Entry {
         down: RateLimiter::new(rec.download_limit),
@@ -1330,6 +1549,7 @@ async fn stub_ui(e: &Entry, state: DownloadState) {
         download_dir: e.rec.dir.display().to_string(),
         uploaded: e.rec.uploaded,
         sequential: e.rec.sequential,
+        super_seeding: e.rec.super_seed,
         ..Default::default()
     };
     let snap = e.rec.snapshot.as_ref();
@@ -1339,7 +1559,7 @@ async fn stub_ui(e: &Entry, state: DownloadState) {
             t.total_length = meta.total_length;
             t.piece_length = meta.piece_length;
             t.piece_count = meta.piece_count() as u32;
-            t.trackers = meta.announce_list.clone();
+            t.trackers = e.rec.trackers.clone().unwrap_or_else(|| meta.announce_list.clone());
             let snap = snap.filter(|s| s.piece_count == t.piece_count);
             t.files = meta
                 .files
@@ -1376,6 +1596,10 @@ async fn refresh(e: &mut Entry) {
     if let Some(t) = &ui.torrent {
         e.rec.uploaded = e.rec.uploaded.max(t.uploaded);
         e.rec.sequential = t.sequential;
+        e.rec.super_seed = t.super_seeding;
+        if let Some(meta) = &e.meta {
+            e.rec.trackers = Some(t.trackers.clone()).filter(|l| *l != meta.announce_list);
+        }
         if !t.files.is_empty() {
             e.rec.priorities = Some(t.files.iter().map(|f| f.priority).collect());
             e.rec.snapshot = Some(Snapshot {
@@ -1587,6 +1811,44 @@ fn summary_line(st: &SessionState) -> String {
 mod tests {
     use super::*;
     use crate::storage::sha1_bytes;
+
+    #[test]
+    fn applescript_escaping() {
+        assert_eq!(applescript_escape(r#"a "b" \c"#), r#"a \"b\" \\c"#);
+        assert_eq!(applescript_escape("x\ny\r\tz"), "x y  z");
+        assert_eq!(applescript_escape("日本語 ✓ é"), "日本語 ✓ é");
+        assert_eq!(applescript_escape(r#"\" ; do shell script "rm""#), r#"\\\" ; do shell script \"rm\""#);
+    }
+
+    #[test]
+    fn rate_history_caps() {
+        let mut h = Vec::new();
+        for i in 0..RATE_HISTORY + 7 {
+            push_sample(&mut h, (i as f64, 0.0));
+        }
+        assert_eq!(h.len(), RATE_HISTORY);
+        assert_eq!(h[0].0, 7.0);
+        assert_eq!(h[RATE_HISTORY - 1].0, (RATE_HISTORY + 6) as f64);
+    }
+
+    #[test]
+    fn schedule_actions_follow_the_slot() {
+        let eff = |dp, up| Effective { down: 0, up: 0, downloads_paused: dp, uploads_paused: up };
+        let t = |running, complete, state, sched_paused| TorrentFacts { running, complete, state, sched_paused };
+        let dl = Some(DownloadState::Downloading);
+        let seed_only = eff(true, false);
+        assert_eq!(schedule_action(&seed_only, &t(true, false, dl, false)), ScheduleAction::Pause);
+        assert_eq!(schedule_action(&seed_only, &t(true, false, dl, true)), ScheduleAction::None);
+        assert_eq!(schedule_action(&seed_only, &t(true, false, Some(DownloadState::Paused), false)), ScheduleAction::None);
+        assert_eq!(schedule_action(&seed_only, &t(true, true, Some(DownloadState::Seeding), false)), ScheduleAction::None);
+        assert_eq!(schedule_action(&seed_only, &t(false, false, dl, false)), ScheduleAction::None);
+        let off = eff(true, true);
+        assert_eq!(schedule_action(&off, &t(true, true, Some(DownloadState::Seeding), false)), ScheduleAction::Stop);
+        assert_eq!(schedule_action(&off, &t(false, false, None, false)), ScheduleAction::None);
+        let normal = eff(false, false);
+        assert_eq!(schedule_action(&normal, &t(true, false, Some(DownloadState::Paused), true)), ScheduleAction::Resume);
+        assert_eq!(schedule_action(&normal, &t(true, false, Some(DownloadState::Paused), false)), ScheduleAction::None);
+    }
 
     #[test]
     fn fetched_info_becomes_a_torrent_with_the_magnet_trackers() {

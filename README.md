@@ -65,6 +65,15 @@ Subscribe to RSS or Atom feeds (`http(s)` only) and torrents matching your inclu
 - Feeds and the items already seen are kept in `feeds.bencode` in the data directory, so a restart never re-adds anything.
 - A session also adds an `http(s)` link to a `.torrent` (up to 10 MiB), which is how feed items and the web UI's add box deliver torrents. `torrust add` accepts them too.
 
+## Block list, schedule and notifications
+
+- **Block list**: set `blocklist` in the settings to a text file of IP ranges (PeerGuardian `name:1.2.3.4-1.2.3.9`, eMule `1.2.3.4 - 1.2.3.9 , 100 , name` or `a-b` lines, IPv4 and IPv6; `#` comments; gzip not supported). Inbound connections from listed addresses are dropped before the handshake. Torrents already running use the new list after they restart. Load results and skipped lines show in the log; a missing file is logged as an error and no list is applied.
+- **Schedule**: a 7x24 grid of slots, `normal`, `limited` (uses the schedule's own down/up limits), `seedonly` (downloads pause, seeding continues) and `off` (every torrent stops). Rules read `<days> <HH-HH> <slot>`, for example `weekdays 09-18 limited`, `sat,sun 00-24 normal`, `mon-fri 22-06 off` (end hour exclusive, a start after the end runs past midnight). Days are `mon`..`sun`, ranges such as `fri-mon`, lists, `weekdays`, `weekend` or `all`. Times use the UTC offset stored with the schedule, filled from the system on first start. Only torrents the schedule paused or stopped are resumed or restarted when the slot ends; ones you paused or stopped stay as they are. Slot changes are logged.
+- **Notifications**: when a torrent finishes downloading, a desktop notification is shown (`osascript` on macOS, `notify-send` on Linux if installed, nothing on Windows). Turn off with `notifications` in the settings. Torrents that were already complete when the session started do not notify.
+- **Super-seeding**: for a torrent you are the first seeder of, `SetSuperSeed` makes the engine reveal pieces one peer at a time so each uploaded piece spreads before the next is offered. The setting is kept per torrent across restarts.
+- **Adding trackers**: `AddTracker` and `RemoveTracker` change a torrent's tracker list while it runs; the changed list is saved and replaces the one from the .torrent on restart. Stopped torrents ignore the command.
+- **Peer flags**: `E` encrypted, `P` uTP, `I` incoming, `X` found via PEX, `L` local discovery, `H` DHT, `F` fast extension, `W` web seed.
+
 ## Web UI
 
 A small browser interface for the session, off by default. It takes links and magnets only and never shows or accepts local paths or folders.

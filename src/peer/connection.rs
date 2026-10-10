@@ -61,6 +61,15 @@ pub enum ToPeer {
     Extended { ext_id: u8, payload: Vec<u8> },
     /// Send a raw Bitfield message. Sent internally when the connection comes up.
     SendBitfield(Vec<u8>),
+    /// BEP 6 stand-ins for a full or an empty Bitfield.
+    SendHaveAll,
+    SendHaveNone,
+    /// BEP 6: refuse a request we will not serve.
+    Reject {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
     /// A block we read from local storage in response to a peer's `Request`.
     /// Sent internally; callers should not need this.
     Serve {
@@ -81,6 +90,12 @@ pub enum FromPeer {
     },
     Bitfield(Bitfield),
     Have(u32),
+    /// BEP 6: the peer will not serve a block we asked for.
+    Rejected {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
     /// The peer choked (`true`) or unchoked (`false`) us.
     Choking(bool),
     /// The peer became interested in what we have.
@@ -128,7 +143,19 @@ pub struct PeerState {
     pub listen_port: Option<u16>,
     /// When we last accepted a `ut_pex` message from this peer.
     pub last_pex_in: Option<Instant>,
+    /// Both sides set the Fast extension bit (BEP 6).
+    pub fast: bool,
+    /// Pieces the peer lets us request while it chokes us (BEP 6).
+    pub allowed_fast: HashSet<u32>,
+    /// We sent this peer an empty bitfield and reveal pieces one at a time.
+    pub super_seeded: bool,
+    /// The id this peer wants `ut_metadata` replies under.
+    pub metadata_id: Option<u8>,
+    /// Start of the current minute and the metadata requests seen in it.
+    pub metadata_window: (Instant, u32),
 }
+
+const MAX_ALLOWED_FAST: usize = 512;
 
 impl PeerState {
     pub fn new(piece_count: usize) -> Self {
@@ -148,6 +175,11 @@ impl PeerState {
             pex_id: None,
             listen_port: None,
             last_pex_in: None,
+            fast: false,
+            allowed_fast: HashSet::new(),
+            super_seeded: false,
+            metadata_id: None,
+            metadata_window: (Instant::now(), 0),
         }
     }
 
@@ -168,13 +200,15 @@ pub struct PeerHandle {
     pub tx: mpsc::UnboundedSender<ToPeer>,
     /// True for a connection we accepted rather than dialled.
     pub inbound: bool,
+    pub utp: bool,
+    pub encrypted: bool,
 }
 
 impl PeerHandle {
     /// True if this peer currently has the given piece and is willing to send it.
     pub async fn can_request(&self, index: u32) -> bool {
         let s = self.state.lock().await;
-        !s.they_choke && s.interested && s.bitfield.has(index)
+        (!s.they_choke || s.allowed_fast.contains(&index)) && s.interested && s.bitfield.has(index)
     }
 }
 
@@ -191,6 +225,50 @@ pub struct Seeder {
     pub piece_count: usize,
     pub piece_len: u32,
     pub last_piece_len: u32,
+    /// Super-seeding (BEP 16) is in effect: new connections get an empty
+    /// bitfield and the pool reveals pieces one at a time.
+    pub super_seed: bool,
+}
+
+/// What a connection offers over the BEP 10 extension protocol. No `port`
+/// means no extension protocol at all (private torrents).
+#[derive(Clone, Default)]
+pub struct Ext {
+    pub port: Option<u16>,
+    /// The raw `info` dict to serve over `ut_metadata` (BEP 9).
+    pub info: Option<Arc<Vec<u8>>>,
+}
+
+impl From<Option<u16>> for Ext {
+    fn from(port: Option<u16>) -> Self {
+        Ext { port, info: None }
+    }
+}
+
+/// Connection facts known once the handshake is done.
+#[derive(Clone, Copy)]
+struct Link {
+    inbound: bool,
+    fast: bool,
+    utp: bool,
+    encrypted: bool,
+}
+
+fn initial_message(seeder: Option<&Seeder>, piece_count: usize, fast: bool) -> (Option<ToPeer>, bool) {
+    match seeder {
+        Some(s) if s.super_seed && s.bitfield.full(piece_count) => {
+            let empty = if fast {
+                ToPeer::SendHaveNone
+            } else {
+                ToPeer::SendBitfield(vec![0; piece_count.div_ceil(8).max(1)])
+            };
+            (Some(empty), true)
+        }
+        Some(s) if fast && s.bitfield.full(piece_count) => (Some(ToPeer::SendHaveAll), false),
+        Some(s) => (Some(ToPeer::SendBitfield(encode_bitfield(&s.bitfield))), false),
+        None if fast => (Some(ToPeer::SendHaveNone), false),
+        None => (None, false),
+    }
 }
 
 impl Seeder {
@@ -307,7 +385,7 @@ async fn negotiate(
     } else {
         stream
     };
-    wire::handshake_outgoing(&mut stream, &infohash.0, true, false, pex).await?;
+    wire::handshake_outgoing(&mut stream, &infohash.0, true, true, pex).await?;
     let hs = wire::handshake_incoming(&mut stream).await?;
     if hs.infohash != infohash.0 {
         return Err(anyhow!(
@@ -352,7 +430,7 @@ pub async fn connect(
     inbound_tx: mpsc::UnboundedSender<FromPeer>,
     limits: Limits,
     auto_unchoke: bool,
-    pex_port: Option<u16>,
+    ext: impl Into<Ext>,
 ) -> Result<PeerHandle> {
     connect_with(
         addr,
@@ -362,7 +440,7 @@ pub async fn connect(
         inbound_tx,
         limits,
         auto_unchoke,
-        pex_port,
+        ext,
         &Transport::default(),
     )
     .await
@@ -378,11 +456,12 @@ pub async fn connect_with(
     inbound_tx: mpsc::UnboundedSender<FromPeer>,
     limits: Limits,
     auto_unchoke: bool,
-    pex_port: Option<u16>,
+    ext: impl Into<Ext>,
     transport: &Transport,
 ) -> Result<PeerHandle> {
+    let ext = ext.into();
     let mode = transport.encryption;
-    let pex = pex_port.is_some();
+    let pex = ext.port.is_some();
     let mut utp_used = false;
     let mut dialled = None;
 
@@ -441,10 +520,10 @@ pub async fn connect_with(
         piece_count,
         seeder,
         inbound_tx,
-        false,
         limits,
         auto_unchoke,
-        pex_port.filter(|_| hs.supports_extended()),
+        Ext { port: ext.port.filter(|_| hs.supports_extended()), info: ext.info },
+        Link { inbound: false, fast: hs.supports_fast(), utp: utp_used, encrypted },
     )
     .await?;
 
@@ -463,7 +542,7 @@ pub async fn accept(
     inbound_tx: mpsc::UnboundedSender<FromPeer>,
     limits: Limits,
     auto_unchoke: bool,
-    pex_port: Option<u16>,
+    ext: impl Into<Ext>,
 ) -> Result<PeerHandle> {
     let addr = stream
         .peer_addr()
@@ -480,7 +559,7 @@ pub async fn accept(
         inbound_tx,
         limits,
         auto_unchoke,
-        pex_port,
+        ext,
     )
     .await
 }
@@ -497,8 +576,9 @@ pub async fn accept_handshaken(
     inbound_tx: mpsc::UnboundedSender<FromPeer>,
     limits: Limits,
     auto_unchoke: bool,
-    pex_port: Option<u16>,
+    ext: impl Into<Ext>,
 ) -> Result<PeerHandle> {
+    let ext = ext.into();
     if hs.infohash != infohash.0 {
         return Err(anyhow!(
             "peer {addr} wants infohash {} but we are serving {}",
@@ -508,7 +588,7 @@ pub async fn accept_handshaken(
     }
     let (rd, mut wr) = split(stream);
     // The dialer waits for our half of the handshake before sending anything.
-    wire::handshake_outgoing(&mut wr, &infohash.0, true, false, pex_port.is_some()).await?;
+    wire::handshake_outgoing(&mut wr, &infohash.0, true, true, ext.port.is_some()).await?;
 
     // Announce acceptance before the tasks take ownership of the sender.
     let _ = inbound_tx.send(FromPeer::Accepted(addr));
@@ -522,10 +602,10 @@ pub async fn accept_handshaken(
         piece_count,
         seeder,
         inbound_tx,
-        true,
         limits,
         auto_unchoke,
-        pex_port.filter(|_| hs.supports_extended()),
+        Ext { port: ext.port.filter(|_| hs.supports_extended()), info: ext.info },
+        Link { inbound: true, fast: hs.supports_fast(), utp: hs.utp, encrypted: hs.encrypted },
     )
     .await
 }
@@ -539,16 +619,22 @@ async fn spawn_tasks<S>(
     piece_count: usize,
     seeder: SharedSeeder,
     inbound_tx: mpsc::UnboundedSender<FromPeer>,
-    inbound: bool,
     limits: Limits,
     auto_unchoke: bool,
-    pex_port: Option<u16>,
+    ext: Ext,
+    link: Link,
 ) -> Result<PeerHandle>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<ToPeer>();
-    let state = Arc::new(Mutex::new(PeerState::new(piece_count)));
+    let (first, super_seeded) = initial_message(seeder.read().unwrap().as_ref(), piece_count, link.fast);
+    let mut initial_state = PeerState::new(piece_count);
+    initial_state.fast = link.fast;
+    initial_state.super_seeded = super_seeded;
+    let state = Arc::new(Mutex::new(initial_state));
+    let ext_enabled = ext.port.is_some();
+    let reader_info = ext.info.clone();
     let reader_state = Arc::clone(&state);
     let reader_tx = peer_tx.clone();
     let close = Arc::new(Notify::new());
@@ -580,6 +666,10 @@ where
                 Ok(Ok(msg)) => {
                     let mut st = reader_state.lock().await;
                     st.last_activity = Instant::now();
+                    if msg.is_fast() && !st.fast {
+                        err_msg = Some("fast extension message without negotiating it".into());
+                        break;
+                    }
 
                     let mut forward: Option<FromPeer> = None;
                     let mut reply: Option<ToPeer> = None;
@@ -589,7 +679,9 @@ where
                         Message::KeepAlive => {}
                         Message::Choke => {
                             st.they_choke = true;
-                            st.outstanding.clear();
+                            if !st.fast {
+                                st.outstanding.clear();
+                            }
                             forward = Some(FromPeer::Choking(true));
                         }
                         Message::Unchoke => {
@@ -642,13 +734,17 @@ where
                             begin,
                             length,
                         } => {
-                            if !st.am_choking {
-                                let hit = reader_seeder
+                            let hit = if st.am_choking {
+                                None
+                            } else {
+                                reader_seeder
                                     .read()
                                     .unwrap()
                                     .as_ref()
-                                    .and_then(|s| s.read_requested(index, begin, length));
-                                if let Some((i, b, data)) = hit {
+                                    .and_then(|s| s.read_requested(index, begin, length))
+                            };
+                            match hit {
+                                Some((i, b, data)) => {
                                     st.uploaded += data.len() as u64;
                                     st.window_up += data.len() as u64;
                                     reply = Some(ToPeer::Serve {
@@ -657,16 +753,69 @@ where
                                         block: data,
                                     });
                                 }
+                                None if st.fast => {
+                                    reply = Some(ToPeer::Reject {
+                                        index,
+                                        begin,
+                                        length,
+                                    });
+                                }
+                                None => {}
+                            }
+                        }
+                        Message::HaveAll => {
+                            let bf = Bitfield::all(piece_count);
+                            st.bitfield = bf.clone();
+                            forward = Some(FromPeer::Bitfield(bf));
+                        }
+                        Message::HaveNone => {
+                            let bf = Bitfield::with_pieces(piece_count);
+                            st.bitfield = bf.clone();
+                            forward = Some(FromPeer::Bitfield(bf));
+                        }
+                        Message::SuggestPiece { .. } => {}
+                        Message::AllowedFast { index } => {
+                            if (index as usize) < piece_count && st.allowed_fast.len() < MAX_ALLOWED_FAST {
+                                st.allowed_fast.insert(index);
+                            }
+                        }
+                        Message::RejectRequest {
+                            index,
+                            begin,
+                            length,
+                        } => {
+                            if st.outstanding.remove(&(index, begin)).is_some() {
+                                forward = Some(FromPeer::Rejected {
+                                    index,
+                                    begin,
+                                    length,
+                                });
                             }
                         }
                         Message::Cancel { .. } => {}
                         Message::Port { .. } => {}
                         Message::Extended { ext_id, payload } => {
-                            if pex_port.is_some() {
+                            if ext_enabled {
                                 if ext_id == 0 {
                                     if let Some(h) = pex::decode_handshake(&payload) {
                                         st.pex_id = h.pex_id;
                                         st.listen_port = h.port;
+                                        st.metadata_id = h.metadata_id;
+                                    }
+                                } else if ext_id == pex::OUR_METADATA_ID {
+                                    if let (Some(info), Some(reply_id), Some(piece)) =
+                                        (&reader_info, st.metadata_id, pex::metadata_request(&payload))
+                                    {
+                                        if st.metadata_window.0.elapsed() >= Duration::from_secs(60) {
+                                            st.metadata_window = (Instant::now(), 0);
+                                        }
+                                        st.metadata_window.1 += 1;
+                                        let served: &[u8] =
+                                            if st.metadata_window.1 > pex::METADATA_MAX_PER_MINUTE { &[] } else { info };
+                                        reply = Some(ToPeer::Extended {
+                                            ext_id: reply_id,
+                                            payload: pex::metadata_reply(served, piece),
+                                        });
                                     }
                                 } else if ext_id == pex::OUR_PEX_ID
                                     && st
@@ -714,16 +863,16 @@ where
 
     // ---- writer ----
     let writer_state = Arc::clone(&state);
-    if let Some(port) = pex_port {
+    // Queue the initial Bitfield (or its BEP 6 stand-in) before the loop
+    // starts so it is always the first thing the peer sees from us.
+    if let Some(m) = first {
+        let _ = peer_tx.send(m);
+    }
+    if let Some(port) = ext.port {
         let _ = peer_tx.send(ToPeer::Extended {
             ext_id: 0,
-            payload: pex::encode_handshake(port),
+            payload: pex::encode_handshake(port, ext.info.as_ref().map(|i| i.len())),
         });
-    }
-    // Queue the initial Bitfield before the loop starts so it is always the
-    // first thing the peer sees from us.
-    if let Some(s) = seeder.read().unwrap().as_ref() {
-        let _ = peer_tx.send(ToPeer::SendBitfield(encode_bitfield(&s.bitfield)));
     }
     tokio::spawn(async move {
         while let Some(cmd) = peer_rx.recv().await {
@@ -793,6 +942,17 @@ where
                 ToPeer::Close => break,
                 ToPeer::Extended { ext_id, payload } => Message::Extended { ext_id, payload },
                 ToPeer::SendBitfield(bytes) => Message::Bitfield { bits: bytes },
+                ToPeer::SendHaveAll => Message::HaveAll,
+                ToPeer::SendHaveNone => Message::HaveNone,
+                ToPeer::Reject {
+                    index,
+                    begin,
+                    length,
+                } => Message::RejectRequest {
+                    index,
+                    begin,
+                    length,
+                },
                 ToPeer::Serve { index, begin, block } => {
                     limits.acquire_up(block.len()).await;
                     Message::Piece {
@@ -818,7 +978,9 @@ where
         peer_id,
         state,
         tx: peer_tx,
-        inbound,
+        inbound: link.inbound,
+        utp: link.utp,
+        encrypted: link.encrypted,
     })
 }
 
@@ -869,6 +1031,7 @@ mod tests {
             announce: None,
             announce_list: vec![],
             web_seeds: vec![],
+            info_bytes: vec![],
         }
     }
 
@@ -885,6 +1048,7 @@ mod tests {
             piece_count: meta.piece_count(),
             piece_len: meta.piece_length,
             last_piece_len: meta.last_piece_length() as u32,
+            super_seed: false,
         }
     }
 

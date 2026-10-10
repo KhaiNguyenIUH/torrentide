@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use super::connection::{FromPeer, PeerHandle, PeerState, SharedSeeder, ToPeer, Transport, BLOCK_SIZE};
+use super::connection::{Ext, FromPeer, PeerHandle, PeerState, SharedSeeder, ToPeer, Transport, BLOCK_SIZE};
 use super::{pex, PeerStream};
 use super::wire::{Bitfield, Handshake};
+use crate::blocklist::BlockList;
 use crate::metainfo::{InfoHash, Metainfo, SocketAddrLite};
 use crate::ratelimit::Limits;
 use crate::state::EncryptionMode;
@@ -28,6 +29,28 @@ const UNCHOKE_SLOTS: usize = 4;
 
 /// The optimistic slot moves every this many rechokes.
 const OPTIMISTIC_ROTATION: u64 = 3;
+
+/// How long a super-seeded peer holds its revealed piece before the next one
+/// is revealed even though nobody else reported having it.
+const SUPER_SEED_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Where we learned of a peer's address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Tracker,
+    Pex,
+    Lsd,
+    Dht,
+}
+
+/// Super-seeding progress for one peer: the piece it is currently holding,
+/// every piece revealed so far and whether nothing is left to reveal.
+#[derive(Default)]
+struct Reveal {
+    current: Option<(u32, Instant)>,
+    shown: HashSet<u32>,
+    done: bool,
+}
 
 pub struct PeerPool {
     peers: HashMap<SocketAddr, PeerHandle>,
@@ -65,6 +88,19 @@ pub struct PeerPool {
     pex_known: HashMap<SocketAddr, HashSet<SocketAddr>>,
     last_pex: Instant,
     transport: Transport,
+    ext: Ext,
+    blocklist: Option<Arc<BlockList>>,
+    blocked_total: u64,
+    sources: HashMap<SocketAddr, Source>,
+    super_seed: bool,
+    reveal: HashMap<SocketAddr, Reveal>,
+    super_seed_timeout: Duration,
+}
+
+fn ext_for(meta: &Metainfo, port: u16) -> Ext {
+    let port = pex_port_for(meta, port);
+    let info = (port.is_some() && !meta.info_bytes.is_empty()).then(|| Arc::new(meta.info_bytes.clone()));
+    Ext { port, info }
 }
 
 impl PeerPool {
@@ -78,6 +114,7 @@ impl PeerPool {
         auto_unchoke: bool,
     ) -> Self {
         let piece_count = meta.piece_count();
+        let ext = ext_for(&meta, port);
         PeerPool {
             peers: HashMap::new(),
             shared: Arc::new(RwLock::new(seeder.clone())),
@@ -100,7 +137,171 @@ impl PeerPool {
             pex_known: HashMap::new(),
             last_pex: Instant::now(),
             transport: Transport::default(),
+            ext,
+            blocklist: None,
+            blocked_total: 0,
+            sources: HashMap::new(),
+            super_seed: false,
+            reveal: HashMap::new(),
+            super_seed_timeout: SUPER_SEED_TIMEOUT,
         }
+    }
+
+    /// Refuse to dial or accept addresses in this list.
+    pub fn set_blocklist(&mut self, blocklist: Option<Arc<BlockList>>) {
+        self.blocklist = blocklist;
+    }
+
+    fn blocked(&self, addr: &SocketAddr) -> bool {
+        self.blocklist.as_ref().is_some_and(|b| b.contains(addr.ip()))
+    }
+
+    /// Ask for super-seeding (BEP 16). It only takes effect while we hold
+    /// every piece; see [`PeerPool::super_seeding`].
+    pub fn set_super_seed(&mut self, on: bool) {
+        self.super_seed = on;
+        self.sync_super_seed();
+        if !on {
+            self.release_revealed();
+        }
+    }
+
+    /// Whether super-seeding is in effect: requested and we are a full seed.
+    pub fn super_seeding(&self) -> bool {
+        self.super_seed
+            && self
+                .seeder
+                .as_ref()
+                .is_some_and(|s| s.bitfield.full(self.piece_count))
+    }
+
+    fn sync_super_seed(&mut self) {
+        let effective = self.super_seeding();
+        if let Some(s) = &mut self.seeder {
+            s.super_seed = effective;
+        }
+        if let Some(s) = self.shared.write().unwrap().as_mut() {
+            s.super_seed = effective;
+        }
+    }
+
+    /// Super-seeding ended: tell every peer we were holding back from about
+    /// the pieces it has not been shown.
+    fn release_revealed(&mut self) {
+        let Some(seed) = &self.seeder else {
+            self.reveal.clear();
+            return;
+        };
+        for (addr, r) in self.reveal.drain() {
+            let Some(p) = self.peers.get(&addr) else { continue };
+            for i in 0..self.piece_count as u32 {
+                if seed.bitfield.has(i) && !r.shown.contains(&i) {
+                    let _ = p.tx.send(ToPeer::Have(i));
+                }
+            }
+        }
+    }
+
+    /// Show `addr` the rarest piece it has not seen yet.
+    fn reveal_next(&mut self, addr: SocketAddr) {
+        let Some(seed) = &self.seeder else { return };
+        let Some(r) = self.reveal.get(&addr) else { return };
+        let peer = self.peers.get(&addr);
+        let mut shown_to: HashMap<u32, u32> = HashMap::new();
+        for other in self.reveal.values() {
+            for i in &other.shown {
+                *shown_to.entry(*i).or_default() += 1;
+            }
+        }
+        let pick = (0..self.piece_count as u32)
+            .filter(|i| seed.bitfield.has(*i) && !r.shown.contains(i))
+            .filter(|i| {
+                !peer
+                    .and_then(|p| p.state.try_lock().ok())
+                    .is_some_and(|st| st.bitfield.has(*i))
+            })
+            .min_by_key(|i| (self.seeders_for(*i), shown_to.get(i).copied().unwrap_or(0), *i));
+        let r = self.reveal.get_mut(&addr).unwrap();
+        match pick {
+            Some(i) => {
+                r.shown.insert(i);
+                r.current = Some((i, Instant::now()));
+                if let Some(p) = self.peers.get(&addr) {
+                    let _ = p.tx.send(ToPeer::Have(i));
+                }
+            }
+            None => {
+                r.current = None;
+                r.done = true;
+            }
+        }
+    }
+
+    /// Reveal the next piece to peers whose timeout ran out. Call about once
+    /// a second.
+    pub fn super_seed_tick(&mut self) {
+        if !self.super_seeding() {
+            return;
+        }
+        let due: Vec<SocketAddr> = self
+            .reveal
+            .iter()
+            .filter(|(_, r)| !r.done && r.current.map_or(true, |(_, t)| t.elapsed() >= self.super_seed_timeout))
+            .map(|(a, _)| *a)
+            .collect();
+        for a in due {
+            self.reveal_next(a);
+        }
+    }
+
+    fn super_seed_saw(&mut self, from: SocketAddr, piece: u32) {
+        if !self.super_seeding() {
+            return;
+        }
+        let due: Vec<SocketAddr> = self
+            .reveal
+            .iter()
+            .filter(|(a, r)| **a != from && r.current.is_some_and(|(p, _)| p == piece))
+            .map(|(a, _)| *a)
+            .collect();
+        for a in due {
+            self.reveal_next(a);
+        }
+    }
+
+    async fn manage_new_peer(&mut self, addr: SocketAddr) {
+        let Some(p) = self.peers.get(&addr) else { return };
+        if !p.state.lock().await.super_seeded {
+            return;
+        }
+        self.reveal.insert(addr, Reveal::default());
+        if self.super_seeding() {
+            self.reveal_next(addr);
+        }
+    }
+
+    fn flags(&self, addr: &SocketAddr, h: &PeerHandle, st: &PeerState) -> String {
+        let mut f = String::new();
+        if h.encrypted {
+            f.push('E');
+        }
+        if h.utp {
+            f.push('P');
+        }
+        if h.inbound {
+            f.push('I');
+        } else {
+            match self.sources.get(addr) {
+                Some(Source::Pex) => f.push('X'),
+                Some(Source::Lsd) => f.push('L'),
+                Some(Source::Dht) => f.push('H'),
+                _ => {}
+            }
+        }
+        if st.fast {
+            f.push('F');
+        }
+        f
     }
 
     /// Choose the encryption policy and uTP socket outbound dials use. The
@@ -110,19 +311,13 @@ impl PeerPool {
         self.transport.utp = utp;
     }
 
-    /// The extension-protocol port to advertise, or `None` for a private
-    /// torrent, which must not use PEX (BEP 27).
-    fn pex_port(&self) -> Option<u16> {
-        pex_port_for(&self.meta, self.port)
-    }
-
     /// Send each PEX-capable peer the peers that connected and disconnected
     /// since its last message. Only peers we have a dialable address for are
     /// advertised: dialled ones by their address, inbound ones by the listen
     /// port from their extended handshake.
     pub async fn pex_tick(&mut self) {
         self.last_pex = Instant::now();
-        if self.pex_port().is_none() {
+        if self.ext.port.is_none() {
             return;
         }
         let mut live: HashMap<SocketAddr, SocketAddr> = HashMap::new();
@@ -182,8 +377,10 @@ impl PeerPool {
             for i in 0..self.piece_count as u32 {
                 let had = self.seeder.as_ref().is_some_and(|old| old.bitfield.has(i));
                 if new.bitfield.has(i) && !had {
-                    for p in self.peers.values() {
-                        let _ = p.tx.send(ToPeer::Have(i));
+                    for (addr, p) in &self.peers {
+                        if !self.reveal.contains_key(addr) {
+                            let _ = p.tx.send(ToPeer::Have(i));
+                        }
                     }
                 }
             }
@@ -191,6 +388,7 @@ impl PeerPool {
         *self.shared.write().unwrap() = seeder.clone();
         self.seeder = seeder;
         self.seeder_gen += 1;
+        self.sync_super_seed();
     }
 
     pub fn set_max_peers(&mut self, n: usize) {
@@ -231,10 +429,21 @@ impl PeerPool {
 
     /// Register peers discovered from a tracker, skipping ones we already know.
     pub fn discover(&mut self, peers: &[SocketAddrLite]) -> Vec<SocketAddr> {
+        self.discover_from(peers, Source::Tracker)
+    }
+
+    /// [`PeerPool::discover`] for peers learned from `source`. Blocklisted
+    /// addresses are dropped here, so every discovery path is covered.
+    pub fn discover_from(&mut self, peers: &[SocketAddrLite], source: Source) -> Vec<SocketAddr> {
         let mut fresh = Vec::new();
+        let mut blocked = 0u64;
         for p in peers {
             let addr = SocketAddr::new(p.ip, p.port);
             if self.seen.contains(&addr) || self.peers.contains_key(&addr) {
+                continue;
+            }
+            if self.blocked(&addr) {
+                blocked += 1;
                 continue;
             }
             if self.peers.len() + self.connecting + fresh.len() >= self.max_peers {
@@ -244,7 +453,12 @@ impl PeerPool {
             // counted every peer twice, so a batch of 50 filled the pool with
             // phantom handshakes and `dial` refused to dial any of them.
             self.seen.insert(addr);
+            self.sources.insert(addr, source);
             fresh.push(addr);
+        }
+        if blocked > 0 {
+            self.blocked_total += blocked;
+            tracing::debug!(blocked, total = self.blocked_total, "skipped blocklisted peers");
         }
         fresh
     }
@@ -265,6 +479,9 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
         if self.peers.len() + self.connecting >= self.max_peers {
             break;
         }
+        if self.blocked(&addr) {
+            continue;
+        }
         self.connecting += 1;
         self.dial_gen.insert(addr, self.seeder_gen);
 
@@ -272,7 +489,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
         let events = self.events.clone();
         let limits = self.limits.clone();
         let auto_unchoke = self.auto_unchoke;
-        let pex_port = self.pex_port();
+        let ext = self.ext.clone();
         let transport = self.transport.clone();
         tokio::spawn(async move {
             let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<FromPeer>();
@@ -293,7 +510,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                 peer_tx,
                 limits,
                 auto_unchoke,
-                pex_port,
+                ext,
                 &transport,
             )
             .await;
@@ -311,6 +528,11 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
 
     /// Take over an inbound socket whose handshake the caller already read.
     pub async fn adopt_inbound(&mut self, stream: PeerStream, addr: SocketAddr, hs: Handshake) {
+        if self.blocked(&addr) {
+            self.blocked_total += 1;
+            tracing::debug!(peer = %addr, total = self.blocked_total, "dropping blocklisted inbound connection");
+            return;
+        }
         if self.peers.len() >= self.max_peers {
             tracing::debug!(peer = %addr, "pool full, dropping inbound connection");
             return;
@@ -334,7 +556,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
             peer_tx,
             self.limits.clone(),
             self.auto_unchoke,
-            self.pex_port(),
+            self.ext.clone(),
         )
         .await
         {
@@ -350,6 +572,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                     let _ = h.tx.send(ToPeer::SetInterested(true));
                 }
                 self.peers.insert(addr, h);
+                self.manage_new_peer(addr).await;
             }
             Err(e) => tracing::debug!(peer = %addr, error = %e, "inbound handshake failed"),
         }
@@ -399,6 +622,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
 
     /// Close every connection, sockets included.
     pub async fn disconnect_all(&mut self) {
+        self.reveal.clear();
         for (_, p) in self.peers.drain() {
             self.retired_uploaded += p.state.lock().await.uploaded;
             let _ = p.tx.send(ToPeer::Close);
@@ -417,7 +641,14 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                     tracing::debug!(peer = %addr, "pool full, dropping new connection");
                     return;
                 }
-                if dialed_at.is_some_and(|g| g != self.seeder_gen) {
+                if self.blocked(&addr) {
+                    self.blocked_total += 1;
+                    tracing::debug!(peer = %addr, total = self.blocked_total, "dropping blocklisted connection");
+                    let _ = handle.tx.send(ToPeer::Close);
+                    return;
+                }
+                let managed = handle.state.lock().await.super_seeded;
+                if !managed && dialed_at.is_some_and(|g| g != self.seeder_gen) {
                     if let Some(s) = &self.seeder {
                         for i in 0..self.piece_count as u32 {
                             if s.bitfield.has(i) {
@@ -427,6 +658,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                     }
                 }
                 self.peers.insert(addr, *handle);
+                self.manage_new_peer(addr).await;
                 tracing::info!(peer = %addr, "connected");
             }
             FromPeer::ConnectFailed(addr, why) => {
@@ -446,8 +678,10 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                     let mut st = p.state.lock().await;
                     st.bitfield.set(i);
                 }
+                self.super_seed_saw(addr, i);
             }
             FromPeer::Disconnected(_) => {
+                self.reveal.remove(&addr);
                 if let Some(p) = self.peers.remove(&addr) {
                     self.retired_uploaded += p.state.lock().await.uploaded;
                     // Recompute availability from the survivors only.
@@ -478,7 +712,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
         let mut candidates: Vec<(usize, SocketAddr)> = Vec::new();
         for (addr, p) in &self.peers {
             let st = p.state.lock().await;
-            if !st.they_choke && st.bitfield.has(index) {
+            if (!st.they_choke || st.allowed_fast.contains(&index)) && st.bitfield.has(index) {
                 candidates.push((st.outstanding.len(), *addr));
             }
         }
@@ -528,6 +762,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
         }
         let mut removed = 0;
         for addr in list_dead(&self.peers).await {
+            self.reveal.remove(&addr);
             if let Some(p) = self.peers.remove(&addr) {
                 self.retired_uploaded += p.state.lock().await.uploaded;
             }
@@ -561,11 +796,12 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
         sum
     }
 
-    pub async fn states(&self) -> Vec<(String, PeerState)> {
+    /// A snapshot of every peer: address, state and uTorrent-style flags.
+    pub async fn states(&self) -> Vec<(String, PeerState, String)> {
         let mut out = Vec::new();
         for (addr, p) in &self.peers {
             if let Ok(st) = p.state.try_lock() {
-                out.push((addr.to_string(), (*st).clone()));
+                out.push((addr.to_string(), (*st).clone(), self.flags(addr, p, &st)));
             }
         }
         out
@@ -606,7 +842,7 @@ pub async fn listen(
     let infohash = meta.infohash;
     let piece_count = meta.piece_count();
     let seeder: SharedSeeder = Arc::new(RwLock::new(seeder));
-    let pex_port = pex_port_for(&meta, local.port());
+    let ext = ext_for(&meta, local.port());
 
     let handle = tokio::spawn(async move {
         loop {
@@ -614,6 +850,7 @@ pub async fn listen(
                 Ok((stream, addr)) => {
                     let seeder = Arc::clone(&seeder);
                     let events = events.clone();
+                    let ext = ext.clone();
                     // Serve each inbound peer independently; one misbehaving
                     // peer must not stop us accepting others.
                     tokio::spawn(async move {
@@ -635,7 +872,7 @@ pub async fn listen(
                             peer_tx,
                             Limits::default(),
                             true,
-                            pex_port,
+                            ext,
                         )
                         .await
                         {
@@ -714,6 +951,8 @@ mod tests {
                 state: Arc::new(Mutex::new(st)),
                 tx,
                 inbound: false,
+                utp: false,
+                encrypted: false,
             },
             rx,
         )
@@ -750,6 +989,7 @@ mod tests {
             announce: None,
             announce_list: vec![],
             web_seeds: vec![],
+            info_bytes: vec![],
         });
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut pool = PeerPool::new(meta, None, 6881, tx, Limits::default(), MAX_PEERS, true);
@@ -782,6 +1022,7 @@ mod tests {
             announce: None,
             announce_list: vec![],
             web_seeds: vec![],
+            info_bytes: vec![],
         });
         let (tx, _ev_rx) = mpsc::unbounded_channel::<(SocketAddr, FromPeer)>();
         let mut pool = PeerPool::new(meta, None, 6881, tx, Limits::default(), MAX_PEERS, true);
@@ -841,6 +1082,7 @@ mod tests {
             announce: None,
             announce_list: vec![],
             web_seeds: vec![],
+            info_bytes: vec![],
         });
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut pool = PeerPool::new(meta, None, 6881, tx, Limits::default(), MAX_PEERS, true);
@@ -869,6 +1111,7 @@ mod tests {
             announce: None,
             announce_list: vec![],
             web_seeds: vec![],
+            info_bytes: vec![],
         });
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut pool = PeerPool::new(meta, None, 6881, tx, Limits::default(), MAX_PEERS, true);
@@ -917,6 +1160,7 @@ mod tests {
             announce: None,
             announce_list: vec![],
             web_seeds: vec![],
+            info_bytes: vec![],
         });
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut pool = PeerPool::new(meta, None, 6881, tx, Limits::default(), MAX_PEERS, true);
@@ -950,6 +1194,7 @@ mod tests {
             announce: None,
             announce_list: vec![],
             web_seeds: vec![],
+            info_bytes: vec![],
         });
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut pool = PeerPool::new(meta, None, 6881, tx, Limits::default(), MAX_PEERS, true);
@@ -985,6 +1230,7 @@ mod tests {
             announce: None,
             announce_list: vec![],
             web_seeds: vec![],
+            info_bytes: vec![],
         })
     }
 
@@ -1059,6 +1305,7 @@ mod tests {
             piece_count: 2,
             piece_len: BLOCK_SIZE,
             last_piece_len: BLOCK_SIZE,
+            super_seed: false,
         };
 
         let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
@@ -1115,6 +1362,60 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn super_seed_reveals_on_timeout_and_never_before() {
+        let meta = small_meta(4);
+        let dir = std::env::temp_dir().join(format!("torrust-pool-super-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Arc::new(crate::storage::Storage::prepare(&meta, &dir).unwrap());
+        let seeder = super::super::connection::Seeder {
+            storage,
+            bitfield: Bitfield::all(4),
+            piece_count: 4,
+            piece_len: BLOCK_SIZE,
+            last_piece_len: BLOCK_SIZE,
+            super_seed: false,
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = PeerPool::new(meta, Some(seeder), 6881, tx, Limits::default(), MAX_PEERS, true);
+        assert!(!pool.super_seeding());
+        pool.set_super_seed(true);
+        assert!(pool.super_seeding());
+
+        let (h, mut rx) = fake_handle_with_rx(Bitfield::with_pieces(4), true, 0);
+        h.state.try_lock().unwrap().super_seeded = true;
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        pool.peers.insert(addr, h);
+        pool.manage_new_peer(addr).await;
+        assert!(matches!(rx.try_recv(), Ok(ToPeer::Have(0))));
+
+        pool.super_seed_tick();
+        assert!(rx.try_recv().is_err(), "nothing before the timeout");
+        pool.super_seed_timeout = Duration::ZERO;
+        pool.super_seed_tick();
+        assert!(matches!(rx.try_recv(), Ok(ToPeer::Have(1))));
+
+        pool.set_seeder(None);
+        assert!(!pool.super_seeding(), "not complete, not super-seeding");
+        pool.set_super_seed(false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_skips_blocklisted_addresses_and_records_sources() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = PeerPool::new(small_meta(4), None, 6881, tx, Limits::default(), MAX_PEERS, true);
+        pool.set_blocklist(Some(Arc::new(crate::blocklist::BlockList::parse("10.0.0.0 - 10.0.0.255").0)));
+        let lite = |ip: [u8; 4]| SocketAddrLite { ip: std::net::IpAddr::from(ip), port: 1 };
+        let fresh = pool.discover_from(&[lite([10, 0, 0, 5]), lite([11, 0, 0, 5])], Source::Dht);
+        assert_eq!(fresh, vec!["11.0.0.5:1".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(pool.sources.get(&fresh[0]), Some(&Source::Dht));
+        assert_eq!(pool.blocked_total, 1);
+        pool.dial(&["10.0.0.5:1".parse().unwrap()]);
+        assert_eq!(pool.connecting, 0, "a blocked address is never dialled");
     }
 
     fn pex_peer(pool: &mut PeerPool, addr: &str, pex_id: Option<u8>) -> mpsc::UnboundedReceiver<ToPeer> {

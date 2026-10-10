@@ -92,6 +92,8 @@ pub struct Metainfo {
     pub announce_list: Vec<String>,
     /// BEP 19 `url-list` web seeds, http(s) only.
     pub web_seeds: Vec<String>,
+    /// The original bencoded `info` dictionary, served to peers over BEP 9.
+    pub info_bytes: Vec<u8>,
 }
 
 impl Metainfo {
@@ -130,6 +132,7 @@ impl Metainfo {
         // need the exact original slice, so locate it in the raw buffer.
         let info_start = find_dict_value_slice(raw, b"info")
             .context("torrent file has no 'info' dictionary")?;
+        let info_bytes = info_start.to_vec();
         let mut hasher = Sha1::new();
         hasher.update(info_start);
         let digest = hasher.finalize();
@@ -236,6 +239,7 @@ impl Metainfo {
             announce,
             announce_list,
             web_seeds,
+            info_bytes,
         })
     }
 }

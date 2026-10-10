@@ -29,6 +29,7 @@ fn settings(dir: &std::path::Path) -> Settings {
         dht: false,
         port_forwarding: false,
         lsd: false,
+        notifications: false,
         ..Settings::default()
     }
 }

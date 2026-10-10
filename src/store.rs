@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::bencode::{self, Value};
+use crate::schedule::Schedule;
 use crate::state::{EncryptionMode, FilePriority, Settings, TorrentId};
 
 /// Where the session keeps its files. `TORRUST_HOME` overrides the platform
@@ -64,6 +65,9 @@ pub struct Record {
     pub sequential: bool,
     /// Completion has been seen (and any move-on-complete done); never moved automatically again.
     pub moved: bool,
+    /// Tracker list that replaces the metainfo's, once trackers were added or removed.
+    pub trackers: Option<Vec<String>>,
+    pub super_seed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -405,6 +409,16 @@ fn encode_settings(s: &Settings) -> Vec<u8> {
     if let Some(p) = s.webui.password.as_deref().filter(|p| !p.is_empty()) {
         d.insert(b"webui_password".to_vec(), Value::Bytes(hashed(p).into_bytes()));
     }
+    if let Some(p) = &s.blocklist {
+        d.insert(b"blocklist".to_vec(), Value::Bytes(path_bytes(p)));
+    }
+    d.insert(b"notifications".to_vec(), int(s.notifications as u64));
+    let sc = &s.schedule;
+    d.insert(b"schedule_enabled".to_vec(), int(sc.enabled as u64));
+    d.insert(b"schedule_grid".to_vec(), Value::Bytes(sc.to_string_grid().into_bytes()));
+    d.insert(b"schedule_limited_down".to_vec(), int(sc.limited_down));
+    d.insert(b"schedule_limited_up".to_vec(), int(sc.limited_up));
+    d.insert(b"schedule_utc_offset".to_vec(), Value::Int(sc.utc_offset_minutes as i64));
     bencode::encode(&Value::Dict(d))
 }
 
@@ -458,6 +472,28 @@ fn decode_settings(raw: &[u8]) -> Result<Settings> {
     }
     s.webui.password = v.get_str_opt("webui_password").filter(|p| !p.is_empty()).map(str::to_owned);
     s.move_completed_dir = v.get_opt("move_completed_dir").map(bytes_path).transpose()?.filter(|p| !p.as_os_str().is_empty());
+    s.blocklist = v.get_opt("blocklist").map(bytes_path).transpose()?.filter(|p| !p.as_os_str().is_empty());
+    if let Some(n) = v.get_int_opt("notifications") {
+        s.notifications = n != 0;
+    }
+    if let Some(n) = v.get_int_opt("schedule_enabled") {
+        s.schedule.enabled = n != 0;
+    }
+    if let Some(g) = v.get_str_opt("schedule_grid") {
+        match Schedule::parse_grid(g) {
+            Ok(grid) => s.schedule.grid = grid,
+            Err(e) => tracing::warn!(error = %e, "ignoring corrupt schedule grid"),
+        }
+    }
+    if let Some(n) = v.get_int_opt("schedule_limited_down") {
+        s.schedule.limited_down = n.max(0) as u64;
+    }
+    if let Some(n) = v.get_int_opt("schedule_limited_up") {
+        s.schedule.limited_up = n.max(0) as u64;
+    }
+    if let Some(n) = v.get_int_opt("schedule_utc_offset") {
+        s.schedule.utc_offset_minutes = n.clamp(-14 * 60, 14 * 60) as i32;
+    }
     Ok(s)
 }
 
@@ -485,6 +521,10 @@ fn encode_record(r: &Record) -> Vec<u8> {
     }
     d.insert(b"sequential".to_vec(), int(r.sequential as u64));
     d.insert(b"moved".to_vec(), int(r.moved as u64));
+    if let Some(t) = &r.trackers {
+        d.insert(b"trackers".to_vec(), Value::List(t.iter().map(|x| Value::Bytes(x.as_bytes().to_vec())).collect()));
+    }
+    d.insert(b"super_seed".to_vec(), int(r.super_seed as u64));
     bencode::encode(&Value::Dict(d))
 }
 
@@ -509,6 +549,16 @@ fn decode_record(id: &str, raw: &[u8]) -> Result<Record> {
         label: v.get_str_opt("label").filter(|l| !l.is_empty()).map(str::to_owned),
         sequential: v.get_int_opt("sequential").unwrap_or(0) != 0,
         moved: v.get_int_opt("moved").map_or_else(|| snapshot.as_ref().is_some_and(|s| s.complete), |n| n != 0),
+        trackers: match v.get_opt("trackers") {
+            Some(Value::List(l)) => Some(
+                l.iter()
+                    .filter_map(|x| x.as_bytes().ok())
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .collect(),
+            ),
+            _ => None,
+        },
+        super_seed: v.get_int_opt("super_seed").unwrap_or(0) != 0,
         snapshot,
     })
 }
@@ -659,10 +709,28 @@ mod tests {
             max_active_downloads: 2,
             max_active_torrents: 4,
             move_completed_dir: Some(PathBuf::from("/done")),
+            blocklist: Some(PathBuf::from("/x/bl.txt")),
+            notifications: false,
+            schedule: {
+                let mut sc = Schedule { enabled: true, limited_down: 11, limited_up: 22, utc_offset_minutes: -330, ..Default::default() };
+                sc.apply_rule("mon-fri 09-18 limited").unwrap();
+                sc.apply_rule("sat 22-02 off").unwrap();
+                sc
+            },
             ..Settings::default()
         };
         store.save_settings(&s).unwrap();
         assert_eq!(store.load_settings(), s);
+    }
+
+    #[test]
+    fn old_settings_file_loads_new_fields_as_defaults() {
+        let store = Store::at(tmp("oldsettings"));
+        let old = bencode::encode(&Value::Dict(BTreeMap::from([(b"listen_port".to_vec(), Value::Int(7000))])));
+        write_private(&store.root.join("settings.bencode"), &old).unwrap();
+        let s = store.load_settings();
+        assert_eq!(s.listen_port, 7000);
+        assert_eq!((s.blocklist, s.notifications, s.schedule), (None, true, Schedule::default()));
     }
 
     #[test]
@@ -693,6 +761,8 @@ mod tests {
             label: Some("movies".into()),
             sequential: true,
             moved: true,
+            trackers: Some(vec!["http://t/a".into(), "udp://u:1/b".into()]),
+            super_seed: true,
         };
         store.save_torrent(&r.id, b"d4:infode").unwrap();
         store.save_record(&r).unwrap();
@@ -728,7 +798,7 @@ mod tests {
         let r = &got[0];
         assert_eq!(r.priorities, Some(vec![FilePriority::Normal, FilePriority::Skip, FilePriority::Normal]));
         assert!(!r.force && r.snapshot.is_none() && r.queue == 0 && !r.stopped);
-        assert!(r.label.is_none() && !r.sequential && !r.moved);
+        assert!(r.label.is_none() && !r.sequential && !r.moved && r.trackers.is_none() && !r.super_seed);
     }
 
     #[test]
@@ -760,6 +830,8 @@ mod tests {
             label: None,
             sequential: false,
             moved: false,
+            trackers: None,
+            super_seed: false,
         };
         let mut d = match bencode::decode(&encode_record(&r)).unwrap() {
             Value::Dict(d) => d,

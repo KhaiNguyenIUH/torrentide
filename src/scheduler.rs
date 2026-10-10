@@ -636,6 +636,7 @@ mod tests {
             announce: None,
             announce_list: vec![],
             web_seeds: vec![],
+            info_bytes: vec![],
         }
     }
 
@@ -961,6 +962,7 @@ mod tests {
             announce: None,
             announce_list: vec![],
             web_seeds: vec![],
+            info_bytes: vec![],
         };
         // Skip file 1 (bytes 10..20): piece 1 (bytes 16..20) lies entirely
         // inside it and is excludable; piece 0 (bytes 0..16) straddles the
@@ -1007,6 +1009,7 @@ mod tests {
             announce: None,
             announce_list: vec![],
             web_seeds: vec![],
+            info_bytes: vec![],
         }
     }
 

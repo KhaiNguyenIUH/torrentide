@@ -55,6 +55,24 @@ pub enum Message {
     Port { port: u16 },
     Piece { index: u32, begin: u32, block: Vec<u8> },
     Extended { ext_id: u8, payload: Vec<u8> },
+    SuggestPiece { index: u32 },
+    HaveAll,
+    HaveNone,
+    RejectRequest { index: u32, begin: u32, length: u32 },
+    AllowedFast { index: u32 },
+}
+
+impl Message {
+    pub fn is_fast(&self) -> bool {
+        matches!(
+            self,
+            Message::SuggestPiece { .. }
+                | Message::HaveAll
+                | Message::HaveNone
+                | Message::RejectRequest { .. }
+                | Message::AllowedFast { .. }
+        )
+    }
 }
 
 /// Perform the BEP 3 handshake as the initiating side.
@@ -107,6 +125,11 @@ pub struct Handshake {
     pub peer_id: [u8; 20],
     /// The peer's 8 reserved bytes, which advertise optional protocol features.
     pub reserved: [u8; 8],
+    /// The connection arrived over uTP. Set by whoever accepted the socket;
+    /// the handshake bytes cannot tell.
+    pub utp: bool,
+    /// The connection is wrapped in MSE. Set like `utp`.
+    pub encrypted: bool,
 }
 
 impl Handshake {
@@ -116,6 +139,10 @@ impl Handshake {
 
     pub fn supports_extended(&self) -> bool {
         self.reserved[RESERVED_EXTENDED.0] & RESERVED_EXTENDED.1 != 0
+    }
+
+    pub fn supports_fast(&self) -> bool {
+        self.reserved[RESERVED_FAST.0] & RESERVED_FAST.1 != 0
     }
 }
 
@@ -151,6 +178,8 @@ where
         infohash,
         peer_id,
         reserved,
+        utp: false,
+        encrypted: false,
     };
     if !hs.supports_dht() {
         tracing::debug!("peer did not advertise DHT support");
@@ -226,6 +255,19 @@ where
                 port: u16::from_be_bytes([p[0], p[1]]),
             }
         }
+        0x0D => Message::SuggestPiece {
+            index: be32(payload, 0)?,
+        },
+        0x0E => Message::HaveAll,
+        0x0F => Message::HaveNone,
+        0x10 => Message::RejectRequest {
+            index: be32(payload, 0)?,
+            begin: be32(payload, 4)?,
+            length: be32(payload, 8)?,
+        },
+        0x11 => Message::AllowedFast {
+            index: be32(payload, 0)?,
+        },
         20 => Message::Extended {
             ext_id: *payload.first().ok_or(WireError::Protocol("empty extended message"))?,
             payload: payload.get(1..).unwrap_or(&[]).to_vec(),
@@ -304,6 +346,29 @@ pub fn encode(msg: &Message) -> Vec<u8> {
             v.extend_from_slice(payload);
             v
         }
+        Message::SuggestPiece { index } => {
+            let mut v = vec![0x0D];
+            v.extend_from_slice(&index.to_be_bytes());
+            v
+        }
+        Message::HaveAll => vec![0x0E],
+        Message::HaveNone => vec![0x0F],
+        Message::RejectRequest {
+            index,
+            begin,
+            length,
+        } => {
+            let mut v = vec![0x10];
+            v.extend_from_slice(&index.to_be_bytes());
+            v.extend_from_slice(&begin.to_be_bytes());
+            v.extend_from_slice(&length.to_be_bytes());
+            v
+        }
+        Message::AllowedFast { index } => {
+            let mut v = vec![0x11];
+            v.extend_from_slice(&index.to_be_bytes());
+            v
+        }
     }
 }
 
@@ -339,6 +404,14 @@ impl Bitfield {
             bits: vec![0u8; piece_count.div_ceil(8).max(1)],
         };
         bf.clear_bits_from(piece_count);
+        bf
+    }
+
+    pub fn all(piece_count: usize) -> Self {
+        let mut bf = Self::with_pieces(piece_count);
+        for i in 0..piece_count as u32 {
+            bf.set(i);
+        }
         bf
     }
 
@@ -441,6 +514,25 @@ mod tests {
             assert_eq!(len + 4, framed.len(), "length prefix must match body");
             assert_eq!(encode(&c), &framed[4..]);
         }
+    }
+
+    #[tokio::test]
+    async fn fast_messages_round_trip_through_the_decoder() {
+        let cases = vec![
+            Message::SuggestPiece { index: 4 },
+            Message::HaveAll,
+            Message::HaveNone,
+            Message::RejectRequest { index: 1, begin: 16384, length: 16384 },
+            Message::AllowedFast { index: 9 },
+        ];
+        for c in cases {
+            assert!(c.is_fast());
+            let framed = encode_framed(&c);
+            let got = read_message(&mut framed.as_slice()).await.unwrap();
+            assert_eq!(encode(&got), encode(&c));
+        }
+        assert!(!Message::Have { index: 1 }.is_fast());
+        assert!(read_message(&mut [0u8, 0, 0, 1, 0x10].as_slice()).await.is_err());
     }
 
     #[test]

@@ -26,11 +26,12 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap,
+    Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Sparkline, Table, TableState, Wrap,
 };
 use ratatui::{Frame, Terminal};
 use tokio::sync::RwLock;
 
+use crate::schedule::Schedule;
 use crate::state::{
     human_bytes, now_hms, Command, DownloadState, EncryptionMode, FeedId, FeedView, FilePriority, FileSummary,
     Level, LogEntry, PeerSummary, SessionCommand, SessionState, Settings, TorrentId, TorrentSummary,
@@ -205,13 +206,14 @@ fn peer_flags(peer: &PeerSummary) -> String {
 }
 
 /// The five cells of a peer table row, in column order.
-fn peer_cells(peer: &PeerSummary) -> [String; 5] {
+fn peer_cells(peer: &PeerSummary) -> [String; 6] {
     [
         peer.addr.clone(),
         human_bytes(peer.downloaded),
         human_bytes(peer.uploaded),
         percent(peer.progress),
         peer_flags(peer),
+        peer.flags.clone(),
     ]
 }
 
@@ -818,6 +820,7 @@ fn render_peers(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
         Cell::from("DL"),
         Cell::from("UP"),
         Cell::from("Progress"),
+        Cell::from("Choke"),
         Cell::from("Flags"),
     ])
     .style(heading_style());
@@ -825,6 +828,7 @@ fn render_peers(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
     let rows: Vec<Row> = if app.peers.is_empty() {
         vec![Row::new(vec![
             Cell::from("no peers connected"),
+            Cell::from(""),
             Cell::from(""),
             Cell::from(""),
             Cell::from(""),
@@ -837,12 +841,13 @@ fn render_peers(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
             .map(|peer| {
                 // Destructured so each owned cell can be moved into its own
                 // `Cell` without cloning.
-                let [addr, down, up, progress, flags] = peer_cells(peer);
+                let [addr, down, up, progress, choke, flags] = peer_cells(peer);
                 Row::new(vec![
                     Cell::from(truncate_line(&addr, usize::from(inner_width))),
                     Cell::from(down),
                     Cell::from(up),
                     Cell::from(progress),
+                    Cell::from(choke),
                     Cell::from(flags),
                 ])
             })
@@ -854,7 +859,8 @@ fn render_peers(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
         Constraint::Length(10),
         Constraint::Length(10),
         Constraint::Length(9),
-        Constraint::Length(6),
+        Constraint::Length(5),
+        Constraint::Length(8),
     ];
     let table = Table::new(rows, widths)
         .header(header)
@@ -1129,7 +1135,7 @@ pub fn run_tui(state: Arc<RwLock<UiState>>) -> Result<()> {
 
 /// Key bindings advertised in the session footer and help overlay. The most
 /// used keys come first because the footer is clipped on narrow terminals.
-const SESSION_KEYS: [(&str, &str); 20] = [
+const SESSION_KEYS: [(&str, &str); 23] = [
     ("a", "add"),
     ("s", "start/stop"),
     ("p", "pause"),
@@ -1142,6 +1148,9 @@ const SESSION_KEYS: [(&str, &str); 20] = [
     ("[ / ]", "queue up/down"),
     ("tab/1-7", "panel"),
     ("a/d/r on Feeds", "add / remove / refresh feed"),
+    ("a/d on Trackers", "add / remove tracker (j/k select)"),
+    ("U", "toggle super-seeding"),
+    ("flags", "E enc P uTP I in X PEX L LSD H DHT F fast W web"),
     ("j/k", "torrents"),
     ("J/K", "files"),
     ("space", "skip file"),
@@ -1169,6 +1178,17 @@ const SESSION_FOOTER_KEYS: [(&str, &str); 15] = [
     ("f", "filter"),
     ("S", "seq"),
     ("m", "move"),
+];
+
+const TRACKERS_FOOTER_KEYS: [(&str, &str); 8] = [
+    ("a", "add tracker"),
+    ("d", "remove tracker"),
+    ("j/k", "trackers"),
+    ("?", "keys"),
+    ("q", "quit"),
+    ("tab", "panel"),
+    ("U", "super-seed"),
+    ("o", "settings"),
 ];
 
 const FEEDS_FOOTER_KEYS: [(&str, &str); 8] = [
@@ -1282,13 +1302,19 @@ fn view_sequential(view: &TorrentView) -> bool {
 }
 
 /// Status text, with a trailing marker while downloading in sequential order.
+fn view_super_seed(view: &TorrentView) -> bool {
+    view.ui.torrent.as_ref().is_some_and(|t| t.super_seeding)
+}
+
 fn status_cell(view: &TorrentView) -> String {
-    let label = view_state(view).label();
+    let mut label = view_state(view).label().to_string();
     if view_sequential(view) {
-        format!("{label}\u{21e3}")
-    } else {
-        label.to_string()
+        label.push('\u{21e3}');
     }
+    if view_super_seed(view) {
+        label.push('*');
+    }
+    label
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1416,7 +1442,55 @@ fn header_summary(state: &SessionState) -> String {
         text.push_str("  ");
         text.push_str(&state.port_status);
     }
+    if state.blocklist_ranges > 0 {
+        text.push_str(&format!("  blocklist: {} ranges", state.blocklist_ranges));
+    }
     text
+}
+
+fn spark_data(history: &[(f64, f64)], width: usize, down: bool) -> Vec<u64> {
+    let start = history.len().saturating_sub(width);
+    history[start..]
+        .iter()
+        .map(|&(d, u)| {
+            let rate = if down { d } else { u };
+            if rate.is_finite() && rate > 0.0 { rate as u64 } else { 0 }
+        })
+        .collect()
+}
+
+fn peak_rate(history: &[(f64, f64)], down: bool) -> f64 {
+    history
+        .iter()
+        .map(|&(d, u)| if down { d } else { u })
+        .filter(|r| r.is_finite())
+        .fold(0.0, f64::max)
+}
+
+fn speed_label(arrow: char, history: &[(f64, f64)], down: bool) -> String {
+    let now = history.last().map_or(0.0, |&(d, u)| if down { d } else { u });
+    format!("{arrow} {} pk {}", compact_rate(now), compact_rate(peak_rate(history, down)))
+}
+
+fn grid_summary(schedule: &Schedule) -> String {
+    const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    let cells: Vec<char> = schedule.to_string_grid().chars().collect();
+    let days: Vec<String> = cells
+        .chunks(24)
+        .zip(DAYS)
+        .map(|(day, name)| {
+            let mut out = format!("{name}:");
+            let mut i = 0;
+            while i < day.len() {
+                let run = day[i..].iter().take_while(|&&c| c == day[i]).count();
+                out.push(day[i]);
+                out.push_str(&run.to_string());
+                i += run;
+            }
+            out
+        })
+        .collect();
+    format!("grid {}", days.join(" "))
 }
 
 /// Keep the selection on the same torrent across refreshes.
@@ -1540,14 +1614,15 @@ struct Form {
     focus: usize,
     error: Option<String>,
     has_password: bool,
+    preview: Option<String>,
 }
 
 impl Form {
     fn new(title: &'static str, fields: Vec<Field>) -> Self {
-        Form { title, fields, focus: 0, error: None, has_password: false }
+        Form { title, fields, focus: 0, error: None, has_password: false, preview: None }
     }
 
-    fn notes(&self) -> Vec<(&'static str, Style)> {
+    fn notes(&self) -> Vec<(&str, Style)> {
         if self.title != "settings" {
             return Vec::new();
         }
@@ -1555,6 +1630,9 @@ impl Form {
         let password = self.fields[WEBUI_PASSWORD].input.text.as_str();
         if self.fields[WEBUI_ON].on && (password == "-" || (password.is_empty() && !self.has_password)) {
             notes.push(("web UI will listen on localhost only", warn_style()));
+        }
+        if let Some(preview) = &self.preview {
+            notes.push((preview.as_str(), muted_style()));
         }
         notes
     }
@@ -1639,6 +1717,12 @@ fn parse_limits(form: &Form) -> Result<(u64, u64), String> {
 
 const WEBUI_ON: usize = 14;
 const WEBUI_PASSWORD: usize = 16;
+const BLOCKLIST_FIELD: usize = 17;
+const NOTIFY_FIELD: usize = 18;
+const SCHEDULE_ON: usize = 19;
+const SCHEDULE_DOWN: usize = 20;
+const SCHEDULE_UP: usize = 21;
+const SCHEDULE_RULE: usize = 22;
 
 fn settings_form(settings: &Settings) -> Form {
     let mut form = Form::new(
@@ -1664,9 +1748,19 @@ fn settings_form(settings: &Settings) -> Form {
             Field::toggle("Web UI", settings.webui.enabled),
             Field::number("Web UI port", settings.webui.port.to_string()),
             Field::secret("Web UI password (empty=keep, -=clear)"),
+            Field::text(
+                "Block list file (empty = none)",
+                settings.blocklist.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            ),
+            Field::toggle("Notifications", settings.notifications),
+            Field::toggle("Schedule", settings.schedule.enabled),
+            Field::number("Schedule limited down (KiB/s)", kib_text(settings.schedule.limited_down)),
+            Field::number("Schedule limited up (KiB/s)", kib_text(settings.schedule.limited_up)),
+            Field::text("Schedule rule (e.g. weekdays 09-18 limited)", ""),
         ],
     );
     form.has_password = settings.webui.password.is_some();
+    form.preview = Some(grid_summary(&settings.schedule));
     form
 }
 
@@ -1717,6 +1811,16 @@ fn parse_settings(form: &Form, base: &Settings) -> Result<Settings, String> {
         "-" => None,
         typed => Some(typed.to_string()),
     };
+    let blocklist = Some(clean_input(&f[BLOCKLIST_FIELD].input.text))
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from);
+    let mut schedule = base.schedule.clone();
+    schedule.enabled = f[SCHEDULE_ON].on;
+    schedule.limited_down = parse_kib("Schedule down", &f[SCHEDULE_DOWN].input.text)?;
+    schedule.limited_up = parse_kib("Schedule up", &f[SCHEDULE_UP].input.text)?;
+    for rule in f[SCHEDULE_RULE].input.text.split(';').map(str::trim).filter(|r| !r.is_empty()) {
+        schedule.apply_rule(rule).map_err(|e| format!("Schedule rule: {e}"))?;
+    }
     Ok(Settings {
         download_dir: PathBuf::from(dir),
         listen_port,
@@ -1733,6 +1837,9 @@ fn parse_settings(form: &Form, base: &Settings) -> Result<Settings, String> {
         encryption,
         utp: f[13].on,
         webui: WebUiSettings { enabled: f[WEBUI_ON].on, port: webui_port, password },
+        blocklist,
+        notifications: f[NOTIFY_FIELD].on,
+        schedule,
         ..base.clone()
     })
 }
@@ -1880,12 +1987,23 @@ enum Modal {
     Text(TextPrompt),
     Feed(Form),
     RemoveFeed { id: FeedId, name: String },
+    RemoveTracker { id: TorrentId, url: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextPurpose {
     Label,
     Move,
+    Tracker,
+}
+
+fn valid_tracker(url: &str) -> Result<(), String> {
+    let lower = url.to_ascii_lowercase();
+    let host = ["https://", "http://", "udp://"].iter().find_map(|scheme| lower.strip_prefix(scheme));
+    if host.map_or(true, |h| h.is_empty() || h.starts_with('/')) {
+        return Err("Tracker URL: enter an http://, https:// or udp:// address".to_string());
+    }
+    Ok(())
 }
 
 /// A one-line prompt that acts on a single torrent: set its label or move its data.
@@ -1906,6 +2024,7 @@ impl TextPrompt {
         match self.purpose {
             TextPurpose::Label => "label",
             TextPurpose::Move => "move data",
+            TextPurpose::Tracker => "add tracker",
         }
     }
 
@@ -1913,6 +2032,7 @@ impl TextPrompt {
         match self.purpose {
             TextPurpose::Label => "Label (empty = clear):",
             TextPurpose::Move => "Move data to folder:",
+            TextPurpose::Tracker => "Tracker URL (http/https/udp):",
         }
     }
 
@@ -1927,6 +2047,13 @@ impl TextPrompt {
                 self.error = Some("enter a destination folder".to_string());
                 None
             }
+            TextPurpose::Tracker => match valid_tracker(&text) {
+                Ok(()) => Some(SessionCommand::Torrent(self.id.clone(), Command::AddTracker(text))),
+                Err(message) => {
+                    self.error = Some(message);
+                    None
+                }
+            },
             TextPurpose::Move => Some(SessionCommand::MoveData {
                 id: self.id.clone(),
                 dir: PathBuf::from(text),
@@ -2002,6 +2129,7 @@ struct RowInfo {
     upload_limit: u64,
     label: Option<String>,
     sequential: bool,
+    super_seed: bool,
 }
 
 struct SessionApp {
@@ -2020,6 +2148,8 @@ struct SessionApp {
     view: App,
     settings: Settings,
     feeds: Vec<FeedView>,
+    trackers: Vec<String>,
+    tracker_selected: Option<usize>,
     feed_selected: Option<usize>,
     feed_id: Option<FeedId>,
     modal: Modal,
@@ -2042,6 +2172,8 @@ impl SessionApp {
             view: App::default(),
             settings: Settings::default(),
             feeds: Vec::new(),
+            trackers: Vec::new(),
+            tracker_selected: None,
             feed_selected: None,
             feed_id: None,
             modal: Modal::None,
@@ -2064,6 +2196,7 @@ impl SessionApp {
                 upload_limit: t.upload_limit,
                 label: view_label(t).map(str::to_string),
                 sequential: view_sequential(t),
+                super_seed: view_super_seed(t),
             })
             .collect();
         self.settings = state.settings.clone();
@@ -2082,6 +2215,11 @@ impl SessionApp {
             .and_then(|t| t.ui.torrent.as_ref())
             .map(|s| s.files.clone())
             .unwrap_or_default();
+        self.trackers = current
+            .and_then(|t| t.ui.torrent.as_ref())
+            .map(|s| s.trackers.clone())
+            .unwrap_or_default();
+        self.tracker_selected = clamp_selection(self.tracker_selected, self.trackers.len());
         self.view.selected = clamp_selection(self.view.selected, self.view.peers.len());
         self.view.file_selected = clamp_selection(self.view.file_selected, self.view.files.len());
     }
@@ -2114,6 +2252,7 @@ impl SessionApp {
         if new_id != self.selected_id {
             self.view.selected = None;
             self.view.file_selected = None;
+            self.tracker_selected = None;
             self.view.log_scroll = 0;
             self.selected_id = new_id;
         }
@@ -2136,6 +2275,7 @@ impl SessionApp {
         if new_id != self.selected_id {
             self.view.selected = None;
             self.view.file_selected = None;
+            self.tracker_selected = None;
             self.view.log_scroll = 0;
             self.selected_id = new_id;
         }
@@ -2155,6 +2295,30 @@ impl SessionApp {
             KeyCode::Char('d') => {
                 if let Some(feed) = self.feed_selected.and_then(|i| self.feeds.get(i)) {
                     self.modal = Modal::RemoveFeed { id: feed.id, name: feed_name(feed) };
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn on_trackers_key(&mut self, key: &KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.tracker_selected = move_selection(self.tracker_selected, self.trackers.len(), 1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.tracker_selected = move_selection(self.tracker_selected, self.trackers.len(), -1)
+            }
+            KeyCode::Char('a') => {
+                if let Some(row) = self.current() {
+                    self.modal = Modal::Text(TextPrompt::new(row.id.clone(), TextPurpose::Tracker));
+                }
+            }
+            KeyCode::Char('d') => {
+                let url = self.tracker_selected.and_then(|i| self.trackers.get(i)).cloned();
+                if let (Some(row), Some(url)) = (self.current(), url) {
+                    self.modal = Modal::RemoveTracker { id: row.id.clone(), url };
                 }
             }
             _ => return false,
@@ -2193,6 +2357,9 @@ impl SessionApp {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if self.tab == Tab::Feeds && !ctrl && self.on_feeds_key(&key) {
+            return;
+        }
+        if self.tab == Tab::Trackers && !ctrl && self.on_trackers_key(&key) {
             return;
         }
         match key.code {
@@ -2243,6 +2410,14 @@ impl SessionApp {
                     self.send(SessionCommand::Torrent(
                         row.id.clone(),
                         Command::SetSequential(!row.sequential),
+                    ));
+                }
+            }
+            KeyCode::Char('U') => {
+                if let Some(row) = self.current() {
+                    self.send(SessionCommand::Torrent(
+                        row.id.clone(),
+                        Command::SetSuperSeed(!row.super_seed),
                     ));
                 }
             }
@@ -2395,6 +2570,14 @@ impl SessionApp {
                 KeyCode::Esc | KeyCode::Char('n') => Modal::None,
                 _ => Modal::RemoveFeed { id, name },
             },
+            Modal::RemoveTracker { id, url } => match key.code {
+                KeyCode::Char('y') => {
+                    self.send(SessionCommand::Torrent(id, Command::RemoveTracker(url)));
+                    Modal::None
+                }
+                KeyCode::Esc | KeyCode::Char('n') => Modal::None,
+                _ => Modal::RemoveTracker { id, url },
+            },
             Modal::Settings(mut form) => match form.on_key(&key) {
                 FormAction::Cancel => Modal::None,
                 FormAction::Submit => match parse_settings(&form, &self.settings) {
@@ -2458,11 +2641,13 @@ fn render_session(frame: &mut Frame, snapshot: &Result<SessionState, String>, ap
     app.sync(state);
 
     let footer_rows = if state.warning.is_some() { 2 } else { 1 };
-    let body_rows = area.height.saturating_sub(HEADER_ROWS + footer_rows);
+    let strip_rows = if area.height >= STRIP_MIN_HEIGHT { STRIP_ROWS } else { 0 };
+    let body_rows = area.height.saturating_sub(HEADER_ROWS + strip_rows + footer_rows);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(HEADER_ROWS),
+            Constraint::Length(strip_rows),
             Constraint::Length(table_rows(state.torrents.len(), body_rows)),
             Constraint::Min(0),
             Constraint::Length(footer_rows),
@@ -2470,12 +2655,59 @@ fn render_session(frame: &mut Frame, snapshot: &Result<SessionState, String>, ap
         .split(area);
 
     render_session_header(frame, chunks[0], state, &app.filter);
-    render_torrent_table(frame, chunks[1], state, app);
-    render_detail(frame, chunks[2], state, app);
-    let footer_keys: &[(&'static str, &'static str)] =
-        if app.tab == Tab::Feeds { &FEEDS_FOOTER_KEYS } else { &SESSION_FOOTER_KEYS };
-    render_footer(frame, chunks[3], state.warning.as_deref(), footer_keys);
+    if strip_rows > 0 {
+        render_speed(frame, chunks[1], &state.rate_history, false);
+    }
+    render_torrent_table(frame, chunks[2], state, app);
+    render_detail(frame, chunks[3], state, app);
+    let footer_keys: &[(&'static str, &'static str)] = match app.tab {
+        Tab::Feeds => &FEEDS_FOOTER_KEYS,
+        Tab::Trackers => &TRACKERS_FOOTER_KEYS,
+        _ => &SESSION_FOOTER_KEYS,
+    };
+    render_footer(frame, chunks[4], state.warning.as_deref(), footer_keys);
     render_modal(frame, area, app);
+}
+
+const STRIP_MIN_HEIGHT: u16 = 24;
+const STRIP_ROWS: u16 = 2;
+const SPEED_LABEL: u16 = 22;
+
+fn render_speed(frame: &mut Frame, area: Rect, history: &[(f64, f64)], bordered: bool) {
+    let inner = if bordered {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style())
+            .style(base_style())
+            .title(Span::styled(" speed ", heading_style()));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        inner
+    } else {
+        area
+    };
+    if inner.height == 0 || inner.width <= SPEED_LABEL {
+        return;
+    }
+    let half = (inner.height / 2).max(1);
+    for (down, y, height) in [(true, inner.y, half), (false, inner.y + half, inner.height - half)] {
+        if height == 0 {
+            continue;
+        }
+        let row = Rect { x: inner.x, y, width: inner.width, height };
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(SPEED_LABEL), Constraint::Min(0)])
+            .split(row);
+        let arrow = if down { '\u{2193}' } else { '\u{2191}' };
+        frame.render_widget(
+            Paragraph::new(Span::styled(speed_label(arrow, history, down), value_style())),
+            cols[0],
+        );
+        let data = spark_data(history, usize::from(cols[1].width), down);
+        let style = if down { good_style() } else { warn_style() };
+        frame.render_widget(Sparkline::default().data(&data).style(style), cols[1]);
+    }
 }
 
 fn render_session_header(frame: &mut Frame, area: Rect, state: &SessionState, filter: &LabelFilter) {
@@ -2577,8 +2809,16 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &SessionState, app: &mut 
         Tab::General => render_general(frame, body, view),
         Tab::Peers => render_peers(frame, body, &mut app.view, false),
         Tab::Files => render_files(frame, body, &mut app.view, true),
-        Tab::Trackers => render_trackers(frame, body, view),
+        Tab::Trackers => render_trackers(frame, body, view, app.tracker_selected),
         Tab::Log => render_log(frame, body, &view.ui.log, "log", &mut app.view),
+        Tab::Session if body.height >= 14 => {
+            let parts = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length((body.height / 2).min(8)), Constraint::Min(0)])
+                .split(body);
+            render_speed(frame, parts[0], &state.rate_history, true);
+            render_log(frame, parts[1], &state.log, "session log", &mut app.view);
+        }
         Tab::Session => render_log(frame, body, &state.log, "session log", &mut app.view),
         Tab::Feeds => {}
     }
@@ -2608,7 +2848,7 @@ fn general_lines(view: &TorrentView) -> Vec<Line<'static>> {
     let Some(t) = view.ui.torrent.as_ref() else {
         return vec![kv("Status", "waiting for metadata".to_string())];
     };
-    vec![
+    let mut lines = vec![
         kv("Name", view_name(view)),
         kv(
             "Queue",
@@ -2652,7 +2892,11 @@ fn general_lines(view: &TorrentView) -> Vec<Line<'static>> {
             ),
         ),
         kv("Trackers", t.trackers.len().to_string()),
-    ]
+    ];
+    if t.super_seeding {
+        lines.insert(4, kv("Super-seed", "on".to_string()));
+    }
+    lines
 }
 
 fn render_general(frame: &mut Frame, area: Rect, view: &TorrentView) {
@@ -2664,7 +2908,7 @@ fn render_general(frame: &mut Frame, area: Rect, view: &TorrentView) {
     frame.render_widget(Paragraph::new(Text::from(general_lines(view))).block(block), area);
 }
 
-fn render_trackers(frame: &mut Frame, area: Rect, view: &TorrentView) {
+fn render_trackers(frame: &mut Frame, area: Rect, view: &TorrentView, selected: Option<usize>) {
     let width = usize::from(area.width.saturating_sub(2));
     let trackers = view.ui.torrent.as_ref().map(|t| t.trackers.as_slice()).unwrap_or(&[]);
     let lines: Vec<Line> = if trackers.is_empty() {
@@ -2672,7 +2916,17 @@ fn render_trackers(frame: &mut Frame, area: Rect, view: &TorrentView) {
     } else {
         trackers
             .iter()
-            .map(|url| Line::from(Span::styled(truncate_line(url, width), value_style())))
+            .enumerate()
+            .map(|(i, url)| {
+                let focused = selected == Some(i);
+                Line::from(vec![
+                    Span::styled(if focused { "> " } else { "  " }, heading_style()),
+                    Span::styled(
+                        truncate_line(url, width.saturating_sub(2)),
+                        if focused { selection_style() } else { value_style() },
+                    ),
+                ])
+            })
             .collect()
     };
     let block = Block::default()
@@ -2713,7 +2967,8 @@ fn render_modal(frame: &mut Frame, area: Rect, app: &SessionApp) {
         Modal::Limits { form, .. } | Modal::Settings(form) | Modal::Feed(form) => {
             render_form(frame, area, form)
         }
-        Modal::RemoveFeed { name, .. } => render_remove_feed(frame, area, name),
+        Modal::RemoveFeed { name, .. } => render_confirm(frame, area, "remove feed", "remove feed", name),
+        Modal::RemoveTracker { url, .. } => render_confirm(frame, area, "remove tracker", "remove tracker", url),
     }
 }
 
@@ -2778,20 +3033,20 @@ fn render_remove(frame: &mut Frame, area: Rect, name: &str) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(modal_block("remove torrent")), popup);
 }
 
-fn render_remove_feed(frame: &mut Frame, area: Rect, name: &str) {
+fn render_confirm(frame: &mut Frame, area: Rect, title: &str, verb: &str, name: &str) {
     let popup = popup_rect(70, 6, area);
     let width = usize::from(popup.width.saturating_sub(4));
     let lines = vec![
         Line::from(Span::styled(truncate_line(name, width), value_style())),
         Line::from(vec![
             Span::styled("y", error_style().add_modifier(Modifier::BOLD)),
-            Span::raw(" remove feed   "),
+            Span::raw(format!(" {verb}   ")),
             Span::styled("Esc", heading_style()),
             Span::raw(" cancel"),
         ]),
     ];
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new(Text::from(lines)).block(modal_block("remove feed")), popup);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(modal_block(title)), popup);
 }
 
 fn render_form(frame: &mut Frame, area: Rect, form: &Form) {
@@ -4555,5 +4810,187 @@ mod session_tests {
         assert!(screen.contains("Web UI password"));
         app.on_paste("pasted-pw");
         assert!(!draw(120, 40, &state, &mut app).contains("pasted-pw"));
+    }
+
+    fn rich_state() -> SessionState {
+        let mut state = session(&["a", "b"]);
+        state.rate_history = (0..120).map(|i| (i as f64 * 1024.0, (120 - i) as f64 * 512.0)).collect();
+        state.blocklist_ranges = 42;
+        let t = state.torrents[0].ui.torrent.as_mut().unwrap();
+        t.super_seeding = true;
+        state.torrents[0].ui.peers[0].flags = "EPX".to_string();
+        state
+    }
+
+    fn sent(rx: &mut UnboundedReceiver<SessionCommand>) -> Vec<SessionCommand> {
+        let mut out = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            out.push(cmd);
+        }
+        out
+    }
+
+    #[test]
+    fn spark_data_maps_the_tail_and_sanitises() {
+        let h = vec![(1.0, 9.0), (f64::NAN, -3.0), (2048.0, 4.0), (3.0, f64::INFINITY)];
+        assert_eq!(spark_data(&h, 2, true), vec![2048, 3]);
+        assert_eq!(spark_data(&h, 10, false), vec![9, 0, 4, 0]);
+        assert!(spark_data(&[], 5, true).is_empty());
+        assert_eq!(peak_rate(&h, true), 2048.0);
+        assert_eq!(speed_label('\u{2193}', &h, true), "\u{2193} 3B/s pk 2.0K/s");
+        assert_eq!(speed_label('\u{2191}', &[], false), "\u{2191} - pk -");
+    }
+
+    #[test]
+    fn flags_column_and_marker_formatting() {
+        let state = rich_state();
+        let cells = peer_cells(&state.torrents[0].ui.peers[0]);
+        assert_eq!(cells[5], "EPX");
+        assert_eq!(status_cell(&state.torrents[0]), "downloading*");
+        assert_eq!(status_cell(&state.torrents[1]), "downloading");
+        assert_eq!(header_summary(&state), "2 torrents  \u{2193} 0 B/s  \u{2191} 0 B/s  blocklist: 42 ranges");
+        let general: String = general_lines(&state.torrents[0]).iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(general.contains("Super-seed"));
+    }
+
+    #[test]
+    fn super_seed_key_toggles() {
+        let state = rich_state();
+        let (mut app, mut rx) = app_with(&state);
+        app.on_key(ch('U'));
+        assert_eq!(sent(&mut rx), vec![SessionCommand::Torrent("a".into(), Command::SetSuperSeed(false))]);
+        app.on_key(ch('j'));
+        app.on_key(ch('U'));
+        assert_eq!(sent(&mut rx), vec![SessionCommand::Torrent("b".into(), Command::SetSuperSeed(true))]);
+    }
+
+    #[test]
+    fn trackers_tab_add_validates_and_sends() {
+        let (mut app, mut rx) = app_with(&session(&["a"]));
+        app.set_tab(Tab::Trackers);
+        app.on_key(ch('a'));
+        type_text(&mut app, "ftp://x/announce");
+        app.on_key(key(KeyCode::Enter));
+        let Modal::Text(prompt) = &app.modal else { panic!("prompt closed") };
+        assert!(prompt.error.is_some());
+        assert!(sent(&mut rx).is_empty());
+        for _ in 0..16 {
+            app.on_key(key(KeyCode::Backspace));
+        }
+        type_text(&mut app, "udp://t.example:80/announce");
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(
+            sent(&mut rx),
+            vec![SessionCommand::Torrent("a".into(), Command::AddTracker("udp://t.example:80/announce".into()))]
+        );
+        for bad in ["http://", "https:///x", "tracker.example", ""] {
+            assert!(valid_tracker(bad).is_err(), "{bad}");
+        }
+        assert!(valid_tracker("HTTPS://t.example/a").is_ok());
+    }
+
+    #[test]
+    fn trackers_tab_remove_confirms() {
+        let mut state = session(&["a"]);
+        state.torrents[0].ui.torrent.as_mut().unwrap().trackers =
+            vec!["http://one/a".into(), "http://two/a".into()];
+        let (mut app, mut rx) = app_with(&state);
+        app.set_tab(Tab::Trackers);
+        app.on_key(ch('d'));
+        app.on_key(ch('x'));
+        assert!(matches!(app.modal, Modal::RemoveTracker { .. }));
+        app.on_key(ch('n'));
+        assert!(sent(&mut rx).is_empty());
+        app.on_key(ch('d'));
+        app.on_key(ch('y'));
+        assert_eq!(
+            sent(&mut rx),
+            vec![SessionCommand::Torrent("a".into(), Command::RemoveTracker("http://one/a".into()))]
+        );
+        app.on_key(ch('j'));
+        app.on_key(ch('j'));
+        app.on_key(ch('d'));
+        app.on_key(ch('y'));
+        assert_eq!(
+            sent(&mut rx),
+            vec![SessionCommand::Torrent("a".into(), Command::RemoveTracker("http://two/a".into()))]
+        );
+        assert_eq!(app.selected_id.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn settings_form_round_trips_blocklist_and_schedule() {
+        let mut base = Settings::default();
+        base.blocklist = Some(PathBuf::from("/tmp/bl.p2p"));
+        base.notifications = false;
+        base.schedule.enabled = true;
+        base.schedule.limited_down = 2048;
+        base.schedule.limited_up = 1024;
+        base.schedule.utc_offset_minutes = 60;
+        assert_eq!(parse_settings(&settings_form(&base), &base).unwrap(), base);
+
+        let mut form = settings_form(&base);
+        form.fields[SCHEDULE_RULE].input.text = "weekdays 09-18 limited; sat 00-24 off".to_string();
+        form.fields[NOTIFY_FIELD].on = true;
+        form.fields[BLOCKLIST_FIELD].input.text = String::new();
+        form.fields[SCHEDULE_DOWN].input.text = "5".to_string();
+        let parsed = parse_settings(&form, &base).unwrap();
+        assert_eq!(parsed.blocklist, None);
+        assert!(parsed.notifications);
+        assert_eq!(parsed.schedule.limited_down, 5120);
+        assert_eq!(parsed.schedule.utc_offset_minutes, 60);
+        assert_eq!(parsed.schedule.grid[0][9], crate::schedule::Slot::Limited);
+        assert_eq!(parsed.schedule.grid[5][3], crate::schedule::Slot::Off);
+        assert_eq!(parsed.listen_port, base.listen_port);
+
+        form.fields[SCHEDULE_RULE].input.text = "weekdays 09-18 bogus".to_string();
+        let err = parse_settings(&form, &base).unwrap_err();
+        assert!(err.starts_with("Schedule rule:"), "{err}");
+        assert!(grid_summary(&base.schedule).starts_with("grid mon:N24 tue:N24"));
+    }
+
+    #[test]
+    fn bad_schedule_rule_stays_in_the_form() {
+        let (mut app, mut rx) = app_with(&session(&["a"]));
+        app.on_key(ch('o'));
+        let Modal::Settings(form) = &mut app.modal else { panic!() };
+        form.fields[SCHEDULE_RULE].input.text = "nonsense".to_string();
+        app.on_key(key(KeyCode::Enter));
+        let Modal::Settings(form) = &app.modal else { panic!("form closed") };
+        assert!(form.error.as_deref().is_some_and(|e| e.contains("Schedule rule")));
+        assert!(sent(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn renders_graph_flags_and_markers_at_all_sizes() {
+        let state = rich_state();
+        for (w, h) in [(120, 30), (80, 24), (40, 12)] {
+            let mut app = SessionApp::new();
+            for tab in Tab::ALL {
+                app.set_tab(tab);
+                let screen = draw(w, h, &state, &mut app);
+                assert!(screen.contains("quit") || w < 80, "{w}x{h} {tab:?}\n{screen}");
+                if h >= 24 {
+                    assert!(screen.contains("pk"), "{w}x{h} {tab:?}\n{screen}");
+                    assert!(screen.contains("downloading*"), "{w}x{h} {tab:?}\n{screen}");
+                } else {
+                    assert!(!screen.contains(" pk "), "{screen}");
+                }
+            }
+            app.set_tab(Tab::Peers);
+            if w >= 80 {
+                assert!(draw(w, h, &state, &mut app).contains("EPX"));
+            }
+            app.on_key(ch('o'));
+            draw(w, h, &state, &mut app);
+            app.on_key(key(KeyCode::Esc));
+            app.on_key(ch('?'));
+            draw(w, h, &state, &mut app);
+        }
+        let mut app = SessionApp::new();
+        assert!(draw(120, 30, &state, &mut app).contains("blocklist: 42 ranges"));
+        app.set_tab(Tab::Session);
+        assert!(draw(120, 30, &state, &mut app).contains("speed"));
     }
 }

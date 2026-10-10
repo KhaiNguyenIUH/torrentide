@@ -561,6 +561,7 @@ mod tests {
             announce: None,
             announce_list: vec![],
             web_seeds: vec![],
+            info_bytes: vec![],
         }
     }
 

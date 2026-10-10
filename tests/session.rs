@@ -169,6 +169,7 @@ fn settings(dir: &Path) -> Settings {
         dht: false,
         port_forwarding: false,
         lsd: false,
+        notifications: false,
         ..Settings::default()
     }
 }
@@ -678,5 +679,92 @@ async fn move_completed_runs_once_per_torrent() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(at(&*h.state().read().await, &id, &done), "moved again after restart");
     assert!(!other.join("mc").exists());
+    quit(h).await;
+}
+
+async fn handshake_reply_len(port: u16, id: &str) -> usize {
+    let mut hs = vec![19u8];
+    hs.extend_from_slice(b"BitTorrent protocol");
+    hs.extend_from_slice(&[0u8; 8]);
+    hs.extend_from_slice(&hex::decode(id).unwrap());
+    hs.extend_from_slice(&[7u8; 20]);
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let _ = s.write_all(&hs).await;
+    let mut buf = [0u8; 68];
+    let mut n = 0;
+    while n < buf.len() {
+        match tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf[n..])).await {
+            Ok(Ok(k)) if k > 0 => n += k,
+            _ => break,
+        }
+    }
+    n
+}
+
+#[tokio::test]
+async fn blocklist_refuses_inbound_peers_and_reports_ranges() {
+    let fx = Fixture::new("blk", 51);
+    let dl = temp_dir("dl");
+    let (h, home, id) = seeding_session(&fx, &dl).await;
+    assert_eq!(handshake_reply_len(h.port(), &id).await, 68);
+
+    let list = temp_dir("bl").join("list.txt");
+    std::fs::write(&list, "# comment\nloopback:127.0.0.1-127.0.0.1\nnot a range\n").unwrap();
+    let mut s = h.state().read().await.settings.clone();
+    s.blocklist = Some(list.clone());
+    h.command().send(SessionCommand::SetSettings(s)).unwrap();
+    wait_for(&h, "block list loaded", 10, |st| st.blocklist_ranges == 1).await;
+    assert!(h.state().read().await.log.iter().any(|l| l.message.contains("1 ranges, 1 lines skipped")));
+    assert_eq!(handshake_reply_len(h.port(), &id).await, 0);
+    quit(h).await;
+
+    let mut again = settings(&dl);
+    again.blocklist = Some(list);
+    let h = Session::start_in(Store::at(&home), again).await.unwrap();
+    wait_for(&h, "block list restored", 10, |st| st.blocklist_ranges == 1).await;
+    quit(h).await;
+}
+
+#[tokio::test]
+async fn missing_blocklist_file_logs_an_error() {
+    let dl = temp_dir("dl");
+    let mut s = settings(&dl);
+    s.blocklist = Some(dl.join("nope.txt"));
+    let h = Session::start_in(Store::at(temp_dir("home")), s).await.unwrap();
+    {
+        let st = h.state();
+        let st = st.read().await;
+        assert_eq!(st.blocklist_ranges, 0);
+        assert!(st.log.iter().any(|l| l.level == torrust::state::Level::Error && l.message.contains("block list")));
+    }
+    quit(h).await;
+}
+
+#[tokio::test]
+async fn schedule_off_stops_running_torrents_and_disabling_restarts_them() {
+    let fx = Fixture::new("sch", 52);
+    let dl = temp_dir("dl");
+    let (h, _home, id) = seeding_session(&fx, &dl).await;
+    let mut s = h.state().read().await.settings.clone();
+    s.schedule.enabled = true;
+    s.schedule.grid = torrust::schedule::Schedule::parse_grid(&"O".repeat(168)).unwrap();
+    h.command().send(SessionCommand::SetSettings(s.clone())).unwrap();
+    wait_for(&h, "stopped by schedule", 15, |st| torrent_state(st, &id) == Some(DownloadState::Queued)).await;
+    assert!(h.state().read().await.log.iter().any(|l| l.message.contains("schedule: all transfers off")));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(torrent_state(&*h.state().read().await, &id), Some(DownloadState::Queued));
+
+    s.schedule.enabled = false;
+    h.command().send(SessionCommand::SetSettings(s)).unwrap();
+    wait_for(&h, "restarted", 30, |st| is_done(torrent_state(st, &id))).await;
+    quit(h).await;
+}
+
+#[tokio::test]
+async fn rate_history_grows_one_sample_a_second() {
+    let dl = temp_dir("dl");
+    let h = Session::start_in(Store::at(temp_dir("home")), settings(&dl)).await.unwrap();
+    wait_for(&h, "three samples", 10, |st| st.rate_history.len() >= 3).await;
+    assert!(h.state().read().await.rate_history.len() <= 300);
     quit(h).await;
 }
