@@ -1487,7 +1487,7 @@ impl DhtNode {
         let target_id = NodeId(infohash.0);
         let (_, mut tokens) = self.get_peers_rounds(infohash, 3).await?;
         if tokens.is_empty() {
-            tracing::warn!(infohash = %infohash, "announce_peer skipped: no node gave a token");
+            tracing::debug!(infohash = %infohash, "announce_peer skipped: no node gave a token");
             return Ok(());
         }
         tokens.sort_by_key(|(id, _, _)| id.distance(&target_id));

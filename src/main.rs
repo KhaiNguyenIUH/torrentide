@@ -210,14 +210,24 @@ async fn main() -> Result<()> {
         Command::Add { source, output } => {
             use torrust::ipc::Delivery;
             #[cfg(unix)]
-            {
+            let watch = {
                 let store = torrust::store::Store::open();
                 if !torrust::ipc::session_running(&store) {
                     start_service(&store).await?;
                 }
-            }
+                torrust::ipc::attach(&store).await.ok().map(|(state, _)| state)
+            };
+            #[cfg(not(unix))]
+            let watch: Option<Arc<RwLock<torrust::state::SessionState>>> = None;
+            let before = match &watch {
+                Some(state) => state.read().await.log_total,
+                None => 0,
+            };
             match torrust::ipc::send_add(&source, output.as_deref()).await? {
-                Delivery::Delivered => println!("added to running session"),
+                Delivery::Delivered => match watch {
+                    Some(state) => println!("{}", add_outcome(&state, before).await?),
+                    None => println!("sent to the running session"),
+                },
                 Delivery::Queued => println!("queued; it will start next time torrust runs"),
             }
             Ok(())
@@ -352,6 +362,27 @@ async fn start_service(store: &torrust::store::Store) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     bail!("the background session did not start within 10 s; see {}", log_path().display())
+}
+
+/// Wait briefly for the session to log the result of an add sent after
+/// `before` log lines, so the caller sees "added X" or why it was refused.
+async fn add_outcome(state: &RwLock<torrust::state::SessionState>, before: u64) -> Result<String> {
+    for _ in 0..50 {
+        {
+            let st = state.read().await;
+            let fresh = (st.log_total.saturating_sub(before) as usize).min(st.log.len());
+            for l in &st.log[st.log.len() - fresh..] {
+                if l.message.starts_with("cannot add ") {
+                    bail!("{}", l.message);
+                }
+                if l.message.starts_with("added ") {
+                    return Ok(l.message.clone());
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok("sent to the running session; still working on it (see the TUI or web UI)".to_string())
 }
 
 async fn set_webui_password() -> Result<()> {

@@ -35,6 +35,10 @@ td.num, th.num { text-align:right; }
 .empty { color:var(--mut); padding:12px 8px; }
 .feed { padding:6px 0; border-bottom:1px solid var(--line); word-break:break-word; }
 .feed small { color:var(--mut); display:block; }
+td small.err { display:block; margin:2px 0 0; min-height:0; white-space:normal; }
+#log { list-style:none; margin:0; padding:0; font-size:13px; }
+#log li { padding:3px 0; border-bottom:1px solid var(--line); word-break:break-word; color:var(--mut); }
+#log li.error, #log li.warn { color:var(--err); }
 </style>
 </head>
 <body>
@@ -66,6 +70,9 @@ td.num, th.num { text-align:right; }
   <button class="primary" type="submit">Add feed</button>
 </form>
 
+<h2>Activity</h2>
+<ul id="log" aria-live="polite"></ul>
+
 <script>
 "use strict";
 var $ = function (id) { return document.getElementById(id); };
@@ -88,6 +95,8 @@ function el(tag, cls, text) {
   if (text != null) e.textContent = text;
   return e;
 }
+// The newest error the session logged since the last action, until the next one.
+var seenLog = null, lastError = "";
 function showErr(msg) { $("err").textContent = msg || ""; }
 
 function post(path, params) {
@@ -107,7 +116,7 @@ function send(path, type, body) {
         throw new Error(m || ("HTTP " + r.status));
       });
     }
-  }).then(function () { showErr(""); return refresh(); }).catch(function (e) { showErr(e.message); });
+  }).then(function () { lastError = ""; showErr(""); return refresh(); }).catch(function (e) { lastError = e.message; showErr(e.message); });
 }
 
 function action(t, name) {
@@ -129,7 +138,9 @@ function row(t) {
   var tdb = el("td");
   tdb.appendChild(bar);
   tr.appendChild(tdb);
-  tr.appendChild(el("td", null, t.state));
+  var st = el("td", null, t.state);
+  if (t.warning) st.appendChild(el("small", "err", t.warning));
+  tr.appendChild(st);
   tr.appendChild(el("td", "num", rate(t.download_rate)));
   tr.appendChild(el("td", "num", rate(t.upload_rate)));
   tr.appendChild(el("td", "num", dur(t.eta_secs)));
@@ -173,7 +184,12 @@ function render(s) {
   $("empty").hidden = s.torrents.length > 0;
   var feeds = $("feeds");
   feeds.replaceChildren.apply(feeds, s.feeds.map(feed));
-  if (s.warning) showErr(s.warning);
+  var fresh = seenLog === null ? 0 : Math.min(s.log.length, s.log_total - seenLog);
+  s.log.slice(s.log.length - fresh).forEach(function (l) { if (l.level === "error") lastError = l.message; });
+  seenLog = s.log_total;
+  showErr(s.warning || lastError);
+  var log = $("log");
+  log.replaceChildren.apply(log, s.log.slice().reverse().map(function (l) { return el("li", l.level, l.message); }));
 }
 
 var busy = false;

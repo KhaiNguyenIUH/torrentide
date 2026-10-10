@@ -22,13 +22,21 @@ on run
 	display dialog "Torrust Magnet Handler opens magnet: links and .torrent files with torrust." buttons {"OK"} default button "OK"
 end run
 
+on addSource(theSource)
+	try
+		do shell script (quoted form of torrustBin) & " add " & quoted form of theSource
+	on error errMsg
+		display notification errMsg with title "torrust"
+	end try
+end addSource
+
 on open location theURL
-	do shell script (quoted form of torrustBin) & " add " & quoted form of theURL & " >/dev/null 2>&1 &"
+	addSource(theURL)
 end open location
 
 on open theFiles
 	repeat with f in theFiles
-		do shell script (quoted form of torrustBin) & " add " & quoted form of POSIX path of f & " >/dev/null 2>&1 &"
+		addSource(POSIX path of f)
 	end repeat
 end open
 APPLESCRIPT

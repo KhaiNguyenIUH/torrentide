@@ -25,6 +25,8 @@ use crate::state::{Command, SessionCommand, SessionState, WebUiSettings};
 const INDEX_HTML: &str = include_str!("webui/index.html");
 const MAX_HEAD: usize = 8 * 1024;
 const MAX_BODY: usize = 64 * 1024;
+/// Most recent session log lines included in `/api/state`.
+const LOG_SHOWN: usize = 20;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_PER_IP: usize = 6;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -616,7 +618,7 @@ fn state_json(st: &SessionState) -> String {
             format!(
                 "{{\"id\":{},\"name\":{},\"state\":{},\"progress\":{},\"download_rate\":{},\
                  \"upload_rate\":{},\"eta_secs\":{},\"ratio\":{},\"size\":{},\"downloaded\":{},\
-                 \"uploaded\":{},\"label\":{},\"queue_position\":{}}}",
+                 \"uploaded\":{},\"label\":{},\"queue_position\":{},\"warning\":{}}}",
                 json_str(&t.id),
                 json_str(name),
                 json_str(state),
@@ -630,6 +632,7 @@ fn state_json(st: &SessionState) -> String {
                 t.uploaded,
                 json_opt(t.label.as_deref()),
                 queue,
+                json_opt(t.ui.warning.as_deref()),
             )
         })
         .collect();
@@ -652,15 +655,21 @@ fn state_json(st: &SessionState) -> String {
             )
         })
         .collect();
+    let log: Vec<String> = st.log[st.log.len().saturating_sub(LOG_SHOWN)..]
+        .iter()
+        .map(|l| format!("{{\"level\":{},\"message\":{}}}", json_str(&l.level.label().to_ascii_lowercase()), json_str(&l.message)))
+        .collect();
     format!(
         "{{\"torrents\":[{}],\"download_rate\":{},\"upload_rate\":{},\"port_status\":{},\
-         \"warning\":{},\"feeds\":[{}]}}",
+         \"warning\":{},\"feeds\":[{}],\"log\":[{}],\"log_total\":{}}}",
         torrents.join(","),
         json_num(st.download_rate),
         json_num(st.upload_rate),
         json_str(&st.port_status),
         json_opt(st.warning.as_deref()),
         feeds.join(","),
+        log.join(","),
+        st.log_total,
     )
 }
 
@@ -797,7 +806,7 @@ async fn route(req: &Request, body: &[u8], state: &RwLock<SessionState>) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{DownloadState, FeedView, TorrentSummary, TorrentView, UiState};
+    use crate::state::{DownloadState, FeedView, Level, TorrentSummary, TorrentView, UiState};
     use tokio::sync::mpsc;
 
     const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -920,6 +929,23 @@ mod tests {
             }
         }
         assert!(!in_str && depth == 0 && !esc);
+    }
+
+    #[test]
+    fn state_carries_recent_log_and_torrent_warnings() {
+        let (state, _rx) = fake_state(false);
+        let mut st = state.try_write().unwrap();
+        for i in 0..LOG_SHOWN + 5 {
+            st.log(Level::Info, format!("line {i}"));
+        }
+        st.log(Level::Error, "cannot add x.torrent: already in the session");
+        st.torrents[1].ui.warning = Some("tracker: \"down\"".into());
+        let json = state_json(&st);
+        assert_valid_json(&json);
+        assert!(json.contains(&format!("\"log_total\":{}", LOG_SHOWN + 6)), "{json}");
+        assert!(json.contains("{\"level\":\"error\",\"message\":\"cannot add x.torrent: already in the session\"}"));
+        assert!(!json.contains("\"line 5\"") && json.contains("\"line 6\""));
+        assert!(json.contains("\"warning\":\"tracker: \\\"down\\\"\""), "{json}");
     }
 
     #[test]

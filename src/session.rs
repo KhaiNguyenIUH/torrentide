@@ -674,18 +674,21 @@ impl Core {
     }
 
     async fn on_mapping(&mut self, latest: Option<std::result::Result<portmap::Mapping, String>>) {
-        let status = match latest {
+        let (status, detail) = match latest {
             Some(Ok(m)) => {
                 let s = format!("port {} · {m}", self.port);
                 self.mapping = Some(m);
-                s
+                (s.clone(), s)
             }
-            Some(Err(e)) => format!("port {} · not forwarded ({e})", self.port),
+            Some(Err(e)) => (
+                format!("port {} · not forwarded by the router", self.port),
+                format!("port {} not forwarded: the router answered neither NAT-PMP nor UPnP ({e}); peers can still be reached outbound", self.port),
+            ),
             None => return,
         };
         let changed = self.state.read().await.port_status != status;
         if changed {
-            self.log(Level::Info, status.clone()).await;
+            self.log(Level::Info, detail).await;
             self.state.write().await.port_status = status;
         }
     }
@@ -809,7 +812,7 @@ impl Core {
             None if !source.starts_with("magnet:") => match read_source(&source).await {
                 Ok(raw) => Some(raw),
                 Err(e) => {
-                    self.log(Level::Error, format!("cannot add {}: {e:#}", shown(&source))).await;
+                    self.log(Level::Error, format!("cannot add {}: {e:#}", subject(&source))).await;
                     return;
                 }
             },
@@ -831,7 +834,7 @@ impl Core {
                 self.save(i).await;
                 self.log(Level::Info, format!("added {name}")).await;
             }
-            Err(e) => self.log(Level::Error, format!("cannot add {}: {e:#}", shown(&source))).await,
+            Err(e) => self.log(Level::Error, format!("cannot add {}: {e:#}", subject(&source))).await,
         }
     }
 
@@ -854,7 +857,7 @@ impl Core {
             Fetched::Torrent { source, dir, ack, result } => {
                 match result {
                     Ok(raw) => self.add_loaded(source, Some(raw), dir).await,
-                    Err(e) => self.log(Level::Error, format!("cannot add {}: {e:#}", shown(&source))).await,
+                    Err(e) => self.log(Level::Error, format!("cannot add {}: {e:#}", subject(&source))).await,
                 }
                 if let Some(a) = ack {
                     let _ = std::fs::remove_file(a);
@@ -2140,6 +2143,21 @@ fn redacted(url: &str) -> String {
     crate::redact::url(url)
 }
 
+/// A short name for what is being added, so an error's reason stays visible
+/// in a narrow log row: the magnet's name, the file name, or the redacted URL.
+fn subject(source: &str) -> String {
+    if source.starts_with("magnet:") {
+        return match Magnet::parse(source) {
+            Ok(m) => m.display_name.unwrap_or_else(|| format!("magnet {}", &m.infohash.to_hex()[..8])),
+            Err(_) => "magnet link".to_string(),
+        };
+    }
+    if is_http(source) {
+        return redacted(source);
+    }
+    Path::new(source).file_name().map_or_else(|| source.to_owned(), |n| n.to_string_lossy().into_owned())
+}
+
 fn shown(source: &str) -> String {
     if is_http(source) {
         redacted(source)
@@ -2181,6 +2199,14 @@ fn summary_line(st: &SessionState) -> String {
 mod tests {
     use super::*;
     use crate::storage::sha1_bytes;
+
+    #[test]
+    fn add_errors_name_the_torrent_briefly() {
+        assert_eq!(subject("magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=Big+Buck+Bunny&tr=udp%3A%2F%2Ft%3A1"), "Big Buck Bunny");
+        assert_eq!(subject("magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c"), "magnet dd8255ec");
+        assert_eq!(subject("/Users/a/Downloads/some file.torrent"), "some file.torrent");
+        assert!(!subject("https://u:secret@example.com/x.torrent?passkey=abc").contains("secret"));
+    }
 
     #[test]
     fn lsd_needs_known_public_metadata() {

@@ -433,11 +433,15 @@ pub struct SessionState {
     pub rate_history: Vec<(f64, f64)>,
     /// Ranges loaded from the IP block list, or 0.
     pub blocklist_ranges: usize,
+    /// Log lines ever appended, so a viewer can tell which entries are new
+    /// after the oldest ones roll off.
+    pub log_total: u64,
 }
 
 impl SessionState {
     pub fn log(&mut self, level: Level, message: impl Into<String>) {
         const MAX: usize = 500;
+        self.log_total += 1;
         if self.log.len() >= MAX {
             self.log.remove(0);
         }
