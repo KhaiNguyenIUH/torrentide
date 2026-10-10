@@ -15,6 +15,7 @@ use tokio::io::{split, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex, Notify};
 
+use super::pex;
 use super::wire::{self, Bitfield, Message};
 use crate::metainfo::InfoHash;
 use crate::ratelimit::Limits;
@@ -54,6 +55,8 @@ pub enum ToPeer {
     Have(u32),
     /// Shut the connection down: the writer closes its half and the reader ends.
     Close,
+    /// A BEP 10 extended message. `ext_id` 0 is the extended handshake.
+    Extended { ext_id: u8, payload: Vec<u8> },
     /// Send a raw Bitfield message. Sent internally when the connection comes up.
     SendBitfield(Vec<u8>),
     /// A block we read from local storage in response to a peer's `Request`.
@@ -116,6 +119,13 @@ pub struct PeerState {
     pub uploaded: u64,
     pub connected_at: Instant,
     pub last_activity: Instant,
+    /// The id this peer wants `ut_pex` messages under, once its extended
+    /// handshake has arrived.
+    pub pex_id: Option<u8>,
+    /// The peer's advertised listen port, from its extended handshake.
+    pub listen_port: Option<u16>,
+    /// When we last accepted a `ut_pex` message from this peer.
+    pub last_pex_in: Option<Instant>,
 }
 
 impl PeerState {
@@ -133,6 +143,9 @@ impl PeerState {
             uploaded: 0,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
+            pex_id: None,
+            listen_port: None,
+            last_pex_in: None,
         }
     }
 
@@ -233,6 +246,7 @@ pub async fn connect(
     inbound_tx: mpsc::UnboundedSender<FromPeer>,
     limits: Limits,
     auto_unchoke: bool,
+    pex_port: Option<u16>,
 ) -> Result<PeerHandle> {
     // A short connect timeout matters: a tracker can hand back many dead peers,
     // and each one that lingers for the full timeout delays the next attempt.
@@ -244,7 +258,7 @@ pub async fn connect(
     let _ = stream.set_nodelay(true);
     let (mut rd, mut wr) = split(stream);
 
-    wire::handshake_outgoing(&mut wr, &infohash.0, true, false, false).await?;
+    wire::handshake_outgoing(&mut wr, &infohash.0, true, false, pex_port.is_some()).await?;
     let hs = wire::handshake_incoming(&mut rd).await?;
     if hs.infohash != infohash.0 {
         return Err(anyhow!(
@@ -264,6 +278,7 @@ pub async fn connect(
         false,
         limits,
         auto_unchoke,
+        pex_port.filter(|_| hs.supports_extended()),
     )
     .await?;
 
@@ -282,6 +297,7 @@ pub async fn accept(
     inbound_tx: mpsc::UnboundedSender<FromPeer>,
     limits: Limits,
     auto_unchoke: bool,
+    pex_port: Option<u16>,
 ) -> Result<PeerHandle> {
     let hs = wire::handshake_incoming(&mut stream).await?;
     accept_handshaken(
@@ -293,6 +309,7 @@ pub async fn accept(
         inbound_tx,
         limits,
         auto_unchoke,
+        pex_port,
     )
     .await
 }
@@ -308,6 +325,7 @@ pub async fn accept_handshaken(
     inbound_tx: mpsc::UnboundedSender<FromPeer>,
     limits: Limits,
     auto_unchoke: bool,
+    pex_port: Option<u16>,
 ) -> Result<PeerHandle> {
     let addr = stream
         .peer_addr()
@@ -322,7 +340,7 @@ pub async fn accept_handshaken(
     }
     let (rd, mut wr) = split(stream);
     // The dialer waits for our half of the handshake before sending anything.
-    wire::handshake_outgoing(&mut wr, &infohash.0, true, false, false).await?;
+    wire::handshake_outgoing(&mut wr, &infohash.0, true, false, pex_port.is_some()).await?;
 
     // Announce acceptance before the tasks take ownership of the sender.
     let _ = inbound_tx.send(FromPeer::Accepted(addr));
@@ -339,6 +357,7 @@ pub async fn accept_handshaken(
         true,
         limits,
         auto_unchoke,
+        pex_port.filter(|_| hs.supports_extended()),
     )
     .await
 }
@@ -355,6 +374,7 @@ async fn spawn_tasks<S>(
     inbound: bool,
     limits: Limits,
     auto_unchoke: bool,
+    pex_port: Option<u16>,
 ) -> Result<PeerHandle>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -473,7 +493,26 @@ where
                         }
                         Message::Cancel { .. } => {}
                         Message::Port { .. } => {}
-                        Message::Extended { .. } => {}
+                        Message::Extended { ext_id, payload } => {
+                            if pex_port.is_some() {
+                                if ext_id == 0 {
+                                    if let Some(h) = pex::decode_handshake(&payload) {
+                                        st.pex_id = h.pex_id;
+                                        st.listen_port = h.port;
+                                    }
+                                } else if ext_id == pex::OUR_PEX_ID
+                                    && st
+                                        .last_pex_in
+                                        .map_or(true, |t| t.elapsed() >= pex::MIN_RECEIVE_GAP)
+                                {
+                                    st.last_pex_in = Some(Instant::now());
+                                    let added = pex::decode(&payload).added;
+                                    if !added.is_empty() {
+                                        forward = Some(FromPeer::PexPeers(added));
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     drop(st);
@@ -507,6 +546,12 @@ where
 
     // ---- writer ----
     let writer_state = Arc::clone(&state);
+    if let Some(port) = pex_port {
+        let _ = peer_tx.send(ToPeer::Extended {
+            ext_id: 0,
+            payload: pex::encode_handshake(port),
+        });
+    }
     // Queue the initial Bitfield before the loop starts so it is always the
     // first thing the peer sees from us.
     if let Some(s) = seeder.read().unwrap().as_ref() {
@@ -578,6 +623,7 @@ where
                 }
                 ToPeer::Have(index) => Message::Have { index },
                 ToPeer::Close => break,
+                ToPeer::Extended { ext_id, payload } => Message::Extended { ext_id, payload },
                 ToPeer::SendBitfield(bytes) => Message::Bitfield { bits: bytes },
                 ToPeer::Serve { index, begin, block } => {
                     limits.acquire_up(block.len()).await;
@@ -654,6 +700,7 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         }
     }
 

@@ -1219,6 +1219,7 @@ dependencies = [
  "ratatui",
  "rustls",
  "sha1",
+ "socket2",
  "thiserror",
  "tokio",
  "tokio-rustls",

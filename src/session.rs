@@ -7,6 +7,7 @@
 //! [`SessionState`] the TUI reads.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,6 +21,7 @@ use tokio::task::JoinHandle;
 use crate::bencode::{self, Value};
 use crate::dht::DhtNode;
 use crate::engine::{self, Engine, EngineOptions};
+use crate::lsd::Lsd;
 use crate::metainfo::{InfoHash, Magnet, Metainfo};
 use crate::peer::wire::{handshake_incoming, Handshake};
 use crate::portmap;
@@ -154,7 +156,23 @@ impl Session {
         };
 
         let routes: Routes = Arc::default();
-        let accept = tokio::spawn(accept_loop(listener, Arc::clone(&routes)));
+        let mut accepts = vec![tokio::spawn(accept_loop(listener, Arc::clone(&routes)))];
+        match bind_v6(port) {
+            Ok(l) => accepts.push(tokio::spawn(accept_loop(l, Arc::clone(&routes)))),
+            Err(e) => tracing::debug!(error = %e, "no separate IPv6 listener"),
+        }
+
+        let lsd = if settings.lsd {
+            match Lsd::start(port).await {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    state.write().await.log(Level::Warn, format!("local peer discovery unavailable: {e:#}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let dht = if settings.dht {
             match DhtNode::new(None).await {
@@ -204,14 +222,26 @@ impl Session {
             routes,
             port,
             dht,
+            lsd,
             mapping: None,
-            tasks: std::iter::once(accept).chain(mapper).chain(ipc).collect(),
+            tasks: accepts.into_iter().chain(mapper).chain(ipc).collect(),
         };
         core.init().await;
 
         let join = tokio::spawn(core.run(rx, pm_rx));
         Ok(SessionHandle { state, tx, port, join })
     }
+}
+
+fn bind_v6(port: u16) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let s = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    s.set_only_v6(true)?;
+    s.set_reuse_address(true)?;
+    s.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())?;
+    s.listen(1024)?;
+    s.set_nonblocking(true)?;
+    TcpListener::from_std(s.into())
 }
 
 async fn accept_loop(listener: TcpListener, routes: Routes) {
@@ -247,6 +277,7 @@ struct Core {
     routes: Routes,
     port: u16,
     dht: Option<Arc<DhtNode>>,
+    lsd: Option<Lsd>,
     gdown: Arc<RateLimiter>,
     gup: Arc<RateLimiter>,
     mapping: Option<portmap::Mapping>,
@@ -507,7 +538,10 @@ impl Core {
             inbound: Some(in_rx),
             port: self.port,
             file_priorities: e.rec.priorities.clone(),
-            extra_peers: None,
+            extra_peers: match &self.lsd {
+                Some(l) if e.meta.as_ref().is_none_or(|m| !m.private) => Some(l.register(e.ih.0)),
+                _ => None,
+            },
         };
         let ui = Arc::clone(&e.ui);
         let dir = e.rec.dir.clone();
@@ -534,6 +568,9 @@ impl Core {
         if let Some(run) = e.run.take() {
             let _ = run.cmd.send(Command::Stop);
             self.routes.lock().unwrap().remove(&e.ih.0);
+            if let Some(l) = &self.lsd {
+                l.unregister(&e.ih.0);
+            }
             let mut handle = run.handle;
             if tokio::time::timeout(STOP_TIMEOUT, &mut handle).await.is_err() {
                 handle.abort();
@@ -662,8 +699,8 @@ impl Core {
         if let Err(e) = self.store.save_settings(&new) {
             self.log(Level::Error, format!("saving settings: {e:#}")).await;
         }
-        if new.listen_port != old.listen_port || new.dht != old.dht || new.port_forwarding != old.port_forwarding {
-            self.log(Level::Info, "port, DHT and port forwarding changes take effect after restart").await;
+        if new.listen_port != old.listen_port || new.dht != old.dht || new.lsd != old.lsd || new.port_forwarding != old.port_forwarding {
+            self.log(Level::Info, "port, DHT, local discovery and port forwarding changes take effect after restart").await;
         }
         if new.ratio_target != old.ratio_target {
             self.log(Level::Info, "ratio target applies to torrents started from now on").await;
@@ -693,6 +730,11 @@ impl Core {
                     let trackers = e.magnet.as_ref().map(|m| m.trackers.clone()).unwrap_or_default();
                     match store_metadata(&self.store, &e.rec.id, &info, &trackers) {
                         Ok(meta) => {
+                            if meta.private {
+                                if let Some(l) = &self.lsd {
+                                    l.unregister(&e.ih.0);
+                                }
+                            }
                             e.meta = Some(Arc::new(meta));
                             e.rec.magnet = None;
                             dirty = true;
@@ -705,6 +747,9 @@ impl Core {
             if e.run.as_ref().is_some_and(|r| r.handle.is_finished()) {
                 let run = e.run.take().unwrap();
                 self.routes.lock().unwrap().remove(&e.ih.0);
+                if let Some(l) = &self.lsd {
+                    l.unregister(&e.ih.0);
+                }
                 let result = run.handle.await;
                 let mut ui = e.ui.write().await;
                 match result {

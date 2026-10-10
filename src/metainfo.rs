@@ -90,6 +90,8 @@ pub struct Metainfo {
     pub private: bool,
     pub announce: Option<String>,
     pub announce_list: Vec<String>,
+    /// BEP 19 `url-list` web seeds, http(s) only.
+    pub web_seeds: Vec<String>,
 }
 
 impl Metainfo {
@@ -198,6 +200,17 @@ impl Metainfo {
         announce_list.sort();
         announce_list.dedup();
 
+        let mut web_seeds = Vec::new();
+        if let Some(v) = root.get_opt("url-list") {
+            if let Ok(list) = v.as_list() {
+                web_seeds.extend(list.iter().filter_map(|e| e.as_str().ok().map(str::to_owned)));
+            } else if let Ok(s) = v.as_str() {
+                web_seeds.push(s.to_owned());
+            }
+        }
+        web_seeds.retain(|u| is_http_url(u));
+        web_seeds.dedup();
+
         let total_length = files.total_length();
 
         // Sanity check: the piece count implied by the file sizes must match the
@@ -222,8 +235,14 @@ impl Metainfo {
             private,
             announce,
             announce_list,
+            web_seeds,
         })
     }
+}
+
+pub fn is_http_url(u: &str) -> bool {
+    let l = u.to_ascii_lowercase();
+    l.starts_with("http://") || l.starts_with("https://")
 }
 
 fn parse_files(info: &Value, root_name: &str) -> Result<Files> {
@@ -497,6 +516,25 @@ mod tests {
             (b"announce".to_vec(), Value::Bytes(b"http://tracker/ann".to_vec())),
             (b"info".to_vec(), info),
         ])))
+    }
+
+    fn with_url_list(url_list: crate::bencode::Value) -> Metainfo {
+        use crate::bencode::Value;
+        let raw = single_file_torrent(16384, 40_000, "hello.bin");
+        let Value::Dict(mut d) = crate::bencode::decode(&raw).unwrap() else { panic!() };
+        d.insert(b"url-list".to_vec(), url_list);
+        Metainfo::from_bytes(&crate::bencode::encode(&Value::Dict(d))).unwrap()
+    }
+
+    #[test]
+    fn url_list_string_list_and_non_http() {
+        use crate::bencode::Value;
+        let b = |s: &str| Value::Bytes(s.as_bytes().to_vec());
+        assert_eq!(with_url_list(b("http://a/f")).web_seeds, vec!["http://a/f"]);
+        let m = with_url_list(Value::List(vec![b("https://b/"), b("ftp://c/x"), b("http://d/y")]));
+        assert_eq!(m.web_seeds, vec!["https://b/", "http://d/y"]);
+        assert!(with_url_list(b("")).web_seeds.is_empty());
+        assert!(Metainfo::from_bytes(&single_file_torrent(16384, 40_000, "x")).unwrap().web_seeds.is_empty());
     }
 
     #[test]

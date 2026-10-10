@@ -33,6 +33,7 @@ use crate::state::{
 };
 use crate::storage::Storage;
 use crate::tracker::{self, Event};
+use crate::webseed::{self, WebSeed};
 
 /// Port we advertise to peers and announce to trackers.
 pub const LOCAL_PORT: u16 = 6881;
@@ -339,6 +340,14 @@ impl Engine {
         let mut last_rechoke = Instant::now();
         let uploaded_so_far = self.opts.uploaded_so_far;
 
+        let mut web_seeds: Vec<WebSeed> = Vec::new();
+        for u in self.meta.web_seeds.iter().take(webseed::MAX_WEB_SEEDS) {
+            web_seeds.push(WebSeed::new(u.clone()));
+        }
+        let mut ws_jobs = tokio::task::JoinSet::new();
+        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<webseed::Done>();
+        let mut ws_pieces: HashMap<u32, usize> = HashMap::new();
+
         let mut ticker = tokio::time::interval(Duration::from_millis(50));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -349,6 +358,7 @@ impl Engine {
 
                 Some((addr, ev)) = peer_rx.recv() => {
                     if let FromPeer::PexPeers(addrs) = &ev {
+                        tracing::debug!(peer = %addr, count = addrs.len(), "pex peers");
                         dial_addrs(&mut pool, addrs);
                         continue;
                     }
@@ -363,6 +373,44 @@ impl Engine {
                     }
                 } => {
                     pool.adopt_inbound(stream, hs).await;
+                }
+
+                Some(done) = ws_rx.recv() => {
+                    let webseed::Done { seed, piece, result } = done;
+                    web_seeds[seed].busy = false;
+                    match result {
+                        Ok(data) if !scheduler.block_map().is_verified(piece) => {
+                            for (i, chunk) in data.chunks(BLOCK_SIZE as usize).enumerate() {
+                                let ev = FromPeer::Piece {
+                                    index: piece,
+                                    begin: i as u32 * BLOCK_SIZE,
+                                    block: chunk.to_vec(),
+                                };
+                                handle_peer_event(&mut scheduler, &storage, &self.meta, &ev);
+                            }
+                            ws_pieces.insert(piece, seed);
+                            web_seeds[seed].succeeded(data.len() as u64);
+                        }
+                        Ok(_) => {}
+                        Err(webseed::WsError::Gone(file)) => {
+                            scheduler.release_piece(piece);
+                            web_seeds[seed].mark_file_dead(file);
+                            self.log(
+                                Level::Warn,
+                                format!("web seed {}: file {file} not found", web_seeds[seed].host),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            scheduler.release_piece(piece);
+                            web_seeds[seed].failed();
+                            self.log(
+                                Level::Warn,
+                                format!("web seed {}: {e}", web_seeds[seed].host),
+                            )
+                            .await;
+                        }
+                    }
                 }
 
                 Some(outcome) = announce_rx.recv() => {
@@ -555,6 +603,39 @@ impl Engine {
                         }
                     }
 
+                    // ---- web seeds: one whole piece in flight per seed ----
+                    while ws_jobs.try_join_next().is_some() {}
+                    if !paused
+                        && !seeding
+                        && check_rx.is_none()
+                        && web_seeds.iter().any(|w| w.ready())
+                    {
+                        let rarity: HashMap<u32, u32> = (0..self.meta.piece_count() as u32)
+                            .map(|p| (p, pool.seeders_for(p)))
+                            .collect();
+                        for (i, ws) in web_seeds.iter_mut().enumerate() {
+                            if !ws.ready() {
+                                continue;
+                            }
+                            let meta = &self.meta;
+                            let Some((piece, _)) = scheduler
+                                .claim_piece_for_webseed(&rarity, |p| ws.can_serve(meta, p))
+                            else {
+                                break;
+                            };
+                            ws.busy = true;
+                            webseed::spawn_fetch(
+                                &mut ws_jobs,
+                                Arc::clone(&self.meta),
+                                ws.base.clone(),
+                                i,
+                                piece,
+                                self.opts.limits.clone(),
+                                ws_tx.clone(),
+                            );
+                        }
+                    }
+
                     // ---- announce to trackers periodically ----
                     if !announce_in_flight
                         && (force_announce || last_announce.elapsed() >= announce_interval)
@@ -623,16 +704,21 @@ impl Engine {
                         for piece in ready {
                             match storage.verify_piece(&self.meta, piece) {
                                 Ok(true) => {
+                                    ws_pieces.remove(&piece);
                                     scheduler.block_map_mut().mark_verified(piece);
                                     confirmed += 1;
                                 }
                                 Ok(false) => {
                                     // Discard the bad data and re-request it.
                                     scheduler.block_map_mut().invalidate_piece(piece);
+                                    if let Some(i) = ws_pieces.remove(&piece) {
+                                        web_seeds[i].failed();
+                                    }
                                     corrupt.push(piece);
                                 }
                                 Err(e) => {
                                     self.log(Level::Error, format!("piece {piece}: {e}")).await;
+                                    ws_pieces.remove(&piece);
                                     scheduler.block_map_mut().invalidate_piece(piece);
                                 }
                             }
@@ -688,7 +774,16 @@ impl Engine {
                             None
                         };
 
-                        let peers = snapshot_peers(&pool).await;
+                        let mut peers = snapshot_peers(&pool).await;
+                        peers.extend(web_seeds.iter().map(|w| PeerSummary {
+                            addr: format!("web: {}", w.host),
+                            downloaded: w.downloaded,
+                            uploaded: 0,
+                            progress: 1.0,
+                            choked_by_us: false,
+                            choking_us: w.backing_off(),
+                            outstanding: usize::from(w.busy),
+                        }));
                         let connected = peers.len() as u32;
 
                         let total_up = uploaded_so_far + uploaded;
@@ -1242,6 +1337,7 @@ fn placeholder_meta(magnet: &Magnet) -> Metainfo {
         private: false,
         announce: None,
         announce_list: magnet.trackers.clone(),
+        web_seeds: Vec::new(),
     }
 }
 
@@ -1335,6 +1431,11 @@ pub async fn run_magnet_with_options(
     meta.announce_list.extend(magnet.trackers.iter().cloned());
     meta.announce_list.sort();
     meta.announce_list.dedup();
+    for u in &magnet.webseeds {
+        if crate::metainfo::is_http_url(u) && !meta.web_seeds.contains(u) {
+            meta.web_seeds.push(u.clone());
+        }
+    }
 
     let engine = Engine::with_options(Arc::new(meta), state, commands, opts);
     engine.run(download_dir).await
@@ -1395,6 +1496,7 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         };
         let mut s = Scheduler::new(&meta);
 
@@ -1432,6 +1534,7 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         };
         let mut s = Scheduler::new(&meta);
         let dir = std::env::temp_dir().join(format!("torrust-engine2-{}", std::process::id()));

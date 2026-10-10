@@ -265,6 +265,7 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         }
     }
 

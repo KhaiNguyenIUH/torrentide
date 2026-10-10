@@ -311,6 +311,10 @@ impl Scheduler {
         self.in_flight.remove(&key);
     }
 
+    pub fn release_piece(&mut self, piece: u32) {
+        self.in_flight.retain(|(p, _), _| *p != piece);
+    }
+
     /// A piece is ready to hash when all of its blocks have arrived.
     pub fn ready_pieces(&self) -> Vec<u32> {
         (0..self.piece_count as u32)
@@ -359,6 +363,54 @@ impl Scheduler {
                     length,
                 });
             }
+        }
+        None
+    }
+
+    /// Claim a whole piece for an HTTP web seed. Only pieces with no fresh
+    /// in-flight block qualify, so the web seed never duplicates a peer's
+    /// work. Returns the piece's missing blocks, now marked in flight.
+    pub fn claim_piece_for_webseed(
+        &mut self,
+        rarity: &HashMap<u32, u32>,
+        usable: impl Fn(u32) -> bool,
+    ) -> Option<(u32, Vec<BlockRequest>)> {
+        let retry_after = if self.in_endgame() {
+            self.endgame_retry
+        } else {
+            self.request_timeout
+        };
+        for piece in self.candidate_pieces(rarity) {
+            if !usable(piece) {
+                continue;
+            }
+            let piece_len = self.length_of_piece(piece);
+            let missing: Vec<usize> = (0..self.block_map.blocks_in_piece(piece as usize))
+                .filter(|b| !self.block_map.have_block(piece, *b))
+                .collect();
+            let pending = missing.iter().any(|b| {
+                self.in_flight
+                    .get(&(piece, *b))
+                    .is_some_and(|asked| asked.elapsed() < retry_after)
+            });
+            if missing.is_empty() || pending {
+                continue;
+            }
+            let now = Instant::now();
+            let reqs = missing
+                .into_iter()
+                .map(|block| {
+                    let begin = block as u32 * BLOCK_SIZE;
+                    self.in_flight.insert((piece, block), now);
+                    BlockRequest {
+                        piece,
+                        block,
+                        begin,
+                        length: block_len(piece_len, begin),
+                    }
+                })
+                .collect();
+            return Some((piece, reqs));
         }
         None
     }
@@ -571,7 +623,24 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         }
+    }
+
+    #[test]
+    fn webseed_claims_only_pieces_without_inflight_blocks() {
+        let m = meta(BLOCK_SIZE * 2, 3);
+        let mut s = Scheduler::new(&m);
+        let rarity = HashMap::new();
+        let first = s.next_block(&rarity).unwrap();
+        let (p, reqs) = s.claim_piece_for_webseed(&rarity, |_| true).unwrap();
+        assert_ne!(p, first.piece);
+        assert_eq!(reqs.len(), 2);
+        let (p2, _) = s.claim_piece_for_webseed(&rarity, |x| x != first.piece && x != p).unwrap();
+        assert!(p2 != p && p2 != first.piece);
+        assert!(s.claim_piece_for_webseed(&rarity, |_| true).is_none());
+        s.release_piece(p);
+        assert_eq!(s.claim_piece_for_webseed(&rarity, |_| true).unwrap().0, p);
     }
 
     #[test]
@@ -879,6 +948,7 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         };
         // Skip file 1 (bytes 10..20): piece 1 (bytes 16..20) lies entirely
         // inside it and is excludable; piece 0 (bytes 0..16) straddles the
@@ -924,6 +994,7 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         }
     }
 

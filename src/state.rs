@@ -233,6 +233,8 @@ pub struct Settings {
     pub dht: bool,
     /// Ask the router (NAT-PMP, then UPnP) to forward `listen_port`.
     pub port_forwarding: bool,
+    /// Announce and listen for peers on the local network (BEP 14).
+    pub lsd: bool,
     /// Queue limits: at most this many torrents downloading, and this many
     /// running in total (downloading + seeding). 0 means no limit.
     pub max_active_downloads: usize,
@@ -256,6 +258,7 @@ impl Default for Settings {
             max_active_torrents: 8,
             dht: true,
             port_forwarding: true,
+            lsd: true,
         }
     }
 }

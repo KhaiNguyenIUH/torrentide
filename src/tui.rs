@@ -1542,6 +1542,7 @@ fn settings_form(settings: &Settings) -> Form {
             Field::toggle("Port forwarding", settings.port_forwarding),
             Field::number("Max active downloads (0 = any)", settings.max_active_downloads.to_string()),
             Field::number("Max active torrents (0 = any)", settings.max_active_torrents.to_string()),
+            Field::toggle("Local peer discovery", settings.lsd),
         ],
     )
 }
@@ -1590,6 +1591,7 @@ fn parse_settings(form: &Form, base: &Settings) -> Result<Settings, String> {
         port_forwarding: f[7].on,
         max_active_downloads,
         max_active_torrents,
+        lsd: f[10].on,
         ..base.clone()
     })
 }

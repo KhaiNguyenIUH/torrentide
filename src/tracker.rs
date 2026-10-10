@@ -447,6 +447,9 @@ fn parse_http_response(raw: &[u8]) -> Result<AnnounceResult, TrackerError> {
             _ => {}
         }
     }
+    if let Ok(bencode::Value::Bytes(raw)) = value.get("peers6") {
+        peers.extend(compact_peers(raw, true));
+    }
 
     Ok(AnnounceResult {
         interval: Duration::from_secs(interval),
@@ -473,7 +476,7 @@ async fn udp_connect(url: &str) -> Result<(UdpSocket, i64), TrackerError> {
     let tp = parsed.port().unwrap_or(80);
 
     let server = resolve(&host, tp).await?;
-    let sock = UdpSocket::bind("0.0.0.0:0")
+    let sock = UdpSocket::bind(if server.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" })
         .await
         .map_err(|e| TrackerError::Unreachable(e.to_string()))?;
     sock.connect(server)
@@ -539,7 +542,22 @@ fn udp_announce_packet(conn_id: i64, tx: i32, p: &AnnounceParams, peer_id: &[u8;
     a
 }
 
-fn parse_udp_announce(buf: &[u8], tx: i32) -> Result<AnnounceResult, TrackerError> {
+fn compact_peers(raw: &[u8], v6: bool) -> Vec<SocketAddrLite> {
+    let size = if v6 { 18 } else { 6 };
+    raw.chunks_exact(size)
+        .filter_map(|c| {
+            let (ip, port) = c.split_at(size - 2);
+            let port = u16::from_be_bytes([port[0], port[1]]);
+            let ip = match <[u8; 16]>::try_from(ip) {
+                Ok(b) => IpAddr::from(b),
+                Err(_) => IpAddr::from(<[u8; 4]>::try_from(ip).ok()?),
+            };
+            (port > 0).then_some(SocketAddrLite { ip, port })
+        })
+        .collect()
+}
+
+fn parse_udp_announce(buf: &[u8], tx: i32, v6: bool) -> Result<AnnounceResult, TrackerError> {
     if buf.len() < 20 {
         return Err(TrackerError::BadResponse("short udp announce reply".into()));
     }
@@ -560,17 +578,7 @@ fn parse_udp_announce(buf: &[u8], tx: i32) -> Result<AnnounceResult, TrackerErro
 
     let word = |at: usize| i32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
     let interval = word(8).max(0) as u64;
-    let mut peers = Vec::new();
-    for chunk in buf[20..].chunks_exact(6) {
-        let ip = std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-        let p = u16::from_be_bytes([chunk[4], chunk[5]]);
-        if p > 0 {
-            peers.push(SocketAddrLite {
-                ip: IpAddr::V4(ip),
-                port: p,
-            });
-        }
-    }
+    let peers = compact_peers(&buf[20..], v6);
 
     Ok(AnnounceResult {
         interval: Duration::from_secs(interval.clamp(60, 3600)),
@@ -596,7 +604,7 @@ async fn announce_udp(url: &str, p: &AnnounceParams) -> Result<AnnounceResult, T
         .await
         .map_err(|_| TrackerError::Unreachable("udp announce timed out".into()))?
         .map_err(|e| TrackerError::Unreachable(e.to_string()))?;
-    parse_udp_announce(&buf[..n], tx)
+    parse_udp_announce(&buf[..n], tx, sock.peer_addr().is_ok_and(|a| a.is_ipv6()))
 }
 
 /// The 36-byte BEP 15 scrape request for one infohash.
@@ -656,15 +664,20 @@ async fn scrape_udp(url: &str, infohash: InfoHash) -> Result<ScrapeResult, Track
 
 // -------------------------------------------------------------------- helpers
 
-/// Resolve to an IPv4 address: the UDP socket is bound to `0.0.0.0` and the
-/// BEP 15 announce reply only carries IPv4 peers.
+/// Resolve a host, preferring IPv4 when it has both families.
 async fn resolve(host: &str, port: u16) -> Result<SocketAddr, TrackerError> {
     use tokio::net::lookup_host;
-    lookup_host((host, port))
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let addrs: Vec<SocketAddr> = lookup_host((host, port))
         .await
         .map_err(|e| TrackerError::Unreachable(format!("dns lookup for {host} failed: {e}")))?
+        .collect();
+    addrs
+        .iter()
+        .copied()
         .find(SocketAddr::is_ipv4)
-        .ok_or_else(|| TrackerError::Unreachable(format!("{host} has no IPv4 address")))
+        .or_else(|| addrs.first().copied())
+        .ok_or_else(|| TrackerError::Unreachable(format!("{host} has no address")))
 }
 
 async fn connect_with_timeout(addr: SocketAddr, timeout: Duration) -> Result<TcpStream> {
@@ -749,6 +762,78 @@ mod tests {
         let res = parse_http_response(resp.as_bytes()).unwrap();
         assert_eq!(res.peers.len(), 1);
         assert_eq!(res.peers[0].ip.to_string(), "10.0.0.5");
+    }
+
+    fn v6_entry(last: u8, port: u16) -> Vec<u8> {
+        let mut e = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last as u16).octets().to_vec();
+        e.extend_from_slice(&port.to_be_bytes());
+        e
+    }
+
+    #[test]
+    fn http_peers6_mixes_with_v4_and_skips_junk() {
+        let mut v4 = vec![1, 2, 3, 4];
+        v4.extend_from_slice(&6881u16.to_be_bytes());
+        let mut v6 = v6_entry(1, 7000);
+        v6.extend(v6_entry(2, 0));
+        v6.extend(v6_entry(3, 7002));
+        v6.extend_from_slice(&[9, 9, 9]);
+        let mut body = bencode::encode(&bencode::Value::Dict(std::collections::BTreeMap::from([
+            (b"peers".to_vec(), bencode::Value::Bytes(v4)),
+            (b"peers6".to_vec(), bencode::Value::Bytes(v6)),
+        ])));
+        let mut resp = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        resp.append(&mut body);
+        let res = parse_http_response(&resp).unwrap();
+        let got: Vec<String> = res.peers.iter().map(|p| format!("{}:{}", p.ip, p.port)).collect();
+        assert_eq!(got, ["1.2.3.4:6881", "2001:db8::1:7000", "2001:db8::3:7002"]);
+    }
+
+    #[test]
+    fn http_dict_model_accepts_ipv6() {
+        let body = b"d5:peersld2:ip11:2001:db8::94:porti6881eeee";
+        let mut resp = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        resp.extend_from_slice(body);
+        let res = parse_http_response(&resp).unwrap();
+        assert_eq!(res.peers[0].ip.to_string(), "2001:db8::9");
+    }
+
+    #[test]
+    fn udp_reply_follows_the_address_family() {
+        let mut reply = 1i32.to_be_bytes().to_vec();
+        reply.extend_from_slice(&5i32.to_be_bytes());
+        reply.extend_from_slice(&900i32.to_be_bytes());
+        reply.extend_from_slice(&[0; 8]);
+        reply.extend(v6_entry(1, 7000));
+        reply.extend(v6_entry(2, 7001));
+        reply.extend_from_slice(&[1, 2]);
+        let res = parse_udp_announce(&reply, 5, true).unwrap();
+        assert_eq!(res.peers.len(), 2);
+        assert_eq!(res.peers[1].ip.to_string(), "2001:db8::2");
+    }
+
+    #[tokio::test]
+    async fn udp_announce_over_ipv6() {
+        let Ok(sock) = tokio::net::UdpSocket::bind("[::1]:0").await else { return };
+        let url = format!("udp://{}/announce", sock.local_addr().unwrap());
+        let tracker = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (_, from) = sock.recv_from(&mut buf).await.unwrap();
+            let mut reply = 0i32.to_be_bytes().to_vec();
+            reply.extend_from_slice(&buf[12..16]);
+            reply.extend_from_slice(&42i64.to_be_bytes());
+            sock.send_to(&reply, from).await.unwrap();
+            let (_, from) = sock.recv_from(&mut buf).await.unwrap();
+            let mut reply = 1i32.to_be_bytes().to_vec();
+            reply.extend_from_slice(&buf[12..16]);
+            reply.extend_from_slice(&900i32.to_be_bytes());
+            reply.extend_from_slice(&[0; 8]);
+            reply.extend(v6_entry(7, 6881));
+            sock.send_to(&reply, from).await.unwrap();
+        });
+        let res = announce(&url, InfoHash([7; 20]), 6881, 0, 0, 100, None, 50, true).await.unwrap();
+        tracker.await.unwrap();
+        assert_eq!(res.peers[0].ip.to_string(), "2001:db8::7");
     }
 
     #[test]
@@ -876,6 +961,7 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         }
     }
 

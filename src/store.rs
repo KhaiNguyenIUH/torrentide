@@ -265,6 +265,7 @@ fn encode_settings(s: &Settings) -> Vec<u8> {
     d.insert(b"max_peers".to_vec(), int(s.max_peers as u64));
     d.insert(b"dht".to_vec(), int(s.dht as u64));
     d.insert(b"port_forwarding".to_vec(), int(s.port_forwarding as u64));
+    d.insert(b"lsd".to_vec(), int(s.lsd as u64));
     d.insert(b"max_active_downloads".to_vec(), int(s.max_active_downloads as u64));
     d.insert(b"max_active_torrents".to_vec(), int(s.max_active_torrents as u64));
     bencode::encode(&Value::Dict(d))
@@ -296,6 +297,9 @@ fn decode_settings(raw: &[u8]) -> Result<Settings> {
     }
     if let Some(n) = v.get_int_opt("port_forwarding") {
         s.port_forwarding = n != 0;
+    }
+    if let Some(n) = v.get_int_opt("lsd") {
+        s.lsd = n != 0;
     }
     if let Some(n) = v.get_int_opt("max_active_downloads") {
         s.max_active_downloads = n.max(0) as usize;
@@ -430,6 +434,7 @@ mod tests {
             max_peers: 12,
             dht: false,
             port_forwarding: false,
+            lsd: false,
             max_active_downloads: 2,
             max_active_torrents: 4,
         };

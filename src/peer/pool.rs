@@ -10,6 +10,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use super::connection::{FromPeer, PeerHandle, PeerState, SharedSeeder, ToPeer, BLOCK_SIZE};
+use super::pex;
 use super::wire::{Bitfield, Handshake};
 use crate::metainfo::{InfoHash, Metainfo, SocketAddrLite};
 use crate::ratelimit::Limits;
@@ -58,6 +59,10 @@ pub struct PeerPool {
     /// bitfield may have missed.
     seeder_gen: u64,
     dial_gen: HashMap<SocketAddr, u64>,
+    /// Per recipient, the peer addresses we have already told it about, so
+    /// each PEX message carries only the difference.
+    pex_known: HashMap<SocketAddr, HashSet<SocketAddr>>,
+    last_pex: Instant,
 }
 
 impl PeerPool {
@@ -90,6 +95,67 @@ impl PeerPool {
             retired_uploaded: 0,
             seeder_gen: 0,
             dial_gen: HashMap::new(),
+            pex_known: HashMap::new(),
+            last_pex: Instant::now(),
+        }
+    }
+
+    /// The extension-protocol port to advertise, or `None` for a private
+    /// torrent, which must not use PEX (BEP 27).
+    fn pex_port(&self) -> Option<u16> {
+        pex_port_for(&self.meta, self.port)
+    }
+
+    /// Send each PEX-capable peer the peers that connected and disconnected
+    /// since its last message. Only peers we have a dialable address for are
+    /// advertised: dialled ones by their address, inbound ones by the listen
+    /// port from their extended handshake.
+    pub async fn pex_tick(&mut self) {
+        self.last_pex = Instant::now();
+        if self.pex_port().is_none() {
+            return;
+        }
+        let mut live: HashMap<SocketAddr, SocketAddr> = HashMap::new();
+        let mut capable: Vec<(SocketAddr, u8)> = Vec::new();
+        for (addr, p) in &self.peers {
+            let st = p.state.lock().await;
+            let adv = if p.inbound {
+                st.listen_port.map(|port| SocketAddr::new(addr.ip(), port))
+            } else {
+                Some(*addr)
+            };
+            if let Some(a) = adv {
+                live.insert(*addr, a);
+            }
+            if let Some(id) = st.pex_id {
+                capable.push((*addr, id));
+            }
+        }
+        self.pex_known.retain(|a, _| self.peers.contains_key(a));
+        for (rcpt, id) in capable {
+            let now: HashSet<SocketAddr> = live
+                .iter()
+                .filter(|(k, v)| **k != rcpt && **v != rcpt)
+                .map(|(_, v)| *v)
+                .collect();
+            let known = self.pex_known.entry(rcpt).or_default();
+            let added: Vec<SocketAddr> =
+                now.difference(known).take(pex::MAX_SENT).copied().collect();
+            let dropped: Vec<SocketAddr> =
+                known.difference(&now).take(pex::MAX_SENT).copied().collect();
+            if added.is_empty() && dropped.is_empty() {
+                continue;
+            }
+            known.extend(added.iter().copied());
+            for d in &dropped {
+                known.remove(d);
+            }
+            if let Some(p) = self.peers.get(&rcpt) {
+                let _ = p.tx.send(ToPeer::Extended {
+                    ext_id: id,
+                    payload: pex::encode(&added, &dropped),
+                });
+            }
         }
     }
 
@@ -196,6 +262,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
         let events = self.events.clone();
         let limits = self.limits.clone();
         let auto_unchoke = self.auto_unchoke;
+        let pex_port = self.pex_port();
         tokio::spawn(async move {
             let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<FromPeer>();
             let tagged = events.clone();
@@ -215,6 +282,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                 peer_tx,
                 limits,
                 auto_unchoke,
+                pex_port,
             )
             .await;
 
@@ -254,10 +322,21 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
             peer_tx,
             self.limits.clone(),
             self.auto_unchoke,
+            self.pex_port(),
         )
         .await
         {
             Ok(h) => {
+                // Outbound dials declare interest straight away; an inbound
+                // peer needs the same, or a seeder that found us (LSD, PEX)
+                // never unchokes us and nothing downloads.
+                let complete = self
+                    .seeder
+                    .as_ref()
+                    .is_some_and(|s| s.bitfield.full(self.piece_count));
+                if !complete {
+                    let _ = h.tx.send(ToPeer::SetInterested(true));
+                }
                 self.peers.insert(addr, h);
             }
             Err(e) => tracing::debug!(peer = %addr, error = %e, "inbound handshake failed"),
@@ -432,6 +511,9 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
 
     /// Drop peers that have gone quiet, returning how many were removed.
     pub async fn reap(&mut self) -> usize {
+        if self.last_pex.elapsed() >= pex::SEND_INTERVAL {
+            self.pex_tick().await;
+        }
         let mut removed = 0;
         for addr in list_dead(&self.peers).await {
             if let Some(p) = self.peers.remove(&addr) {
@@ -482,6 +564,10 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
     }
 }
 
+fn pex_port_for(meta: &Metainfo, port: u16) -> Option<u16> {
+    (!meta.private).then_some(port)
+}
+
 async fn list_dead(peers: &HashMap<SocketAddr, PeerHandle>) -> Vec<SocketAddr> {
     let mut dead = Vec::new();
     for (addr, p) in peers {
@@ -508,6 +594,7 @@ pub async fn listen(
     let infohash = meta.infohash;
     let piece_count = meta.piece_count();
     let seeder: SharedSeeder = Arc::new(RwLock::new(seeder));
+    let pex_port = pex_port_for(&meta, local.port());
 
     let handle = tokio::spawn(async move {
         loop {
@@ -536,6 +623,7 @@ pub async fn listen(
                             peer_tx,
                             Limits::default(),
                             true,
+                            pex_port,
                         )
                         .await
                         {
@@ -585,6 +673,7 @@ pub type Hash = InfoHash;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer::connection::connect;
     use tokio::sync::Mutex;
 
     fn fake_handle(bitfield: Bitfield, choke: bool, outstanding: usize) -> PeerHandle {
@@ -648,6 +737,7 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         });
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut pool = PeerPool::new(meta, None, 6881, tx, Limits::default(), MAX_PEERS, true);
@@ -679,6 +769,7 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         });
         let (tx, _ev_rx) = mpsc::unbounded_channel::<(SocketAddr, FromPeer)>();
         let mut pool = PeerPool::new(meta, None, 6881, tx, Limits::default(), MAX_PEERS, true);
@@ -737,6 +828,7 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         });
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut pool = PeerPool::new(meta, None, 6881, tx, Limits::default(), MAX_PEERS, true);
@@ -764,6 +856,7 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         });
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut pool = PeerPool::new(meta, None, 6881, tx, Limits::default(), MAX_PEERS, true);
@@ -811,6 +904,7 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         });
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut pool = PeerPool::new(meta, None, 6881, tx, Limits::default(), MAX_PEERS, true);
@@ -843,6 +937,7 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         });
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut pool = PeerPool::new(meta, None, 6881, tx, Limits::default(), MAX_PEERS, true);
@@ -877,6 +972,7 @@ mod tests {
             private: false,
             announce: None,
             announce_list: vec![],
+            web_seeds: vec![],
         })
     }
 
@@ -967,6 +1063,7 @@ mod tests {
             c_tx,
             Limits::default(),
             true,
+            Some(0),
         ));
         let (mut stream, _) = listener.accept().await.unwrap();
         let hs = crate::peer::wire::handshake_incoming(&mut stream).await.unwrap();
@@ -1006,5 +1103,185 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn pex_peer(pool: &mut PeerPool, addr: &str, pex_id: Option<u8>) -> mpsc::UnboundedReceiver<ToPeer> {
+        let (h, rx) = fake_handle_with_rx(Bitfield::with_pieces(16), true, 0);
+        h.state.try_lock().unwrap().pex_id = pex_id;
+        pool.peers.insert(addr.parse().unwrap(), h);
+        rx
+    }
+
+    fn sent_pex(rx: &mut mpsc::UnboundedReceiver<ToPeer>) -> Option<(u8, pex::Pex)> {
+        match rx.try_recv() {
+            Ok(ToPeer::Extended { ext_id, payload }) => Some((ext_id, pex::decode(&payload))),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pex_tick_sends_added_then_dropped_never_the_recipient() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = PeerPool::new(small_meta(16), None, 6881, tx, Limits::default(), MAX_PEERS, true);
+        let mut a = pex_peer(&mut pool, "10.0.0.1:1000", Some(7));
+        let mut b = pex_peer(&mut pool, "10.0.0.2:2000", Some(8));
+        let mut c = pex_peer(&mut pool, "10.0.0.3:3000", None);
+
+        pool.pex_tick().await;
+        let (id, m) = sent_pex(&mut a).unwrap();
+        assert_eq!(id, 7);
+        let mut added = m.added.clone();
+        added.sort();
+        assert_eq!(added, vec!["10.0.0.2:2000".parse().unwrap(), "10.0.0.3:3000".parse().unwrap()]);
+        assert!(m.dropped.is_empty());
+        let (id, m) = sent_pex(&mut b).unwrap();
+        assert_eq!(id, 8);
+        assert!(!m.added.contains(&"10.0.0.2:2000".parse().unwrap()));
+        assert_eq!(m.added.len(), 2);
+        assert!(sent_pex(&mut c).is_none(), "peer without ut_pex gets nothing");
+
+        pool.pex_tick().await;
+        assert!(sent_pex(&mut a).is_none(), "nothing changed, nothing sent");
+
+        pool.peers.remove(&"10.0.0.3:3000".parse().unwrap());
+        pool.pex_tick().await;
+        let (_, m) = sent_pex(&mut a).unwrap();
+        assert!(m.added.is_empty());
+        assert_eq!(m.dropped, vec!["10.0.0.3:3000".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn pex_tick_skips_inbound_peers_without_a_listen_port() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = PeerPool::new(small_meta(16), None, 6881, tx, Limits::default(), MAX_PEERS, true);
+        let mut a = pex_peer(&mut pool, "10.0.0.1:1000", Some(7));
+        let _b = pex_peer(&mut pool, "10.0.0.2:55555", None);
+        let _c = pex_peer(&mut pool, "10.0.0.3:55556", None);
+        for (addr, port) in [("10.0.0.2:55555", None), ("10.0.0.3:55556", Some(6881u16))] {
+            let h = pool.peers.get_mut(&addr.parse().unwrap()).unwrap();
+            h.inbound = true;
+            h.state.try_lock().unwrap().listen_port = port;
+        }
+        pool.pex_tick().await;
+        let (_, m) = sent_pex(&mut a).unwrap();
+        assert_eq!(m.added, vec!["10.0.0.3:6881".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn pex_tick_is_silent_for_private_torrents() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut meta = (*small_meta(16)).clone();
+        meta.private = true;
+        let mut pool = PeerPool::new(Arc::new(meta), None, 6881, tx, Limits::default(), MAX_PEERS, true);
+        let mut a = pex_peer(&mut pool, "10.0.0.1:1000", Some(7));
+        let _b = pex_peer(&mut pool, "10.0.0.2:2000", Some(7));
+        pool.pex_tick().await;
+        assert!(sent_pex(&mut a).is_none());
+    }
+
+    async fn loopback(
+        server_pex: Option<u16>,
+        client_pex: Option<u16>,
+    ) -> (PeerHandle, PeerHandle, mpsc::UnboundedReceiver<FromPeer>) {
+        let ih = InfoHash([9; 20]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (c_tx, _c_rx) = mpsc::unbounded_channel();
+        let client = tokio::spawn(connect(
+            addr,
+            ih,
+            2,
+            Arc::new(RwLock::new(None)),
+            c_tx,
+            Limits::default(),
+            true,
+            client_pex,
+        ));
+        let (stream, _) = listener.accept().await.unwrap();
+        let (s_tx, s_rx) = mpsc::unbounded_channel();
+        let server = super::super::connection::accept(
+            stream,
+            ih,
+            2,
+            Arc::new(RwLock::new(None)),
+            s_tx,
+            Limits::default(),
+            true,
+            server_pex,
+        )
+        .await
+        .unwrap();
+        (client.await.unwrap().unwrap(), server, s_rx)
+    }
+
+    #[tokio::test]
+    async fn ut_pex_message_reaches_the_engine_as_pex_peers() {
+        let (a, _b, mut b_rx) = loopback(Some(6881), Some(6882)).await;
+        let id = loop {
+            if let Some(id) = a.state.lock().await.pex_id {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let addrs: Vec<SocketAddr> = vec!["1.2.3.4:6881".parse().unwrap(), "[2001:db8::1]:51413".parse().unwrap()];
+        a.tx.send(ToPeer::Extended { ext_id: id, payload: pex::encode(&addrs, &[]) }).unwrap();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), b_rx.recv()).await.unwrap().unwrap() {
+                FromPeer::PexPeers(got) => {
+                    assert_eq!(got.len(), 2);
+                    assert!(addrs.iter().all(|x| got.contains(x)));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(a.state.lock().await.listen_port, Some(6881));
+    }
+
+    #[tokio::test]
+    async fn private_connections_skip_the_extension_bit_and_ignore_ut_pex() {
+        let ih = InfoHash([9; 20]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (c_tx, mut c_rx) = mpsc::unbounded_channel();
+        let client = tokio::spawn(connect(
+            addr,
+            ih,
+            2,
+            Arc::new(RwLock::new(None)),
+            c_tx,
+            Limits::default(),
+            true,
+            None,
+        ));
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let hs = crate::peer::wire::handshake_incoming(&mut stream).await.unwrap();
+        assert!(!hs.supports_extended());
+        crate::peer::wire::handshake_outgoing(&mut stream, &ih.0, false, false, true).await.unwrap();
+        let _client = client.await.unwrap().unwrap();
+
+        use tokio::io::AsyncWriteExt;
+        let pex_msg = crate::peer::wire::Message::Extended {
+            ext_id: pex::OUR_PEX_ID,
+            payload: pex::encode(&["1.2.3.4:6881".parse().unwrap()], &[]),
+        };
+        stream.write_all(&crate::peer::wire::encode_framed(&pex_msg)).await.unwrap();
+        stream.write_all(&crate::peer::wire::encode_framed(&crate::peer::wire::Message::Have { index: 1 })).await.unwrap();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), c_rx.recv()).await.unwrap().unwrap() {
+                FromPeer::PexPeers(_) => panic!("private torrent must ignore ut_pex"),
+                FromPeer::Have(1) => break,
+                _ => {}
+            }
+        }
+
+        let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a2 = l2.local_addr().unwrap();
+        let (t, _r) = mpsc::unbounded_channel();
+        let c2 = tokio::spawn(connect(a2, ih, 2, Arc::new(RwLock::new(None)), t, Limits::default(), true, Some(1)));
+        let (mut s2, _) = l2.accept().await.unwrap();
+        let hs2 = crate::peer::wire::handshake_incoming(&mut s2).await.unwrap();
+        assert!(hs2.supports_extended());
+        drop(c2);
     }
 }

@@ -168,6 +168,7 @@ fn settings(dir: &Path) -> Settings {
         ratio_target: 0.0,
         dht: false,
         port_forwarding: false,
+        lsd: false,
         ..Settings::default()
     }
 }
@@ -534,4 +535,28 @@ async fn restart_restores_saved_progress_and_priorities() {
     })
     .await;
     quit(h).await;
+}
+
+#[tokio::test]
+async fn peers_find_each_other_through_local_discovery_alone() {
+    let fx = Fixture::new("lsd", 7);
+    let dead = mock_tracker(None).await;
+    let (path, id) = write_torrent(&fx, &dead);
+
+    let (seed_dl, leech_dl) = (temp_dir("lsd-seed"), temp_dir("lsd-leech"));
+    fx.write_to(&seed_dl);
+    let lsd_on = |dir: &Path| Settings { lsd: true, ..settings(dir) };
+    let seeder = Session::start_in(Store::at(temp_dir("lsd-home-a")), lsd_on(&seed_dl)).await.unwrap();
+    let leecher = Session::start_in(Store::at(temp_dir("lsd-home-b")), lsd_on(&leech_dl)).await.unwrap();
+    if seeder.state().read().await.log.iter().any(|l| l.message.contains("local peer discovery unavailable")) {
+        eprintln!("multicast unavailable, skipping");
+        return;
+    }
+    add(&seeder, &path, &seed_dl);
+    wait_for(&seeder, "seeding", 30, |st| is_done(torrent_state(st, &id))).await;
+    add(&leecher, &path, &leech_dl);
+    wait_for(&leecher, "download via LSD", 60, |st| is_done(torrent_state(st, &id))).await;
+    fx.assert_on_disk(&leech_dl);
+    quit(seeder).await;
+    quit(leecher).await;
 }
