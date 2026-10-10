@@ -2,20 +2,43 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 permissions:
   contents: write
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+        include:
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-14, target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
-      - run: tar -czf torrust-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release torrust
+      - if: runner.os != 'Windows'
+        run: tar -czf torrust-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release torrust
+      - if: runner.os == 'Windows'
+        run: 7z a torrust-${{ github.ref_name }}-${{ matrix.target }}.zip ./target/${{ matrix.target }}/release/torrust.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: torrust-*
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: torrust-*.tar.gz
+          files: torrust-*
           generate_release_notes: true
