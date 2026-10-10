@@ -25,6 +25,7 @@ pub mod metainfo;
 pub mod peer;
 pub mod portmap;
 pub mod ratelimit;
+pub mod rss;
 pub mod scheduler;
 pub mod session;
 pub mod state;
@@ -32,6 +33,8 @@ pub mod storage;
 pub mod store;
 pub mod tracker;
 pub mod tui;
+pub mod utp;
 pub mod webseed;
+pub mod webui;
 
 pub use metainfo::{InfoHash, Magnet, Metainfo};

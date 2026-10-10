@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>torrust</title>
+<style>
+:root { color-scheme: light dark; --bg:#fafafa; --fg:#1d1d1f; --mut:#6e6e73; --line:#d2d2d7; --acc:#0a64d8; --bar:#e5e5ea; --err:#c62828; }
+@media (prefers-color-scheme: dark) { :root { --bg:#161618; --fg:#f2f2f5; --mut:#9a9aa2; --line:#3a3a40; --acc:#4c9aff; --bar:#2c2c30; --err:#ff6b6b; } }
+* { box-sizing: border-box; }
+body { margin:0; padding:12px; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, sans-serif; }
+h1 { font-size:18px; margin:0 0 4px; }
+h2 { font-size:15px; margin:20px 0 8px; }
+.totals { color:var(--mut); margin-bottom:12px; }
+.err { color:var(--err); margin:8px 0; min-height:1.4em; }
+form { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
+input[type=text] { flex:1 1 180px; min-width:0; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); }
+button { padding:5px 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); cursor:pointer; }
+button:hover, button:focus-visible { border-color:var(--acc); outline:none; }
+button.primary { background:var(--acc); border-color:var(--acc); color:#fff; }
+.wrap { overflow-x:auto; }
+table { border-collapse:collapse; width:100%; min-width:760px; }
+th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:middle; white-space:nowrap; }
+td.name { white-space:normal; word-break:break-word; min-width:160px; }
+td.num, th.num { text-align:right; }
+.bar { position:relative; width:110px; height:16px; background:var(--bar); border-radius:8px; overflow:hidden; }
+.bar > i { position:absolute; inset:0 auto 0 0; background:var(--acc); }
+.bar > span { position:relative; display:block; text-align:center; font-size:11px; line-height:16px; }
+.acts button { margin-right:4px; padding:3px 7px; font-size:12px; }
+.empty { color:var(--mut); padding:12px 8px; }
+.feed { padding:6px 0; border-bottom:1px solid var(--line); word-break:break-word; }
+.feed small { color:var(--mut); display:block; }
+</style>
+</head>
+<body>
+<h1>torrust</h1>
+<div class="totals" id="totals">connecting...</div>
+<div class="err" id="err" role="alert"></div>
+
+<form id="addform">
+  <input type="text" name="source" placeholder="magnet link or https:// .torrent URL" aria-label="Source" required>
+  <button class="primary" type="submit">Add</button>
+</form>
+
+<div class="wrap">
+<table>
+<thead><tr><th>Name</th><th class="num">Size</th><th>Progress</th><th>Status</th><th class="num">Down</th><th class="num">Up</th><th class="num">ETA</th><th class="num">Ratio</th><th>Label</th><th>Actions</th></tr></thead>
+<tbody id="rows"></tbody>
+</table>
+</div>
+<div class="empty" id="empty" hidden>No torrents.</div>
+
+<h2>Feeds</h2>
+<div id="feeds"></div>
+<form id="feedform">
+  <input type="text" name="url" placeholder="RSS/Atom URL" aria-label="Feed URL" required>
+  <input type="text" name="include" placeholder="include (comma separated)" aria-label="Include">
+  <input type="text" name="exclude" placeholder="exclude (comma separated)" aria-label="Exclude">
+  <button class="primary" type="submit">Add feed</button>
+</form>
+
+<script>
+"use strict";
+var $ = function (id) { return document.getElementById(id); };
+
+function bytes(n) {
+  var u = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"], i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i ? n.toFixed(2) : String(n)) + " " + u[i];
+}
+function rate(n) { return bytes(n) + "/s"; }
+function dur(s) {
+  if (s == null || !isFinite(s) || s <= 0) return "--:--";
+  s = Math.round(s);
+  var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  return h ? h + "h " + m + "m" : m ? m + "m " + x + "s" : x + "s";
+}
+function el(tag, cls, text) {
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function showErr(msg) { $("err").textContent = msg || ""; }
+
+function post(path, params) {
+  var body = new URLSearchParams(params || {}).toString();
+  return fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body
+  }).then(function (r) {
+    if (!r.ok) {
+      return r.text().then(function (t) {
+        var m = t;
+        try { m = JSON.parse(t).error || t; } catch (e) {}
+        throw new Error(m || ("HTTP " + r.status));
+      });
+    }
+  }).then(function () { showErr(""); return refresh(); }).catch(function (e) { showErr(e.message); });
+}
+
+function action(t, name) {
+  if (name === "remove-data" && !confirm("Delete the downloaded files of \"" + t.name + "\"?")) return;
+  if (name === "remove" && !confirm("Remove \"" + t.name + "\" (keeps files)?")) return;
+  post("/api/torrents/" + encodeURIComponent(t.id) + "/" + name);
+}
+
+function row(t) {
+  var tr = el("tr");
+  tr.appendChild(el("td", "name", t.name));
+  tr.appendChild(el("td", "num", bytes(t.size)));
+  var pc = Math.max(0, Math.min(1, t.progress)) * 100;
+  var bar = el("div", "bar");
+  var fill = el("i");
+  fill.style.width = pc + "%";
+  bar.appendChild(fill);
+  bar.appendChild(el("span", null, pc.toFixed(1) + "%"));
+  var tdb = el("td");
+  tdb.appendChild(bar);
+  tr.appendChild(tdb);
+  tr.appendChild(el("td", null, t.state));
+  tr.appendChild(el("td", "num", rate(t.download_rate)));
+  tr.appendChild(el("td", "num", rate(t.upload_rate)));
+  tr.appendChild(el("td", "num", dur(t.eta_secs)));
+  tr.appendChild(el("td", "num", t.ratio.toFixed(2)));
+  tr.appendChild(el("td", null, t.label || ""));
+  var acts = el("td", "acts");
+  var list = [["Start", "start"], [t.state === "paused" ? "Resume" : "Pause", t.state === "paused" ? "resume" : "pause"],
+    ["Stop", "stop"], ["Recheck", "recheck"], ["Remove", "remove"], ["Remove + data", "remove-data"]];
+  list.forEach(function (a) {
+    var b = el("button", null, a[0]);
+    b.type = "button";
+    b.onclick = function () { action(t, a[1]); };
+    acts.appendChild(b);
+  });
+  tr.appendChild(acts);
+  return tr;
+}
+
+function feed(f) {
+  var d = el("div", "feed");
+  d.appendChild(el("strong", null, f.title || f.url));
+  var meta = f.url;
+  if (f.include.length) meta += " | include: " + f.include.join(", ");
+  if (f.exclude.length) meta += " | exclude: " + f.exclude.join(", ");
+  if (f.dir) meta += " | dir: " + f.dir;
+  d.appendChild(el("small", null, meta));
+  if (f.last_error) d.appendChild(el("small", "err", f.last_error));
+  if (f.recent.length) d.appendChild(el("small", null, "recent: " + f.recent.join("; ")));
+  var b = el("button", null, "Remove feed");
+  b.type = "button";
+  b.onclick = function () { post("/api/feeds/" + f.id + "/remove"); };
+  d.appendChild(b);
+  return d;
+}
+
+function render(s) {
+  $("totals").textContent = s.torrents.length + " torrents | down " + rate(s.download_rate) +
+    " | up " + rate(s.upload_rate) + (s.port_status ? " | " + s.port_status : "");
+  var rows = $("rows");
+  rows.replaceChildren.apply(rows, s.torrents.map(row));
+  $("empty").hidden = s.torrents.length > 0;
+  var feeds = $("feeds");
+  feeds.replaceChildren.apply(feeds, s.feeds.map(feed));
+  if (s.warning) showErr(s.warning);
+}
+
+var busy = false;
+function refresh() {
+  if (busy) return Promise.resolve();
+  busy = true;
+  return fetch("/api/state").then(function (r) {
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
+  }).then(function (s) { render(s); }).catch(function (e) { showErr("state: " + e.message); })
+    .then(function () { busy = false; });
+}
+
+function bind(id, path) {
+  $(id).onsubmit = function (ev) {
+    ev.preventDefault();
+    var f = ev.target, p = {};
+    Array.prototype.forEach.call(f.elements, function (e) { if (e.name && e.value) p[e.name] = e.value; });
+    post(path, p).then(function () { f.reset(); });
+  };
+}
+bind("addform", "/api/add");
+bind("feedform", "/api/feeds");
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

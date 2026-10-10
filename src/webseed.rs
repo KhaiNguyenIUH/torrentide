@@ -178,6 +178,120 @@ async fn get_range(
     Err(other("too many redirects"))
 }
 
+/// Plain GET following redirects, for small documents such as feeds. The body is
+/// refused once it passes `max_body` bytes rather than buffered.
+pub(crate) async fn get_capped(url: &str, max_body: usize) -> Result<Vec<u8>, WsError> {
+    let mut current = Url::parse(url).map_err(|e| other(format!("bad url: {e}")))?;
+    for _ in 0..=MAX_REDIRECTS {
+        let host = current.host_str().ok_or_else(|| other("url has no host"))?.to_owned();
+        let tls = match current.scheme() {
+            "http" => false,
+            "https" => true,
+            s => return Err(other(format!("unsupported scheme {s}"))),
+        };
+        let port = current.port_or_known_default().unwrap_or(if tls { 443 } else { 80 });
+        let mut target = current.path().to_owned();
+        if let Some(q) = current.query() {
+            target.push('?');
+            target.push_str(q);
+        }
+        let host_header = match current.port() {
+            Some(p) => format!("{host}:{p}"),
+            None => host.clone(),
+        };
+        let tcp = within(TcpStream::connect((host.as_str(), port))).await?;
+        let reply = if tls {
+            let name = rustls::pki_types::ServerName::try_from(host.clone())
+                .map_err(|_| other("bad TLS server name"))?;
+            let stream = within(crate::tracker::tls_connector().connect(name, tcp)).await?;
+            exchange_capped(stream, &host_header, &target, max_body).await?
+        } else {
+            exchange_capped(tcp, &host_header, &target, max_body).await?
+        };
+        match reply {
+            Reply::Body(b) => return Ok(b),
+            Reply::Redirect(loc) => {
+                current = current.join(&loc).map_err(|e| other(format!("bad redirect: {e}")))?;
+            }
+        }
+    }
+    Err(other("too many redirects"))
+}
+
+async fn exchange_capped<S>(
+    stream: S,
+    host: &str,
+    target: &str,
+    max_body: usize,
+) -> Result<Reply, WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut r = BufReader::new(stream);
+    let req = format!(
+        "GET {target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: torrust/0.1\r\n\
+         Accept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+    );
+    within(r.get_mut().write_all(req.as_bytes())).await?;
+    within(r.get_mut().flush()).await?;
+
+    let head = read_head(&mut r).await?;
+    match head.status {
+        301 | 302 | 303 | 307 | 308 => {
+            let loc = head.get("location").ok_or_else(|| other("redirect without Location"))?;
+            return Ok(Reply::Redirect(loc.to_owned()));
+        }
+        200 => {}
+        s => return Err(other(format!("unexpected HTTP status {s}"))),
+    }
+    if head.get("content-encoding").is_some_and(|e| !e.eq_ignore_ascii_case("identity")) {
+        return Err(other("content-encoded response"));
+    }
+    let chunked = head
+        .get("transfer-encoding")
+        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+    let mut body = Vec::new();
+    if chunked {
+        loop {
+            let line = read_line(&mut r).await?;
+            let size_str = line.split(';').next().unwrap_or("").trim();
+            let size = usize::from_str_radix(size_str, 16).map_err(|_| other("bad chunk size"))?;
+            if size == 0 {
+                break;
+            }
+            if size > max_body.saturating_sub(body.len()) {
+                return Err(other("body too large"));
+            }
+            let start = body.len();
+            body.resize(start + size, 0);
+            within(r.read_exact(&mut body[start..])).await?;
+            if !read_line(&mut r).await?.is_empty() {
+                return Err(other("missing chunk terminator"));
+            }
+        }
+    } else {
+        let declared = head.get("content-length").and_then(|v| v.parse::<usize>().ok());
+        if declared.is_some_and(|n| n > max_body) {
+            return Err(other("body too large"));
+        }
+        let mut tmp = [0u8; READ_CHUNK];
+        loop {
+            let got = within(r.read(&mut tmp)).await?;
+            if got == 0 {
+                break;
+            }
+            if got > max_body - body.len() {
+                return Err(other("body too large"));
+            }
+            body.extend_from_slice(&tmp[..got]);
+        }
+        if declared.is_some_and(|n| n != body.len()) {
+            return Err(other("body shorter than Content-Length"));
+        }
+    }
+    Ok(Reply::Body(body))
+}
+
 struct Head {
     status: u16,
     headers: Vec<(String, String)>,
