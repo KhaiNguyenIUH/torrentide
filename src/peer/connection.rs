@@ -5,9 +5,9 @@
 //! [`connect`] dials out as a leecher, [`accept`] takes an inbound socket as a
 //! seeder. Both end up with identical reader/writer tasks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -15,10 +15,12 @@ use tokio::io::{split, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex, Notify};
 
-use super::pex;
+use super::{mse, pex, PeerStream};
 use super::wire::{self, Bitfield, Message};
 use crate::metainfo::InfoHash;
 use crate::ratelimit::Limits;
+use crate::state::EncryptionMode;
+use crate::utp::UtpSocket;
 use crate::storage::Storage;
 
 /// Standard request block size. 16 KiB is what most clients use and keeps the
@@ -237,7 +239,111 @@ impl Seeder {
 /// verified after a connection was made can still be served over it.
 pub type SharedSeeder = Arc<RwLock<Option<Seeder>>>;
 
-/// Dial a peer and complete the handshake as the initiating side.
+/// How a dial reaches a peer: which encryption policy applies and whether a
+/// uTP socket is available. The default is plaintext TCP only.
+#[derive(Clone)]
+pub struct Transport {
+    pub encryption: EncryptionMode,
+    pub utp: Option<Arc<UtpSocket>>,
+    /// Peers whose uTP connect failed, so later dials go straight to TCP.
+    pub utp_failed: Arc<StdMutex<HashSet<SocketAddr>>>,
+}
+
+impl Default for Transport {
+    fn default() -> Self {
+        Transport {
+            encryption: EncryptionMode::Disabled,
+            utp: None,
+            utp_failed: Arc::default(),
+        }
+    }
+}
+
+/// Cap on remembered uTP failures; past it the memory is simply reset.
+const UTP_FAILED_CAP: usize = 4096;
+
+const DIAL_TIMEOUT: Duration = Duration::from_secs(6);
+
+fn crypto_name(encrypted: bool) -> &'static str {
+    if encrypted {
+        "rc4"
+    } else {
+        "plain"
+    }
+}
+
+async fn open_tcp(addr: SocketAddr) -> Result<PeerStream> {
+    let tcp = tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .with_context(|| format!("connecting to {addr}"))?
+        .with_context(|| format!("connecting to {addr}"))?;
+    let _ = tcp.set_nodelay(true);
+    Ok(Box::new(tcp))
+}
+
+async fn open_utp(utp: &UtpSocket, addr: SocketAddr) -> Result<PeerStream> {
+    let s = tokio::time::timeout(DIAL_TIMEOUT, utp.connect(addr))
+        .await
+        .with_context(|| format!("uTP connecting to {addr}"))?
+        .with_context(|| format!("uTP connecting to {addr}"))?;
+    Ok(Box::new(s))
+}
+
+/// Optionally wrap a fresh stream in MSE, then swap BitTorrent handshakes.
+async fn negotiate(
+    stream: PeerStream,
+    addr: SocketAddr,
+    infohash: InfoHash,
+    encrypted: bool,
+    mode: EncryptionMode,
+    pex: bool,
+) -> Result<(PeerStream, wire::Handshake)> {
+    let mut stream: PeerStream = if encrypted {
+        Box::new(
+            mse::connect(stream, infohash, mode)
+                .await
+                .with_context(|| format!("encryption handshake with {addr}"))?,
+        )
+    } else {
+        stream
+    };
+    wire::handshake_outgoing(&mut stream, &infohash.0, true, false, pex).await?;
+    let hs = wire::handshake_incoming(&mut stream).await?;
+    if hs.infohash != infohash.0 {
+        return Err(anyhow!(
+            "peer {addr} served a different infohash ({}) than requested",
+            hex::encode(hs.infohash)
+        ));
+    }
+    Ok((stream, hs))
+}
+
+/// Apply the encryption policy on one transport. `Prefer` tries MSE first and,
+/// if that fails, reconnects once in plaintext; `Require` never downgrades.
+async fn dial_crypto<F, Fut>(
+    open: F,
+    addr: SocketAddr,
+    infohash: InfoHash,
+    mode: EncryptionMode,
+    pex: bool,
+) -> Result<(PeerStream, wire::Handshake, bool)>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<PeerStream>>,
+{
+    if mode != EncryptionMode::Disabled {
+        match negotiate(open().await?, addr, infohash, true, mode, pex).await {
+            Ok((s, hs)) => return Ok((s, hs, true)),
+            Err(e) if mode == EncryptionMode::Require => return Err(e),
+            Err(e) => tracing::debug!(peer = %addr, error = format!("{e:#}"), "encrypted dial failed, retrying plaintext"),
+        }
+    }
+    let (s, hs) = negotiate(open().await?, addr, infohash, false, mode, pex).await?;
+    Ok((s, hs, false))
+}
+
+/// Dial a peer over plaintext TCP and complete the handshake as the
+/// initiating side.
 pub async fn connect(
     addr: SocketAddr,
     infohash: InfoHash,
@@ -248,25 +354,85 @@ pub async fn connect(
     auto_unchoke: bool,
     pex_port: Option<u16>,
 ) -> Result<PeerHandle> {
-    // A short connect timeout matters: a tracker can hand back many dead peers,
-    // and each one that lingers for the full timeout delays the next attempt.
-    let stream = tokio::time::timeout(Duration::from_secs(6), TcpStream::connect(addr))
-        .await
-        .with_context(|| format!("connecting to {addr}"))?
-        .with_context(|| format!("connecting to {addr}"))?;
+    connect_with(
+        addr,
+        infohash,
+        piece_count,
+        seeder,
+        inbound_tx,
+        limits,
+        auto_unchoke,
+        pex_port,
+        &Transport::default(),
+    )
+    .await
+}
 
-    let _ = stream.set_nodelay(true);
-    let (mut rd, mut wr) = split(stream);
+/// Dial a peer, uTP first when a socket is available and the peer has not
+/// failed it before, then TCP; encryption per the transport's policy.
+pub async fn connect_with(
+    addr: SocketAddr,
+    infohash: InfoHash,
+    piece_count: usize,
+    seeder: SharedSeeder,
+    inbound_tx: mpsc::UnboundedSender<FromPeer>,
+    limits: Limits,
+    auto_unchoke: bool,
+    pex_port: Option<u16>,
+    transport: &Transport,
+) -> Result<PeerHandle> {
+    let mode = transport.encryption;
+    let pex = pex_port.is_some();
+    let mut utp_used = false;
+    let mut dialled = None;
 
-    wire::handshake_outgoing(&mut wr, &infohash.0, true, false, pex_port.is_some()).await?;
-    let hs = wire::handshake_incoming(&mut rd).await?;
-    if hs.infohash != infohash.0 {
-        return Err(anyhow!(
-            "peer {addr} served a different infohash ({}) than requested",
-            hex::encode(hs.infohash)
-        ));
+    if let Some(utp) = &transport.utp {
+        let skip = transport.utp_failed.lock().unwrap().contains(&addr);
+        if !skip {
+            let reached = std::sync::atomic::AtomicBool::new(false);
+            let r = dial_crypto(
+                || async {
+                    let s = open_utp(utp, addr).await?;
+                    reached.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(s)
+                },
+                addr,
+                infohash,
+                mode,
+                pex,
+            )
+            .await;
+            match r {
+                Ok(ok) => {
+                    utp_used = true;
+                    dialled = Some(ok);
+                }
+                Err(e) => {
+                    if !reached.load(std::sync::atomic::Ordering::Relaxed) {
+                        let mut failed = transport.utp_failed.lock().unwrap();
+                        if failed.len() >= UTP_FAILED_CAP {
+                            failed.clear();
+                        }
+                        failed.insert(addr);
+                    }
+                    tracing::debug!(peer = %addr, error = %e, "uTP dial failed, falling back to TCP");
+                }
+            }
+        }
     }
 
+    let (stream, hs, encrypted) = match dialled {
+        Some(d) => d,
+        None => dial_crypto(|| open_tcp(addr), addr, infohash, mode, pex).await?,
+    };
+    tracing::debug!(
+        peer = %addr,
+        transport = if utp_used { "utp" } else { "tcp" },
+        crypto = crypto_name(encrypted),
+        "connected"
+    );
+
+    let (rd, wr) = split(stream);
     let handle = spawn_tasks(
         rd,
         wr,
@@ -299,9 +465,14 @@ pub async fn accept(
     auto_unchoke: bool,
     pex_port: Option<u16>,
 ) -> Result<PeerHandle> {
+    let addr = stream
+        .peer_addr()
+        .context("reading peer address of inbound connection")?;
+    let _ = stream.set_nodelay(true);
     let hs = wire::handshake_incoming(&mut stream).await?;
     accept_handshaken(
-        stream,
+        Box::new(stream),
+        addr,
         hs,
         infohash,
         piece_count,
@@ -317,7 +488,8 @@ pub async fn accept(
 /// Like [`accept`], for a socket whose peer handshake was already read (for
 /// example by a session listener routing on the infohash).
 pub async fn accept_handshaken(
-    stream: TcpStream,
+    stream: PeerStream,
+    addr: SocketAddr,
     hs: wire::Handshake,
     infohash: InfoHash,
     piece_count: usize,
@@ -327,10 +499,6 @@ pub async fn accept_handshaken(
     auto_unchoke: bool,
     pex_port: Option<u16>,
 ) -> Result<PeerHandle> {
-    let addr = stream
-        .peer_addr()
-        .context("reading peer address of inbound connection")?;
-    let _ = stream.set_nodelay(true);
     if hs.infohash != infohash.0 {
         return Err(anyhow!(
             "peer {addr} wants infohash {} but we are serving {}",

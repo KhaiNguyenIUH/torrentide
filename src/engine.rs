@@ -17,11 +17,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, RwLock};
 
 use crate::dht::DhtNode;
 use crate::peer::wire::Handshake;
+use crate::peer::PeerStream;
+use crate::utp::UtpSocket;
 use crate::ratelimit::Limits;
 
 use crate::metainfo::{Magnet, Metainfo, SocketAddrLite};
@@ -29,7 +30,7 @@ use crate::peer::connection::{FromPeer, BLOCK_SIZE};
 use crate::peer::pool::PeerPool;
 use crate::scheduler::{BlockRequest, Scheduler};
 use crate::state::{
-    Command, DownloadState, FilePriority, FileSummary, Level, PeerSummary, TorrentSummary, UiState,
+    Command, EncryptionMode, DownloadState, FilePriority, FileSummary, Level, PeerSummary, TorrentSummary, UiState,
 };
 use crate::storage::Storage;
 use crate::tracker::{self, Event};
@@ -78,7 +79,11 @@ pub struct EngineOptions {
     pub dht_enabled: bool,
     /// Peers the session listener already handshook for this torrent. When
     /// set the engine does not bind a listener of its own.
-    pub inbound: Option<mpsc::UnboundedReceiver<(TcpStream, Handshake)>>,
+    pub inbound: Option<mpsc::UnboundedReceiver<(PeerStream, SocketAddr, Handshake)>>,
+    /// Encryption policy for outbound dials. Disabled keeps plaintext.
+    pub encryption: EncryptionMode,
+    /// uTP socket to dial through before falling back to TCP.
+    pub utp: Option<Arc<UtpSocket>>,
     /// Port announced to trackers, the DHT and peers.
     pub port: u16,
     /// Per-file priorities to restore; ignored if its length does not match
@@ -103,6 +108,8 @@ impl Default for EngineOptions {
             dht: None,
             dht_enabled: true,
             inbound: None,
+            encryption: EncryptionMode::Disabled,
+            utp: None,
             port: LOCAL_PORT,
             file_priorities: None,
             extra_peers: None,
@@ -266,6 +273,7 @@ impl Engine {
             self.opts.max_peers,
             self.opts.auto_unchoke,
         );
+        pool.set_transport(self.opts.encryption, self.opts.utp.clone());
 
         if can_seed && inbound.is_none() {
             let (listen_tx, mut listen_rx) =
@@ -373,13 +381,13 @@ impl Engine {
                     pool.on_event(addr, ev).await;
                 }
 
-                Some((stream, hs)) = async {
+                Some((stream, from, hs)) = async {
                     match inbound.as_mut() {
                         Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    pool.adopt_inbound(stream, hs).await;
+                    pool.adopt_inbound(stream, from, hs).await;
                 }
 
                 Some(done) = ws_rx.recv() => {

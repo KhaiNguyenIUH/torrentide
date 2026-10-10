@@ -6,14 +6,15 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use super::connection::{FromPeer, PeerHandle, PeerState, SharedSeeder, ToPeer, BLOCK_SIZE};
-use super::pex;
+use super::connection::{FromPeer, PeerHandle, PeerState, SharedSeeder, ToPeer, Transport, BLOCK_SIZE};
+use super::{pex, PeerStream};
 use super::wire::{Bitfield, Handshake};
 use crate::metainfo::{InfoHash, Metainfo, SocketAddrLite};
 use crate::ratelimit::Limits;
+use crate::state::EncryptionMode;
+use crate::utp::UtpSocket;
 
 /// Upper bound on simultaneous connections. Going much above this invites
 /// connection throttling from other peers for no throughput gain.
@@ -63,6 +64,7 @@ pub struct PeerPool {
     /// each PEX message carries only the difference.
     pex_known: HashMap<SocketAddr, HashSet<SocketAddr>>,
     last_pex: Instant,
+    transport: Transport,
 }
 
 impl PeerPool {
@@ -97,7 +99,15 @@ impl PeerPool {
             dial_gen: HashMap::new(),
             pex_known: HashMap::new(),
             last_pex: Instant::now(),
+            transport: Transport::default(),
         }
+    }
+
+    /// Choose the encryption policy and uTP socket outbound dials use. The
+    /// default is plaintext TCP.
+    pub fn set_transport(&mut self, encryption: EncryptionMode, utp: Option<Arc<UtpSocket>>) {
+        self.transport.encryption = encryption;
+        self.transport.utp = utp;
     }
 
     /// The extension-protocol port to advertise, or `None` for a private
@@ -263,6 +273,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
         let limits = self.limits.clone();
         let auto_unchoke = self.auto_unchoke;
         let pex_port = self.pex_port();
+        let transport = self.transport.clone();
         tokio::spawn(async move {
             let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<FromPeer>();
             let tagged = events.clone();
@@ -274,7 +285,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                 }
             });
 
-            let result = super::connection::connect(
+            let result = super::connection::connect_with(
                 addr,
                 infohash,
                 piece_count,
@@ -283,6 +294,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                 limits,
                 auto_unchoke,
                 pex_port,
+                &transport,
             )
             .await;
 
@@ -298,8 +310,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
 }
 
     /// Take over an inbound socket whose handshake the caller already read.
-    pub async fn adopt_inbound(&mut self, stream: TcpStream, hs: Handshake) {
-        let Ok(addr) = stream.peer_addr() else { return };
+    pub async fn adopt_inbound(&mut self, stream: PeerStream, addr: SocketAddr, hs: Handshake) {
         if self.peers.len() >= self.max_peers {
             tracing::debug!(peer = %addr, "pool full, dropping inbound connection");
             return;
@@ -315,6 +326,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
         });
         match super::connection::accept_handshaken(
             stream,
+            addr,
             hs,
             self.meta.infohash,
             self.piece_count,
@@ -1065,9 +1077,9 @@ mod tests {
             true,
             Some(0),
         ));
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let (mut stream, peer) = listener.accept().await.unwrap();
         let hs = crate::peer::wire::handshake_incoming(&mut stream).await.unwrap();
-        pool.adopt_inbound(stream, hs).await;
+        pool.adopt_inbound(Box::new(stream), peer, hs).await;
         let client = client.await.unwrap().unwrap();
         assert_eq!(pool.connected(), 1);
 

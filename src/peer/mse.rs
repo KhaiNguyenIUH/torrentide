@@ -31,11 +31,13 @@ const WRITE_CHUNK: usize = 16 * 1024;
 
 type U768 = [u64; 12];
 
-/// RFC 2409 section 6.1 (Oakley group 1) prime, little-endian limbs:
-/// 2^768 - 2^704 - 1 + 2^64 * ([2^638 pi] + 149686).
+/// The 768-bit prime from the MSE specification, little-endian limbs. It is
+/// close to, but NOT the same as, the RFC 2409 Oakley group 1 prime: its low
+/// end is `...A63A3621 00000000 00090563`. Using the Oakley prime passes every
+/// loopback test and fails against every real client.
 const P: U768 = [
-    0xFFFF_FFFF_FFFF_FFFF,
-    0xF44C_42E9_A63A_3620,
+    0x0000_0000_0009_0563,
+    0xF44C_42E9_A63A_3621,
     0xE485_B576_625E_7EC6,
     0x4FE1_356D_6D51_C245,
     0x302B_0A6D_F25F_1437,
@@ -576,10 +578,10 @@ mod tests {
         from_be_bytes(&hex::decode(padded).unwrap())
     }
 
-    const P_HEX: &str = "ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a63a3620ffffffffffffffff";
+    const P_HEX: &str = "ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a63a36210000000000090563";
 
     #[test]
-    fn prime_matches_rfc_2409() {
+    fn prime_matches_mse_spec() {
         assert_eq!(P, hex_u768(P_HEX));
         assert_eq!(hex::encode(to_be_bytes(&P)), P_HEX);
     }
@@ -590,11 +592,11 @@ mod tests {
             ("3", "8"),
             (
                 "123456789abcdef0123456789abcdef012345678",
-                "563954e129421ab77e472e08459f30dc8e4856ec8d913668ff35fa1393f659a1a8489b28abd4569d4575f4976a8d22b2df44e204d443f5ad986ee1def26d4c84cd981903b9a07a8e7daefaba9562c9305695275af7e7f74fda28ee7b521e274e",
+                "9d2559a62e1bf5834b6fdbefe51896aa07ab1f71f9f6d9ed16c17dcfde4c82cc1caed6afc7757e58a4d0234cd95c630582da5ddb11b03646a3a60308236808cb5f2b1fcf041a63b1c1d70ea117f265a930d862be96d23bef41638912e7923ba7",
             ),
             (
                 "ffffffffffffffffffffffffffffffffffffffff",
-                "ad53c7b79dc7ae95bc4b0e87d5be0c9dac82bfc0298863d1590e7a30d191f8a5108263259237924fb45a2f19c9e06b84f7cfe70f298bbd2a8fde964b442a92c968a1fe4dd3a14c3c0424369f54b333c15770f6f3a71f896b03f14a053adc8c16",
+                "fe9aac142f64ad4d5bca7e30bea17d62c709de9e4c5694e2b27e8c6ed82510bb57952fcce38f6a5084b9699ec34b033ed1a0dbd51d70274bff40ae493f0ce2cdbd3cbd6055c9677a7eb70d29f4d8ecfbc2625316a7ae1a0d3d6605f0406bad79",
             ),
         ];
         for (x, want) in cases {

@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::AsyncReadExt;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, watch, RwLock, Semaphore};
 use tokio::task::JoinHandle;
@@ -24,12 +25,14 @@ use crate::engine::{self, Engine, EngineOptions};
 use crate::lsd::Lsd;
 use crate::metainfo::{InfoHash, Magnet, Metainfo};
 use crate::peer::wire::{handshake_incoming, Handshake};
+use crate::peer::{mse, PeerStream};
 use crate::portmap;
 use crate::ratelimit::{Limits, RateLimiter};
 use crate::state::{
-    human_bytes, Command, DownloadState, FilePriority, FileSummary, Level, SessionCommand, SessionState, Settings,
+    human_bytes, Command, DownloadState, EncryptionMode, FilePriority, FileSummary, Level, SessionCommand, SessionState, Settings,
     TorrentSummary, TorrentView, UiState,
 };
+use crate::utp::UtpSocket;
 use crate::store::{Record, Snapshot, Store};
 
 const TICK: Duration = Duration::from_millis(250);
@@ -40,7 +43,7 @@ const MAX_PENDING_HANDSHAKES: usize = 64;
 const MAPPING_LIFETIME: Duration = Duration::from_secs(3600);
 const SUMMARY_EVERY: Duration = Duration::from_secs(5);
 
-type Inbound = (TcpStream, Handshake);
+type Inbound = (PeerStream, SocketAddr, Handshake);
 type Routes = Arc<Mutex<HashMap<[u8; 20], UnboundedSender<Inbound>>>>;
 type MappingRx = watch::Receiver<Option<std::result::Result<portmap::Mapping, String>>>;
 
@@ -136,10 +139,10 @@ impl Session {
 
         let ipc = crate::ipc::listen(&store, tx.clone())?;
 
-        let (listener, port) = match TcpListener::bind(("0.0.0.0", settings.listen_port)).await {
+        let (mut listener, mut port, ephemeral) = match TcpListener::bind(("0.0.0.0", settings.listen_port)).await {
             Ok(l) => {
                 let port = l.local_addr()?.port();
-                (l, port)
+                (l, port, settings.listen_port == 0)
             }
             Err(e) if settings.listen_port != 0 => {
                 let l = TcpListener::bind(("0.0.0.0", 0))
@@ -150,17 +153,50 @@ impl Session {
                     Level::Warn,
                     format!("port {} busy, listening on {port}", settings.listen_port),
                 );
-                (l, port)
+                (l, port, true)
             }
             Err(e) => return Err(e).context("binding a listen port"),
         };
 
-        let routes: Routes = Arc::default();
-        let mut accepts = vec![tokio::spawn(accept_loop(listener, Arc::clone(&routes)))];
+        let mut udp = None;
+        if settings.utp {
+            let mut bound = UdpSocket::bind(("0.0.0.0", port)).await;
+            for _ in 0..8 {
+                if bound.is_ok() || !ephemeral {
+                    break;
+                }
+                let l = TcpListener::bind(("0.0.0.0", 0)).await.context("binding a listen port")?;
+                port = l.local_addr()?.port();
+                listener = l;
+                bound = UdpSocket::bind(("0.0.0.0", port)).await;
+            }
+            udp = Some(bound);
+        }
+
+        let router = Router {
+            routes: Arc::default(),
+            pending: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
+            encryption: settings.encryption,
+        };
+        let routes = Arc::clone(&router.routes);
+        let mut accepts = vec![tokio::spawn(accept_loop(listener, router.clone()))];
         match bind_v6(port) {
-            Ok(l) => accepts.push(tokio::spawn(accept_loop(l, Arc::clone(&routes)))),
+            Ok(l) => accepts.push(tokio::spawn(accept_loop(l, router.clone()))),
             Err(e) => tracing::debug!(error = %e, "no separate IPv6 listener"),
         }
+
+        let utp = match udp {
+            Some(Ok(udp)) => {
+                let sock = Arc::new(UtpSocket::bind(udp));
+                accepts.push(tokio::spawn(utp_accept_loop(Arc::clone(&sock), router.clone())));
+                Some(sock)
+            }
+            Some(Err(e)) => {
+                state.write().await.log(Level::Warn, format!("uTP unavailable on UDP port {port}: {e}"));
+                None
+            }
+            None => None,
+        };
 
         let lsd = if settings.lsd {
             match Lsd::start(port).await {
@@ -221,6 +257,7 @@ impl Session {
             state: Arc::clone(&state),
             routes,
             port,
+            utp,
             dht,
             lsd,
             mapping: None,
@@ -244,28 +281,76 @@ fn bind_v6(port: u16) -> std::io::Result<TcpListener> {
     TcpListener::from_std(s.into())
 }
 
-async fn accept_loop(listener: TcpListener, routes: Routes) {
-    let pending = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
+/// What the inbound classifiers share: the per-torrent routes, one bound on
+/// handshakes in flight across every transport, and the encryption policy.
+#[derive(Clone)]
+struct Router {
+    routes: Routes,
+    pending: Arc<Semaphore>,
+    encryption: EncryptionMode,
+}
+
+impl Router {
+    fn spawn_classify(&self, stream: PeerStream, addr: SocketAddr, transport: &'static str) {
+        let Ok(permit) = Arc::clone(&self.pending).try_acquire_owned() else {
+            return;
+        };
+        let router = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let done = tokio::time::timeout(HANDSHAKE_TIMEOUT, router.classify(stream, addr, transport)).await;
+            match done {
+                Ok(Err(e)) => tracing::debug!(peer = %addr, transport, error = %e, "inbound refused"),
+                Err(_) => tracing::debug!(peer = %addr, transport, "inbound handshake timed out"),
+                Ok(Ok(())) => {}
+            }
+        });
+    }
+
+    /// A plaintext BitTorrent handshake starts with 0x13 and the protocol
+    /// string; anything else is treated as the start of an MSE exchange.
+    async fn classify(&self, mut stream: PeerStream, addr: SocketAddr, transport: &'static str) -> Result<()> {
+        let mut prefix = [0u8; 20];
+        stream.read_exact(&mut prefix).await?;
+        let mode = self.encryption;
+        let (stream, hs, crypto) = if prefix[0] == 19 && prefix[1..] == *b"BitTorrent protocol" {
+            anyhow::ensure!(mode != EncryptionMode::Require, "plaintext peer refused: encryption required");
+            let hs = handshake_incoming(&mut (&prefix[..]).chain(&mut stream)).await?;
+            (stream, hs, "plain")
+        } else {
+            anyhow::ensure!(mode != EncryptionMode::Disabled, "encrypted peer refused: encryption disabled");
+            let known: Vec<InfoHash> = self.routes.lock().unwrap().keys().map(|k| InfoHash(*k)).collect();
+            let (mut s, ih) = mse::accept(stream, prefix.to_vec(), &known, mode).await?;
+            let hs = handshake_incoming(&mut s).await?;
+            anyhow::ensure!(hs.infohash == ih.0, "handshake names a different infohash than the encrypted exchange");
+            let stream: PeerStream = Box::new(s);
+            (stream, hs, "rc4")
+        };
+        let tx = self.routes.lock().unwrap().get(&hs.infohash).cloned();
+        let tx = tx.context("no torrent for that infohash")?;
+        tracing::debug!(peer = %addr, transport, crypto, "inbound classified");
+        let _ = tx.send((stream, addr, hs));
+        Ok(())
+    }
+}
+
+async fn accept_loop(listener: TcpListener, router: Router) {
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
+        let Ok((stream, addr)) = listener.accept().await else {
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         };
-        let Ok(permit) = Arc::clone(&pending).try_acquire_owned() else {
-            continue;
-        };
-        let routes = Arc::clone(&routes);
-        tokio::spawn(async move {
-            let _permit = permit;
-            let Ok(Ok(hs)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_incoming(&mut stream)).await
-            else {
-                return;
-            };
-            let tx = routes.lock().unwrap().get(&hs.infohash).cloned();
-            if let Some(tx) = tx {
-                let _ = tx.send((stream, hs));
-            }
-        });
+        let _ = stream.set_nodelay(true);
+        router.spawn_classify(Box::new(stream), addr, "tcp");
+    }
+}
+
+async fn utp_accept_loop(utp: Arc<UtpSocket>, router: Router) {
+    loop {
+        match utp.accept().await {
+            Ok((stream, addr)) => router.spawn_classify(Box::new(stream), addr, "utp"),
+            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
     }
 }
 
@@ -276,6 +361,7 @@ struct Core {
     state: Arc<RwLock<SessionState>>,
     routes: Routes,
     port: u16,
+    utp: Option<Arc<UtpSocket>>,
     dht: Option<Arc<DhtNode>>,
     lsd: Option<Lsd>,
     gdown: Arc<RateLimiter>,
@@ -555,6 +641,8 @@ impl Core {
             dht: self.dht.clone(),
             dht_enabled: self.settings.dht,
             inbound: Some(in_rx),
+            encryption: self.settings.encryption,
+            utp: self.utp.clone(),
             port: self.port,
             file_priorities: e.rec.priorities.clone(),
             extra_peers: match &self.lsd {

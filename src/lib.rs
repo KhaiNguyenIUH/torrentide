@@ -15,6 +15,7 @@
 //! - [`tui`] — the terminal interface
 
 pub mod bencode;
+pub mod blocklist;
 pub mod create;
 pub mod dht;
 pub mod engine;
@@ -26,6 +27,7 @@ pub mod peer;
 pub mod portmap;
 pub mod ratelimit;
 pub mod rss;
+pub mod schedule;
 pub mod scheduler;
 pub mod session;
 pub mod state;
