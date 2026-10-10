@@ -146,7 +146,7 @@ async fn ut_metadata_client_fetches_the_info_dict_from_a_running_peer() {
         }
     });
 
-    let got = torrust::dht::fetch_metadata_from_peer(loopback(addr), meta.infohash, WAIT, EncryptionMode::Disabled)
+    let got = torrust::dht::fetch_metadata_from_peer(loopback(addr), meta.infohash, WAIT, EncryptionMode::Disabled, None)
         .await
         .unwrap();
     assert_eq!(got, meta.info_bytes);

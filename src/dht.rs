@@ -1958,7 +1958,15 @@ impl MetadataClient {
         if !bt.supports_extended() {
             return Err(DhtError::Unsupported);
         }
+        self.exchange(stream, infohash).await
+    }
 
+    /// The BEP 10 handshake and `ut_metadata` exchange, run once both
+    /// BitTorrent handshakes are done.
+    async fn exchange<S>(&self, stream: &mut S, infohash: InfoHash) -> Result<Vec<u8>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         write_framed(
             stream,
             &[
@@ -2090,26 +2098,31 @@ where
 ///
 /// `mode` is the encryption policy: `Prefer` tries MSE first and falls back
 /// to plaintext, as peer dials do, so peers that only accept encrypted
-/// connections can supply metadata too.
+/// connections can supply metadata too. With `utp` set, a uTP attempt races
+/// the TCP one and the first success wins.
 pub async fn fetch_metadata_from_peer(
     addr: SocketAddr,
     infohash: InfoHash,
     timeout: Duration,
     mode: EncryptionMode,
+    utp: Option<Arc<crate::utp::UtpSocket>>,
 ) -> Result<Vec<u8>> {
+    let tcp = fetch_with_policy(addr, infohash, timeout, mode, || async {
+        let stream = TcpStream::connect(addr).await?;
+        stream.set_nodelay(true).ok();
+        Ok(stream)
+    });
     let whole = async {
-        if mode != EncryptionMode::Disabled {
-            // Leave a plaintext retry some of the budget under `Prefer`.
-            let budget = if mode == EncryptionMode::Prefer { timeout / 2 } else { timeout };
-            match tokio::time::timeout(budget, fetch_over(addr, infohash, budget, Some(mode))).await {
-                Ok(Ok(meta)) => return Ok(meta),
-                Ok(Err(e)) if mode == EncryptionMode::Require => return Err(e),
-                Err(_) if mode == EncryptionMode::Require => return Err(DhtError::Timeout),
-                Ok(Err(e)) => tracing::trace!(peer = %addr, error = %e, "encrypted metadata fetch failed, retrying plaintext"),
-                Err(_) => tracing::trace!(peer = %addr, "encrypted metadata fetch timed out, retrying plaintext"),
-            }
-        }
-        fetch_over(addr, infohash, timeout, None).await
+        let Some(utp) = utp else { return tcp.await };
+        let utp = fetch_with_policy(addr, infohash, timeout, mode, || async {
+            Ok(utp.connect(addr).await?)
+        });
+        futures::future::select_ok([
+            Box::pin(tcp) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>>,
+            Box::pin(utp),
+        ])
+            .await
+            .map(|(meta, _)| meta)
     };
     match tokio::time::timeout(timeout, whole).await {
         Ok(r) => r,
@@ -2117,10 +2130,44 @@ pub async fn fetch_metadata_from_peer(
     }
 }
 
+/// The MSE-then-plaintext policy over one transport, dialled by `connect`.
+async fn fetch_with_policy<S, F, Fut>(
+    addr: SocketAddr,
+    infohash: InfoHash,
+    timeout: Duration,
+    mode: EncryptionMode,
+    connect: F,
+) -> Result<Vec<u8>>
+where
+    S: crate::peer::AsyncStream,
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<S>>,
+{
+    if mode != EncryptionMode::Disabled {
+        // Leave a plaintext retry some of the budget under `Prefer`.
+        let budget = if mode == EncryptionMode::Prefer { timeout / 2 } else { timeout };
+        match tokio::time::timeout(budget, fetch_over(connect(), infohash, budget, Some(mode))).await {
+            Ok(Ok(meta)) => return Ok(meta),
+            Ok(Err(e)) if mode == EncryptionMode::Require => return Err(e),
+            Err(_) if mode == EncryptionMode::Require => return Err(DhtError::Timeout),
+            Ok(Err(e)) => tracing::trace!(peer = %addr, error = %e, "encrypted metadata fetch failed, retrying plaintext"),
+            Err(_) => tracing::trace!(peer = %addr, "encrypted metadata fetch timed out, retrying plaintext"),
+        }
+    }
+    fetch_over(connect(), infohash, timeout, None).await
+}
+
 /// One connection's metadata exchange, wrapped in MSE when `mse` is set.
-async fn fetch_over(addr: SocketAddr, infohash: InfoHash, timeout: Duration, mse: Option<EncryptionMode>) -> Result<Vec<u8>> {
-    let stream = TcpStream::connect(addr).await?;
-    stream.set_nodelay(true).ok();
+async fn fetch_over<S>(
+    connecting: impl std::future::Future<Output = Result<S>>,
+    infohash: InfoHash,
+    timeout: Duration,
+    mse: Option<EncryptionMode>,
+) -> Result<Vec<u8>>
+where
+    S: crate::peer::AsyncStream,
+{
+    let stream = connecting.await?;
     match mse {
         Some(mode) => {
             let mut stream = crate::peer::mse::connect(stream, infohash, mode)
@@ -2132,6 +2179,31 @@ async fn fetch_over(addr: SocketAddr, infohash: InfoHash, timeout: Duration, mse
             let mut stream = stream;
             MetadataClient::new().fetch(&mut stream, infohash, timeout).await
         }
+    }
+}
+
+/// Fetch the metadata over a connection the listener accepted: `hs` is the
+/// peer's BitTorrent handshake, which the listener has already read (after
+/// MSE, if any). Replies with our own handshake and runs the exchange.
+pub async fn fetch_metadata_inbound(
+    stream: &mut crate::peer::PeerStream,
+    hs: &wire::Handshake,
+    infohash: InfoHash,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    if hs.infohash != infohash.0 {
+        return Err(DhtError::Metadata("peer asked for a different infohash".into()));
+    }
+    if !hs.supports_extended() {
+        return Err(DhtError::Unsupported);
+    }
+    let run = async {
+        wire::handshake_outgoing(stream, &infohash.0, true, false, true).await?;
+        MetadataClient::new().exchange(stream, infohash).await
+    };
+    match tokio::time::timeout(timeout, run).await {
+        Ok(r) => r,
+        Err(_) => Err(DhtError::Timeout),
     }
 }
 
@@ -2150,7 +2222,7 @@ pub async fn fetch_metadata(
 ) -> Result<Vec<u8>> {
     let node = DhtNode::new(None).await?;
     node.bootstrap(routers).await;
-    fetch_metadata_with_node(&node, infohash, timeout, mode).await
+    fetch_metadata_with_node(&node, infohash, timeout, mode, None).await
 }
 
 /// Like [`fetch_metadata`] on an already running, bootstrapped node.
@@ -2159,6 +2231,7 @@ pub async fn fetch_metadata_with_node(
     infohash: InfoHash,
     timeout: Duration,
     mode: EncryptionMode,
+    utp: Option<Arc<crate::utp::UtpSocket>>,
 ) -> Result<Vec<u8>> {
     let mut peers = node.get_peers(infohash).await?;
     peers.sort_unstable();
@@ -2167,7 +2240,7 @@ pub async fn fetch_metadata_with_node(
         tracing::warn!(infohash = %infohash, "dht returned no peers for metadata");
         return Err(DhtError::Metadata("no peers found for infohash".into()));
     }
-    fetch_metadata_from_peers(peers, infohash, timeout, mode).await
+    fetch_metadata_from_peers(peers, infohash, timeout, mode, utp).await
 }
 
 /// Ask `peers` for the metadata of `infohash`, [`METADATA_CONCURRENCY`] at a
@@ -2178,6 +2251,7 @@ pub async fn fetch_metadata_from_peers(
     infohash: InfoHash,
     timeout: Duration,
     mode: EncryptionMode,
+    utp: Option<Arc<crate::utp::UtpSocket>>,
 ) -> Result<Vec<u8>> {
     tracing::info!(infohash = %infohash, peers = peers.len(), "asking peers for metadata");
 
@@ -2190,10 +2264,11 @@ pub async fn fetch_metadata_from_peers(
     loop {
         while inflight.len() < METADATA_CONCURRENCY {
             let Some(peer) = queue.next() else { break };
+            let utp = utp.clone();
             inflight.push(async move {
                 (
                     peer,
-                    fetch_metadata_from_peer(peer, infohash, per_peer, mode).await,
+                    fetch_metadata_from_peer(peer, infohash, per_peer, mode, utp).await,
                 )
             });
         }
@@ -3320,12 +3395,59 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn metadata_is_fetched_over_an_inbound_connection() {
+        let info_dict = test_info_dict();
+        let infohash = InfoHash(sha1_bytes(&info_dict));
+        let (ours, mut theirs) = tokio::io::duplex(64 * 1024);
+        let served = info_dict.clone();
+        let hash = infohash.0;
+        let peer = tokio::spawn(async move {
+            let mut reserved = [0u8; 8];
+            reserved[5] = 0x10;
+            let mut hs = vec![19u8];
+            hs.extend_from_slice(b"BitTorrent protocol");
+            hs.extend_from_slice(&reserved);
+            hs.extend_from_slice(&hash);
+            hs.extend_from_slice(&[7u8; 20]);
+            theirs.write_all(&hs).await.unwrap();
+            let incoming = wire::handshake_incoming(&mut theirs).await.unwrap();
+            assert_eq!(incoming.infohash, hash);
+            let ext = ExtendedHandshake::new(Some(3), "fake", 100, Some(served.len()));
+            write_ext(&mut theirs, EXT_HANDSHAKE_ID, &ext.encode()).await;
+            let client_hs = read_frame(&mut theirs).await.unwrap();
+            assert_eq!(client_hs[..2], [MSG_EXTENDED, EXT_HANDSHAKE_ID]);
+            while let Ok(req) = read_frame(&mut theirs).await {
+                let body = bencode::decode(&req[2..]).unwrap();
+                let piece = body.get_int_opt("piece").unwrap() as usize;
+                let start = piece * UT_METADATA_PIECE_SIZE;
+                let end = (start + UT_METADATA_PIECE_SIZE).min(served.len());
+                let mut d = BTreeMap::new();
+                d.insert(b"msg_type".to_vec(), Value::Int(1));
+                d.insert(b"piece".to_vec(), Value::Int(piece as i64));
+                d.insert(b"total_size".to_vec(), Value::Int(served.len() as i64));
+                let mut out = bencode::encode(&Value::Dict(d));
+                out.extend_from_slice(&served[start..end]);
+                write_ext(&mut theirs, LOCAL_UT_METADATA_ID, &out).await;
+            }
+        });
+        let mut stream: crate::peer::PeerStream = Box::new(ours);
+        let theirs_hs = wire::handshake_incoming(&mut stream).await.unwrap();
+        let got = fetch_metadata_inbound(&mut stream, &theirs_hs, infohash, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(got, info_dict);
+        let mut wrong = theirs_hs.clone();
+        wrong.infohash = [9; 20];
+        assert!(fetch_metadata_inbound(&mut stream, &wrong, infohash, Duration::from_secs(1)).await.is_err());
+        drop(stream);
+        peer.await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn metadata_is_fetched_from_a_peer_that_requires_encryption() {
         let info_dict = test_info_dict();
         let infohash = InfoHash(sha1_bytes(&info_dict));
         let addr = spawn_fake_peer_with(info_dict.clone(), infohash.0, Some(EncryptionMode::Require)).await;
-        let got = fetch_metadata_from_peer(addr, infohash, Duration::from_secs(5), EncryptionMode::Prefer).await.unwrap();
+        let got = fetch_metadata_from_peer(addr, infohash, Duration::from_secs(5), EncryptionMode::Prefer, None).await.unwrap();
         assert_eq!(got, info_dict);
     }
 
@@ -3334,10 +3456,10 @@ mod tests {
         let info_dict = test_info_dict();
         let infohash = InfoHash(sha1_bytes(&info_dict));
         let addr = spawn_fake_peer(info_dict.clone(), infohash.0).await;
-        let got = fetch_metadata_from_peer(addr, infohash, Duration::from_secs(5), EncryptionMode::Prefer).await.unwrap();
+        let got = fetch_metadata_from_peer(addr, infohash, Duration::from_secs(5), EncryptionMode::Prefer, None).await.unwrap();
         assert_eq!(got, info_dict);
         let addr = spawn_fake_peer(info_dict, infohash.0).await;
-        assert!(fetch_metadata_from_peer(addr, infohash, Duration::from_secs(5), EncryptionMode::Require).await.is_err());
+        assert!(fetch_metadata_from_peer(addr, infohash, Duration::from_secs(5), EncryptionMode::Require, None).await.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3346,7 +3468,7 @@ mod tests {
         assert!(info_dict.len() > UT_METADATA_PIECE_SIZE);
         let infohash = InfoHash(sha1_bytes(&info_dict));
         let addr = spawn_fake_peer(info_dict.clone(), infohash.0).await;
-        let got = fetch_metadata_from_peer(addr, infohash, Duration::from_secs(5), EncryptionMode::Disabled)
+        let got = fetch_metadata_from_peer(addr, infohash, Duration::from_secs(5), EncryptionMode::Disabled, None)
             .await
             .unwrap();
         assert_eq!(got, info_dict);
@@ -3357,7 +3479,7 @@ mod tests {
         let info_dict = test_info_dict();
         let wanted = InfoHash([7u8; 20]);
         let addr = spawn_fake_peer(info_dict, wanted.0).await;
-        let err = fetch_metadata_from_peer(addr, wanted, Duration::from_secs(5), EncryptionMode::Disabled)
+        let err = fetch_metadata_from_peer(addr, wanted, Duration::from_secs(5), EncryptionMode::Disabled, None)
             .await
             .unwrap_err();
         assert!(
@@ -3374,7 +3496,7 @@ mod tests {
             let (_sock, _) = listener.accept().await.unwrap();
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
-        let err = fetch_metadata_from_peer(addr, InfoHash([1; 20]), Duration::from_millis(300), EncryptionMode::Disabled)
+        let err = fetch_metadata_from_peer(addr, InfoHash([1; 20]), Duration::from_millis(300), EncryptionMode::Disabled, None)
             .await
             .unwrap_err();
         assert!(matches!(err, DhtError::Timeout), "got {err:?}");
@@ -3397,7 +3519,7 @@ mod tests {
             sock.write_all(&ours).await.unwrap();
             let _ = read_frame(&mut sock).await;
         });
-        let err = fetch_metadata_from_peer(addr, InfoHash([1; 20]), Duration::from_secs(5), EncryptionMode::Disabled)
+        let err = fetch_metadata_from_peer(addr, InfoHash([1; 20]), Duration::from_secs(5), EncryptionMode::Disabled, None)
             .await
             .unwrap_err();
         assert!(matches!(err, DhtError::Unsupported), "got {err:?}");

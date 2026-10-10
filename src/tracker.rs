@@ -261,6 +261,69 @@ pub async fn announce_tiers(
     out
 }
 
+/// One announce outcome from [`announce_stream`]; `Err` is already redacted.
+#[derive(Debug)]
+pub struct TrackerUpdate {
+    pub url: String,
+    pub result: Result<AnnounceResult, String>,
+}
+
+const STREAM_MIN_INTERVAL: Duration = Duration::from_secs(60);
+const STREAM_MAX_INTERVAL: Duration = Duration::from_secs(300);
+const STREAM_RETRY_BASE: Duration = Duration::from_secs(15);
+
+/// Wait before a tracker's next announce: its own interval clamped to
+/// 60s..5min after a reply, doubling from 15s up to 5min after failures.
+fn stream_delay(reply: Option<Duration>, failures: u32) -> Duration {
+    match reply {
+        Some(i) => i.clamp(STREAM_MIN_INTERVAL, STREAM_MAX_INTERVAL),
+        None => (STREAM_RETRY_BASE * 2u32.saturating_pow(failures.saturating_sub(1)).min(64)).min(STREAM_MAX_INTERVAL),
+    }
+}
+
+/// Announce to every tracker independently and forever, sending each outcome
+/// as soon as that tracker answers. Each tracker re-announces on its own
+/// clamped interval and retries with backoff after a failure. The tasks end
+/// when the receiver is dropped.
+pub fn announce_stream(
+    urls: &[String],
+    infohash: InfoHash,
+    port: u16,
+    left: u64,
+) -> tokio::sync::mpsc::UnboundedReceiver<TrackerUpdate> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    for url in urls.iter().filter(|u| !u.is_empty()).cloned() {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut event = Some(Event::Started);
+            let mut failures = 0u32;
+            loop {
+                let res = announce(&url, infohash, port, 0, 0, left, event, 200, true).await;
+                let delay = match &res {
+                    Ok(r) => {
+                        event = None;
+                        failures = 0;
+                        stream_delay(Some(r.interval), 0)
+                    }
+                    Err(_) => {
+                        failures += 1;
+                        stream_delay(None, failures)
+                    }
+                };
+                let result = res.map_err(|e| format!("{}: {e}", crate::redact::url(&url)));
+                if tx.send(TrackerUpdate { url: url.clone(), result }).is_err() {
+                    return;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = tx.closed() => return,
+                }
+            }
+        });
+    }
+    rx
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn announce_and_count(
     url: &str,
@@ -1160,6 +1223,36 @@ mod tests {
             }
         });
         format!("http://{addr}/announce")
+    }
+
+    #[test]
+    fn stream_delay_clamps_and_backs_off() {
+        assert_eq!(stream_delay(Some(Duration::from_secs(5)), 0), Duration::from_secs(60));
+        assert_eq!(stream_delay(Some(Duration::from_secs(1800)), 0), Duration::from_secs(300));
+        assert_eq!(stream_delay(None, 1), Duration::from_secs(15));
+        assert_eq!(stream_delay(None, 3), Duration::from_secs(60));
+        assert_eq!(stream_delay(None, 50), Duration::from_secs(300));
+    }
+
+    #[tokio::test]
+    async fn announce_stream_delivers_each_tracker_as_it_answers() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fast = mock_tracker(Duration::ZERO, 1111, seen.clone()).await;
+        let slow = mock_tracker(Duration::from_millis(800), 2222, seen.clone()).await;
+        let dead = "http://127.0.0.1:1/announce".to_owned();
+        let mut rx = announce_stream(&[slow.clone(), dead.clone(), fast.clone()], InfoHash([7; 20]), 6881, 16384);
+
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            let u = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+            order.push((u.url, u.result.map(|r| r.peers[0].port)));
+        }
+        assert_eq!(order[2], (slow, Ok(2222)));
+        let fast_pos = order.iter().position(|(u, _)| *u == fast).unwrap();
+        assert_eq!(order[fast_pos].1, Ok(1111));
+        let dead_pos = order.iter().position(|(u, _)| *u == dead).unwrap();
+        assert!(order[dead_pos].1.is_err());
+        assert!(seen.lock().unwrap().iter().all(|r| r.contains("left=16384")));
     }
 
     #[tokio::test]

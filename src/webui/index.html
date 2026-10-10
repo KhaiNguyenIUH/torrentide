@@ -129,7 +129,7 @@ function action(t, name) {
 function row(t) {
   var tr = el("tr");
   tr.appendChild(el("td", "name", t.name));
-  tr.appendChild(el("td", "num", bytes(t.size)));
+  tr.appendChild(el("td", "num", t.state === "fetching metadata" ? "?" : bytes(t.size)));
   var pc = Math.max(0, Math.min(1, t.progress)) * 100;
   var bar = el("div", "bar");
   var fill = el("i");

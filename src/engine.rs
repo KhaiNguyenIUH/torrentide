@@ -17,6 +17,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use futures::future::BoxFuture;
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{mpsc, oneshot, RwLock};
 
 use crate::dht::DhtNode;
@@ -1385,122 +1387,228 @@ pub fn build_seeder(
     })
 }
 
-/// Resolve a magnet link's `info` dict.
+/// Resolve a magnet link's `info` dict with one continuous pipeline that
+/// runs until some peer supplies it (the caller stops it with `Stop`).
 ///
-/// Two independent peer sources are tried, in the order real clients use:
+/// Peers stream in from every source at once and go straight into the fetch
+/// pool: each magnet tracker is announced to independently and re-announced on
+/// its own interval, the DHT is searched repeatedly, and inbound peers that
+/// connect to us meanwhile are asked directly. Up to [`META_CONCURRENCY`]
+/// peers are asked at a time; a failed peer is retried after a cooldown.
 ///
-/// 1. The magnet's own trackers. These are HTTP/UDP *tracker* URLs, not DHT
-///    node addresses, so they must be announced to with the tracker client
-///    rather than passed to the DHT bootstrapper.
-/// 2. The DHT, using the well-known public bootstrap routers, for magnets that
-///    carry no trackers or whose trackers are unreachable.
-///
-/// Either way the returned bytes are the raw bencoded `info` dictionary, whose
-/// SHA-1 must equal the magnet's infohash.
-async fn fetch_magnet_metadata(
-    magnet: &Magnet,
-    state: &Arc<RwLock<UiState>>,
-    port: u16,
-    dht_enabled: bool,
-    shared_dht: Option<&DhtNode>,
-    encryption: EncryptionMode,
-) -> Result<Vec<u8>> {
-    const PEER_PHASE_TIMEOUT: Duration = Duration::from_secs(60);
+/// The returned bytes are the raw bencoded `info` dictionary, whose SHA-1 must
+/// equal the magnet's infohash. The inbound receiver is handed back to `opts`
+/// so the engine still sees later inbound peers.
+async fn fetch_magnet_metadata(magnet: &Magnet, state: &Arc<RwLock<UiState>>, opts: &mut EngineOptions) -> Vec<u8> {
+    let infohash = magnet.infohash;
+    let started = Instant::now();
+    let mut urls = magnet.trackers.clone();
+    urls.sort();
+    urls.dedup();
+    let mut trackers = Some(tracker::announce_stream(&urls, infohash, opts.port, UNKNOWN_LEFT));
+    let mut tracker_state: HashMap<String, bool> = HashMap::new();
 
-    let mut tried = 0usize;
-
-    // ---- 1. trackers listed in the magnet ----
-    if !magnet.trackers.is_empty() {
-        let tracker::AnnounceOutcome { peers, errors, .. } = tracker::announce_all(
-            &magnet.trackers,
-            &placeholder_meta(magnet),
-            port,
-            0,
-            0,
-            0,
-            Some(Event::Started),
-        )
-        .await;
-
-        for e in &errors {
-            state.write().await.log(Level::Warn, format!("tracker: {e}"));
-        }
-        if !peers.is_empty() {
-            state
-                .write()
-                .await
-                .log(Level::Info, format!("trackers returned {} peers", peers.len()));
-
-            tried = peers.len();
-            let addrs = peers.iter().map(|p| SocketAddr::new(p.ip, p.port)).collect();
-            match crate::dht::fetch_metadata_from_peers(addrs, magnet.infohash, PEER_PHASE_TIMEOUT, encryption)
-                .await
-            {
-                Ok(info) => {
-                    state
-                        .write()
-                        .await
-                        .log(Level::Info, "fetched metadata from a tracker peer");
-                    return Ok(info);
+    let (dht_tx, dht_rx) = mpsc::unbounded_channel::<Result<Vec<SocketAddr>, String>>();
+    let mut dht_rx = Some(dht_rx);
+    let mut dht_state = if opts.dht_enabled { "starting".to_string() } else { "off".to_string() };
+    let (mut dht_lookups, mut dht_found) = (0usize, 0usize);
+    let mut dht_task = tokio::task::JoinSet::new();
+    if opts.dht_enabled {
+        let shared = opts.dht.clone();
+        dht_task.spawn(async move {
+            let node = match shared {
+                Some(node) => node,
+                None => loop {
+                    match DhtNode::new(None).await {
+                        Ok(node) => {
+                            let routers: Vec<String> =
+                                crate::dht::DEFAULT_ROUTERS.iter().map(|s| (*s).to_owned()).collect();
+                            node.bootstrap(&routers).await;
+                            break Arc::new(node);
+                        }
+                        Err(e) => {
+                            if dht_tx.send(Err(e.to_string())).is_err() {
+                                return;
+                            }
+                            tokio::time::sleep(DHT_LOOKUP_EVERY).await;
+                        }
+                    }
+                },
+            };
+            loop {
+                let found = node.get_peers(infohash).await.map_err(|e| e.to_string());
+                if dht_tx.send(found).is_err() {
+                    return;
                 }
-                Err(e) => tracing::debug!(error = %e, "tracker peers did not supply metadata"),
+                tokio::time::sleep(DHT_LOOKUP_EVERY).await;
+            }
+        });
+    }
+
+    let mut inbound = opts.inbound.take();
+    let mut inbound_seen = 0usize;
+    let mut peers = MetaPeers::default();
+    let mut tried = 0usize;
+    let mut inflight: FuturesUnordered<BoxFuture<'static, (Option<SocketAddr>, Result<Vec<u8>, String>)>> =
+        FuturesUnordered::new();
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    let mut last_status = String::new();
+
+    loop {
+        while inflight.len() < META_CONCURRENCY {
+            let Some(addr) = peers.next() else { break };
+            tried += 1;
+            let utp = opts.utp.clone();
+            let mode = opts.encryption;
+            inflight.push(Box::pin(async move {
+                let res = crate::dht::fetch_metadata_from_peer(addr, infohash, META_PEER_TIMEOUT, mode, utp).await;
+                (Some(addr), res.map_err(|e| e.to_string()))
+            }));
+        }
+
+        tokio::select! {
+            Some((addr, res)) = inflight.next(), if !inflight.is_empty() => match res {
+                Ok(info) => {
+                    let from = addr.map_or_else(|| "an inbound peer".to_string(), |a| a.to_string());
+                    state.write().await.log(Level::Info, format!("fetched metadata from {from}"));
+                    opts.inbound = inbound;
+                    return info;
+                }
+                Err(e) => {
+                    tracing::debug!(peer = ?addr, error = %e, "peer did not supply metadata");
+                    if let Some(a) = addr {
+                        peers.failed(a, Instant::now());
+                    }
+                }
+            },
+            update = next_from(&mut trackers) => match update.result {
+                Ok(reply) => {
+                    tracker_state.insert(update.url.clone(), true);
+                    state.write().await.log(
+                        Level::Info,
+                        format!("tracker {}: {} peers", crate::redact::url(&update.url), reply.peers.len()),
+                    );
+                    for p in reply.peers {
+                        peers.add(SocketAddr::new(p.ip, p.port), opts.blocklist.as_deref());
+                    }
+                }
+                Err(e) => {
+                    tracker_state.insert(update.url, false);
+                    state.write().await.log(Level::Warn, format!("tracker: {e}"));
+                }
+            },
+            found = next_from(&mut dht_rx) => match found {
+                Ok(addrs) => {
+                    dht_lookups += 1;
+                    dht_found += addrs.len();
+                    dht_state = format!("{dht_found} peers from {dht_lookups} lookups");
+                    for a in addrs {
+                        peers.add(a, opts.blocklist.as_deref());
+                    }
+                }
+                Err(e) => dht_state = format!("error: {e}"),
+            },
+            (mut stream, addr, hs) = next_from(&mut inbound) => {
+                inbound_seen += 1;
+                if !opts.blocklist.as_deref().is_some_and(|b| b.contains(addr.ip())) {
+                    inflight.push(Box::pin(async move {
+                        let res = crate::dht::fetch_metadata_inbound(&mut stream, &hs, infohash, META_PEER_TIMEOUT).await;
+                        (None, res.map_err(|e| e.to_string()))
+                    }));
+                }
+            },
+            _ = tick.tick() => {
+                peers.requeue(Instant::now());
+                let answered = tracker_state.values().filter(|ok| **ok).count();
+                let failed = tracker_state.len() - answered;
+                let secs = started.elapsed().as_secs();
+                let sources = if urls.is_empty() && !opts.dht_enabled {
+                    "no trackers and the DHT is off, waiting for inbound peers only".to_string()
+                } else {
+                    let trackers = if urls.is_empty() {
+                        "no trackers".to_string()
+                    } else {
+                        format!("trackers {answered} answered, {failed} failed, {} pending", urls.len() - tracker_state.len())
+                    };
+                    format!("{trackers}; DHT {dht_state}")
+                };
+                let mut body = format!(
+                    "{sources}; peers {} known, {tried} tried, {} connecting; {inbound_seen} inbound",
+                    peers.known.len(),
+                    inflight.len(),
+                );
+                if secs >= 180 {
+                    body.push_str("; adding the .torrent file instead skips this step");
+                }
+                if body != last_status {
+                    state.write().await.warning = Some(format!("waiting for file info ({}m{:02}s): {body}", secs / 60, secs % 60));
+                    last_status = body;
+                }
             }
         }
     }
+}
 
-    // ---- 2. the DHT ----
-    if !dht_enabled {
-        anyhow::bail!("tried {tried} tracker peers and the DHT is off in settings");
-    }
-
-    state
-        .write()
-        .await
-        .log(Level::Info, "asking the DHT for peers");
-
-    let routers: Vec<String> = crate::dht::DEFAULT_ROUTERS
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
-
-    let timeout = Duration::from_secs(60);
-    let fetched = match shared_dht {
-        Some(node) => crate::dht::fetch_metadata_with_node(node, magnet.infohash, timeout, encryption).await,
-        None => crate::dht::fetch_metadata(magnet.infohash, &routers, timeout, encryption).await,
-    };
-    match fetched {
-        Ok(info) => Ok(info),
-        Err(e) => Err(anyhow::anyhow!("tried {tried} tracker peers, then the DHT: {e:#}")),
+/// Next value from an optional receiver; a missing or closed one never
+/// yields, so a `select!` arm on it just goes quiet.
+async fn next_from<T>(rx: &mut Option<mpsc::UnboundedReceiver<T>>) -> T {
+    loop {
+        match rx {
+            Some(r) => match r.recv().await {
+                Some(v) => return v,
+                None => *rx = None,
+            },
+            None => std::future::pending().await,
+        }
     }
 }
 
-/// Wait before the first metadata retry; it doubles up to the maximum.
-const METADATA_RETRY_FIRST: Duration = Duration::from_secs(15);
-const METADATA_RETRY_MAX: Duration = Duration::from_secs(300);
+const META_CONCURRENCY: usize = 32;
+const META_PEER_TIMEOUT: Duration = Duration::from_secs(10);
+const META_RETRY_COOLDOWN: Duration = Duration::from_secs(120);
+const DHT_LOOKUP_EVERY: Duration = Duration::from_secs(60);
 
-/// A stand-in metainfo so the tracker client can announce a magnet, which has
-/// an infohash but no info dict yet. Only the infohash is used for announcing.
-fn placeholder_meta(magnet: &Magnet) -> Metainfo {
-    Metainfo {
-        infohash: magnet.infohash,
-        name: magnet
-            .display_name
-            .clone()
-            .unwrap_or_else(|| magnet.infohash.to_hex()),
-        piece_length: 0,
-        pieces: Vec::new(),
-        files: crate::metainfo::Files::Single {
-            name: String::new(),
-            length: 0,
-        },
-        total_length: 0,
-        private: false,
-        announce: None,
-        announce_list: magnet.trackers.clone(),
-        web_seeds: Vec::new(),
-        info_bytes: vec![],
+/// Addresses offered for the metadata fetch: each is queued once, and one that
+/// failed is queued again only after [`META_RETRY_COOLDOWN`].
+#[derive(Default)]
+struct MetaPeers {
+    /// `None` while queued or being asked, else when the last attempt failed.
+    known: HashMap<SocketAddr, Option<Instant>>,
+    queue: VecDeque<SocketAddr>,
+}
+
+impl MetaPeers {
+    fn add(&mut self, addr: SocketAddr, blocklist: Option<&crate::blocklist::BlockList>) {
+        if addr.port() == 0 || blocklist.is_some_and(|b| b.contains(addr.ip())) {
+            return;
+        }
+        if let std::collections::hash_map::Entry::Vacant(v) = self.known.entry(addr) {
+            v.insert(None);
+            self.queue.push_back(addr);
+        }
+    }
+
+    fn next(&mut self) -> Option<SocketAddr> {
+        self.queue.pop_front()
+    }
+
+    fn failed(&mut self, addr: SocketAddr, now: Instant) {
+        self.known.insert(addr, Some(now));
+    }
+
+    fn requeue(&mut self, now: Instant) {
+        for (addr, failed) in &mut self.known {
+            if failed.is_some_and(|at| now.saturating_duration_since(at) >= META_RETRY_COOLDOWN) {
+                *failed = None;
+                self.queue.push_back(*addr);
+            }
+        }
     }
 }
+
+/// `left` announced before the size is known. Zero would mark us a seeder, and
+/// many trackers do not hand seeders to seeders.
+const UNKNOWN_LEFT: u64 = 16 * 1024;
 
 /// Fetch metadata for a magnet link, then run the engine on the result.
 pub async fn run_magnet(
@@ -1520,7 +1628,7 @@ pub async fn run_magnet_with_options(
     download_dir: PathBuf,
     state: Arc<RwLock<UiState>>,
     mut commands: mpsc::UnboundedReceiver<Command>,
-    opts: EngineOptions,
+    mut opts: EngineOptions,
     info_sink: Option<oneshot::Sender<Vec<u8>>>,
 ) -> Result<()> {
     {
@@ -1537,28 +1645,6 @@ pub async fn run_magnet_with_options(
         st.log(Level::Info, "magnet link: locating peers for metadata");
     }
 
-    // Keep trying until it works or the torrent is stopped: right after a
-    // start the DHT may still be filling, and peers come and go.
-    let fetch = async {
-        let mut wait = METADATA_RETRY_FIRST;
-        loop {
-            match fetch_magnet_metadata(&magnet, &state, opts.port, opts.dht_enabled, opts.dht.as_deref(), opts.encryption).await {
-                Ok(info) => {
-                    state.write().await.warning = None;
-                    break Ok::<_, anyhow::Error>(info);
-                }
-                Err(e) => {
-                    let msg = format!("no metadata yet ({e:#}); retrying in {}s", wait.as_secs());
-                    let mut st = state.write().await;
-                    st.log(Level::Warn, msg.clone());
-                    st.warning = Some(msg);
-                    drop(st);
-                    tokio::time::sleep(wait).await;
-                    wait = (wait * 2).min(METADATA_RETRY_MAX);
-                }
-            }
-        }
-    };
     let wait_stop = async {
         while let Some(cmd) = commands.recv().await {
             if cmd == Command::Stop {
@@ -1568,9 +1654,14 @@ pub async fn run_magnet_with_options(
         std::future::pending::<()>().await
     };
     let raw_info = tokio::select! {
-        r = fetch => r?,
+        r = fetch_magnet_metadata(&magnet, &state, &mut opts) => {
+            state.write().await.warning = None;
+            r
+        }
         _ = wait_stop => {
-            if let Some(t) = &mut state.write().await.torrent {
+            let mut st = state.write().await;
+            st.warning = None;
+            if let Some(t) = &mut st.torrent {
                 t.state = DownloadState::Stopped;
             }
             return Ok(());
@@ -1637,6 +1728,26 @@ fn bencode_dict_with_info(info: Vec<u8>) -> crate::bencode::Value {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn meta_peers_dedupe_and_retry_after_cooldown() {
+        let a: SocketAddr = "10.0.0.1:6881".parse().unwrap();
+        let mut p = MetaPeers::default();
+        p.add(a, None);
+        p.add(a, None);
+        p.add("10.0.0.2:0".parse().unwrap(), None);
+        assert_eq!(p.next(), Some(a));
+        assert_eq!(p.next(), None);
+        let t = Instant::now();
+        p.failed(a, t);
+        p.add(a, None);
+        p.requeue(t + META_RETRY_COOLDOWN - Duration::from_secs(1));
+        assert_eq!(p.next(), None);
+        p.requeue(t + META_RETRY_COOLDOWN);
+        assert_eq!(p.next(), Some(a));
+        p.requeue(t + META_RETRY_COOLDOWN * 3);
+        assert_eq!(p.next(), None);
+    }
 
     #[test]
     fn ratio_reached_needs_target_and_size() {

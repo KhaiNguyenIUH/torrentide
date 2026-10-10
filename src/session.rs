@@ -1049,7 +1049,7 @@ impl Core {
         };
         rec.id = ih.to_hex();
         if self.find(&rec.id).is_some() {
-            anyhow::bail!("already in the session");
+            anyhow::bail!("already in the torrent list");
         }
         Ok(make_entry(rec, ih, meta, magnet))
     }

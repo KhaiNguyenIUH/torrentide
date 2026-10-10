@@ -1040,12 +1040,12 @@ mod tests {
         for i in 0..LOG_SHOWN + 5 {
             st.log(Level::Info, format!("line {i}"));
         }
-        st.log(Level::Error, "cannot add x.torrent: already in the session");
+        st.log(Level::Error, "cannot add x.torrent: already in the torrent list");
         st.torrents[1].ui.warning = Some("tracker: \"down\"".into());
         let json = state_json(&st);
         assert_valid_json(&json);
         assert!(json.contains(&format!("\"log_total\":{}", LOG_SHOWN + 6)), "{json}");
-        assert!(json.contains("{\"level\":\"error\",\"message\":\"cannot add x.torrent: already in the session\"}"));
+        assert!(json.contains("{\"level\":\"error\",\"message\":\"cannot add x.torrent: already in the torrent list\"}"));
         assert!(!json.contains("\"line 5\"") && json.contains("\"line 6\""));
         assert!(json.contains("\"warning\":\"tracker: \\\"down\\\"\""), "{json}");
     }
