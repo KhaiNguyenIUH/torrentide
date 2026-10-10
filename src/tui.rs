@@ -1758,6 +1758,23 @@ const SCHEDULE_UP: usize = 21;
 const SCHEDULE_RULE: usize = 22;
 const WEBUI_LAN: usize = 23;
 const LOCAL_URLS: usize = 24;
+const SAVE_ROOTS: usize = 25;
+
+/// Extra folders the web UI may save into: full paths, `;` separated.
+fn parse_save_roots(text: &str) -> Result<Vec<PathBuf>, String> {
+    text.split(';')
+        .map(clean_input)
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let path = PathBuf::from(&p);
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                Err(format!("Web UI save folder must be a full path: {p}"))
+            }
+        })
+        .collect()
+}
 
 fn settings_form(settings: &Settings) -> Form {
     let mut form = Form::new(
@@ -1794,6 +1811,10 @@ fn settings_form(settings: &Settings) -> Form {
             Field::text("Schedule rule (e.g. weekdays 09-18 limited)", ""),
             Field::toggle("Web UI on LAN (needs password)", settings.webui.lan),
             Field::toggle("Allow local network URLs", settings.allow_local_urls),
+            Field::text(
+                "Web UI extra save folders (; separated)",
+                settings.webui.save_roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("; "),
+            ),
         ],
     );
     form.has_password = settings.webui.password.is_some();
@@ -1848,6 +1869,7 @@ fn parse_settings(form: &Form, base: &Settings) -> Result<Settings, String> {
         "-" => None,
         typed => Some(typed.to_string()),
     };
+    let save_roots = parse_save_roots(&f[SAVE_ROOTS].input.text)?;
     let blocklist = Some(clean_input(&f[BLOCKLIST_FIELD].input.text))
         .filter(|d| !d.is_empty())
         .map(PathBuf::from);
@@ -1878,8 +1900,7 @@ fn parse_settings(form: &Form, base: &Settings) -> Result<Settings, String> {
             port: webui_port,
             password,
             lan: f[WEBUI_LAN].on,
-            // Not on the settings form, so keep whatever is stored.
-            save_roots: base.webui.save_roots.clone(),
+            save_roots,
         },
         blocklist,
         notifications: f[NOTIFY_FIELD].on,
@@ -4258,6 +4279,18 @@ mod session_tests {
         assert!(set(9, "").is_err());
         assert_eq!(set(8, "0").unwrap().max_active_downloads, 0);
         assert_eq!(set(9, "12").unwrap().max_active_torrents, 12);
+    }
+
+    #[test]
+    fn save_roots_are_full_paths_separated_by_semicolons() {
+        assert_eq!(parse_save_roots(" /Volumes/Media ; '/Users/a/My Stuff';"), Ok(vec![PathBuf::from("/Volumes/Media"), PathBuf::from("/Users/a/My Stuff")]));
+        assert_eq!(parse_save_roots(""), Ok(vec![]));
+        assert!(parse_save_roots("Movies").is_err());
+        let base = Settings { webui: WebUiSettings { save_roots: vec![PathBuf::from("/Volumes/Media")], ..WebUiSettings::default() }, ..Settings::default() };
+        let mut form = settings_form(&base);
+        assert_eq!(parse_settings(&form, &base).unwrap(), base);
+        form.fields[SAVE_ROOTS].input = TextInput::new("");
+        assert!(parse_settings(&form, &base).unwrap().webui.save_roots.is_empty());
     }
 
     #[test]

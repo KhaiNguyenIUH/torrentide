@@ -748,7 +748,9 @@ fn save_dir(root: &Path, extra: &[PathBuf], raw: Option<&str>) -> Result<Option<
             .join(", ")
     };
     let rejected = || format!("the folder must be inside: {}", list());
-    if name.contains('\0') {
+    // A backslash is a separator on Windows and never what a browser user
+    // means as part of a name elsewhere, so `C:\x` is refused everywhere.
+    if name.contains(['\0', '\\']) {
         return Err(rejected());
     }
     let asked = Path::new(name);
@@ -798,13 +800,17 @@ async fn route(req: &Request, body: &[u8], state: &RwLock<SessionState>) -> Vec<
             };
             // Safe first: a remote browser may name links, never a file on
             // this machine. It may pick a folder to save into, but only a
-            // subfolder of the download root; see `subfolder`.
+            // subfolder of the download root or of a configured save root; see `save_dir`.
             if !is_link(source) {
                 return error(400, "only magnet: and http(s):// links can be added here");
             }
             let dir = {
-                let st = state.read().await;
-                match save_dir(&st.settings.download_dir, &st.settings.webui.save_roots, field(&f, "dir")) {
+                // Clone the roots so the filesystem checks run without the lock.
+                let (root, extra) = {
+                    let st = state.read().await;
+                    (st.settings.download_dir.clone(), st.settings.webui.save_roots.clone())
+                };
+                match save_dir(&root, &extra, field(&f, "dir")) {
                     Ok(dir) => dir,
                     Err(message) => return error(400, &message),
                 }
@@ -820,8 +826,12 @@ async fn route(req: &Request, body: &[u8], state: &RwLock<SessionState>) -> Vec<
                 return error(400, "not a .torrent file");
             }
             let dir = {
-                let st = state.read().await;
-                match save_dir(&st.settings.download_dir, &st.settings.webui.save_roots, field(&query(req), "dir")) {
+                // Clone the roots so the filesystem checks run without the lock.
+                let (root, extra) = {
+                    let st = state.read().await;
+                    (st.settings.download_dir.clone(), st.settings.webui.save_roots.clone())
+                };
+                match save_dir(&root, &extra, field(&query(req), "dir")) {
                     Ok(dir) => dir,
                     Err(message) => return error(400, &message),
                 }
