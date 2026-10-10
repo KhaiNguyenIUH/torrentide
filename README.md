@@ -12,6 +12,11 @@
 
 torrust runs as a background session that you drive from a terminal UI (ratatui) or a small web UI, and it also has a plain-text mode. Closing either UI leaves downloads running. The crate is both a library (`torrust`) and a binary.
 
+<p align="center">
+  <img alt="Terminal UI" src="docs/tui.png" width="49%">
+  <img alt="Web UI" src="docs/webui.png" width="49%">
+</p>
+
 ## Download
 
 No Rust needed. Grab the file for your system from the [latest release](https://github.com/KhaiNguyenIUH/torrust/releases/latest), unpack it and run `torrust`.
