@@ -14,15 +14,15 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -432,16 +432,24 @@ fn bindings_line(width: u16) -> Line<'static> {
 
 /// Footer hints for an arbitrary key list; shared by both screens.
 fn keys_line(keys: &[(&'static str, &'static str)], width: u16) -> Line<'static> {
+    keys_layout(keys, width).0
+}
+
+/// The footer line plus the column span of each hint, in `keys` order.
+fn keys_layout(keys: &[(&'static str, &'static str)], width: u16) -> (Line<'static>, Vec<(usize, usize)>) {
     let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut spots = Vec::new();
     let mut used = 0usize;
     for (i, (key, desc)) in keys.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  "));
             used += 2;
         }
+        let start = used;
         spans.push(Span::styled(*key, heading_style()));
         spans.push(Span::raw(format!(" {desc}")));
         used += key.chars().count() + 1 + desc.chars().count();
+        spots.push((start, used));
     }
     let clock = now_hms();
     let clock_len = clock.chars().count();
@@ -450,7 +458,7 @@ fn keys_line(keys: &[(&'static str, &'static str)], width: u16) -> Line<'static>
         spans.push(Span::raw(" ".repeat(total - used - clock_len)));
         spans.push(Span::styled(clock, muted_style()));
     }
-    Line::from(spans)
+    (Line::from(spans), spots)
 }
 
 /// A rectangle `px`% wide and `py`% tall, centred inside `area`.
@@ -610,7 +618,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn restore() {
         let mut out = io::stdout();
-        let _ = execute!(out, DisableBracketedPaste, LeaveAlternateScreen, Show);
+        let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen, Show);
         let _ = disable_raw_mode();
         let _ = out.flush();
     }
@@ -998,7 +1006,12 @@ fn render_log(frame: &mut Frame, area: Rect, log: &[LogEntry], label: &str, app:
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, warning: Option<&str>, keys: &[(&'static str, &'static str)]) {
+fn render_footer(
+    frame: &mut Frame,
+    area: Rect,
+    warning: Option<&str>,
+    keys: &[(&'static str, &'static str)],
+) -> Vec<Rect> {
     let mut lines: Vec<Line> = Vec::new();
     if let Some(message) = warning {
         let text = truncate_line(message, usize::from(area.width).saturating_sub(2));
@@ -1007,8 +1020,20 @@ fn render_footer(frame: &mut Frame, area: Rect, warning: Option<&str>, keys: &[(
             Span::styled(text, warn_style()),
         ]));
     }
-    lines.push(keys_line(keys, area.width));
+    let (line, spots) = keys_layout(keys, area.width);
+    lines.push(line);
+    let y = area.y + (lines.len() - 1) as u16;
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    spots
+        .into_iter()
+        .filter(|&(start, _)| start < usize::from(area.width))
+        .map(|(start, end)| Rect {
+            x: area.x + start as u16,
+            y,
+            width: (end.min(usize::from(area.width)) - start) as u16,
+            height: 1,
+        })
+        .collect()
 }
 
 fn render_help(frame: &mut Frame, area: Rect, keys: &[(&str, &str)], size: (u16, u16)) {
@@ -1135,7 +1160,7 @@ pub fn run_tui(state: Arc<RwLock<UiState>>) -> Result<()> {
 
 /// Key bindings advertised in the session footer and help overlay. The most
 /// used keys come first because the footer is clipped on narrow terminals.
-const SESSION_KEYS: [(&str, &str); 24] = [
+const SESSION_KEYS: [(&str, &str); 26] = [
     ("a", "add"),
     ("s", "start/stop"),
     ("p", "pause"),
@@ -1160,6 +1185,8 @@ const SESSION_KEYS: [(&str, &str); 24] = [
     ("q", "close (downloads keep running)"),
     ("Q", "stop torrust"),
     ("Enter/Esc", "confirm/cancel"),
+    ("mouse", "click rows, tabs and hints; wheel scrolls"),
+    ("select text", "hold Shift (macOS: Option/Fn) and drag"),
 ];
 
 /// Footer hints: the global keys only; the modal keys live in the help overlay.
@@ -1967,9 +1994,14 @@ fn terms_text(terms: &[String]) -> String {
     if terms.is_empty() { "-".to_string() } else { terms.join(", ") }
 }
 
-fn feed_lines(feeds: &[FeedView], selected: Option<usize>, now: u64, width: usize) -> (Vec<Line<'static>>, usize, usize) {
+fn feed_lines(
+    feeds: &[FeedView],
+    selected: Option<usize>,
+    now: u64,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<std::ops::Range<usize>>) {
     let mut lines = Vec::new();
-    let (mut start, mut end) = (0, 0);
+    let mut ranges = Vec::new();
     for (i, feed) in feeds.iter().enumerate() {
         let first = lines.len();
         let focused = selected == Some(i);
@@ -1997,12 +2029,9 @@ fn feed_lines(feeds: &[FeedView], selected: Option<usize>, now: u64, width: usiz
             let recent = format!("added: {}", feed.recent.join("; "));
             lines.push(Line::from(Span::styled(format!("  {}", truncate_line(&recent, width.saturating_sub(2))), value_style())));
         }
-        if focused {
-            start = first;
-            end = lines.len();
-        }
+        ranges.push(first..lines.len());
     }
-    (lines, start, end)
+    (lines, ranges)
 }
 
 /// The add-torrent prompt: first the source, then the optional save folder.
@@ -2170,19 +2199,64 @@ impl Tab {
 /// The tab strip. Inactive tabs shrink to their number when the full labels
 /// would not fit.
 fn tab_line(active: Tab, width: u16) -> Line<'static> {
+    let spans = Tab::ALL.iter().zip(tab_texts(active, width)).map(|(tab, text)| {
+        let style = if *tab == active { selection_style() } else { muted_style() };
+        Span::styled(text, style)
+    });
+    Line::from(spans.collect::<Vec<_>>())
+}
+
+fn tab_texts(active: Tab, width: u16) -> Vec<String> {
     let full: usize = Tab::ALL.iter().map(|t| t.label().len() + 4).sum();
     let compact = usize::from(width) < full;
-    let mut spans = Vec::new();
-    for (i, tab) in Tab::ALL.iter().enumerate() {
-        let text = if compact && *tab != active {
-            format!(" {} ", i + 1)
-        } else {
-            format!(" {} {} ", i + 1, tab.label())
-        };
-        let style = if *tab == active { selection_style() } else { muted_style() };
-        spans.push(Span::styled(text, style));
+    Tab::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, tab)| {
+            if compact && *tab != active {
+                format!(" {} ", i + 1)
+            } else {
+                format!(" {} {} ", i + 1, tab.label())
+            }
+        })
+        .collect()
+}
+
+/// Screen areas recorded while rendering, so clicks are tested against what
+/// was actually drawn.
+#[derive(Default)]
+struct Hits {
+    tabs: Vec<(Rect, Tab)>,
+    keys: Vec<(Rect, KeyCode)>,
+    torrents: Vec<(Rect, usize)>,
+    list: Vec<(Rect, usize)>,
+    table: Rect,
+    detail: Rect,
+}
+
+fn hint_key(label: &str) -> Option<KeyCode> {
+    let mut chars = label.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Some(KeyCode::Char(c)),
+        _ if label == "tab" => Some(KeyCode::Tab),
+        _ => None,
     }
-    Line::from(spans)
+}
+
+fn inner(area: Rect) -> Rect {
+    Block::default().borders(Borders::ALL).inner(area)
+}
+
+fn below_header(body: Rect) -> Rect {
+    Rect { y: body.y + 1, height: body.height.saturating_sub(1), ..body }
+}
+
+fn row_rects(body: Rect, offset: usize, len: usize) -> Vec<(Rect, usize)> {
+    (offset..len)
+        .take(usize::from(body.height))
+        .enumerate()
+        .map(|(n, index)| (Rect { y: body.y + n as u16, height: 1, ..body }, index))
+        .collect()
 }
 
 /// What key handling needs to know about one torrent between frames.
@@ -2219,6 +2293,7 @@ struct SessionApp {
     feed_selected: Option<usize>,
     feed_id: Option<FeedId>,
     modal: Modal,
+    hits: Hits,
     cmd: Option<tokio::sync::mpsc::UnboundedSender<SessionCommand>>,
     quit: bool,
 }
@@ -2243,6 +2318,7 @@ impl SessionApp {
             feed_selected: None,
             feed_id: None,
             modal: Modal::None,
+            hits: Hits::default(),
             cmd: None,
             quit: false,
         }
@@ -2336,7 +2412,11 @@ impl SessionApp {
     }
 
     fn move_torrent(&mut self, delta: isize) {
-        self.selected = move_selection(self.selected, self.rows.len(), delta);
+        self.select_torrent(move_selection(self.selected, self.rows.len(), delta));
+    }
+
+    fn select_torrent(&mut self, selected: Option<usize>) {
+        self.selected = selected;
         let new_id = self.selected.map(|i| self.rows[i].id.clone());
         if new_id != self.selected_id {
             self.view.selected = None;
@@ -2547,6 +2627,59 @@ impl SessionApp {
         }
     }
 
+    fn on_mouse(&mut self, event: MouseEvent) {
+        if !matches!(self.modal, Modal::None) {
+            return;
+        }
+        let at = Position::new(event.column, event.row);
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.on_click(at),
+            MouseEventKind::ScrollDown => self.on_wheel(at, 1),
+            MouseEventKind::ScrollUp => self.on_wheel(at, -1),
+            _ => {}
+        }
+    }
+
+    fn on_click(&mut self, at: Position) {
+        let hit = |rows: &[(Rect, usize)]| rows.iter().find(|(r, _)| r.contains(at)).map(|&(_, i)| i);
+        if let Some(i) = hit(&self.hits.torrents) {
+            self.select_torrent(Some(i));
+        } else if let Some(&(_, tab)) = self.hits.tabs.iter().find(|(r, _)| r.contains(at)) {
+            self.set_tab(tab);
+        } else if let Some(&(_, code)) = self.hits.keys.iter().find(|(r, _)| r.contains(at)) {
+            self.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        } else if let Some(i) = hit(&self.hits.list) {
+            match self.tab {
+                Tab::Peers => self.view.selected = Some(i),
+                Tab::Files => self.view.file_selected = Some(i),
+                Tab::Trackers => self.tracker_selected = Some(i),
+                Tab::Feeds => {
+                    self.feed_selected = Some(i);
+                    self.feed_id = self.feeds.get(i).map(|f| f.id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn on_wheel(&mut self, at: Position, delta: isize) {
+        if self.hits.table.contains(at) {
+            self.move_torrent(delta);
+        } else if self.hits.detail.contains(at) {
+            match self.tab {
+                Tab::Peers => self.view.selected = move_selection(self.view.selected, self.view.peers.len(), delta),
+                Tab::Files => {
+                    self.view.file_selected = move_selection(self.view.file_selected, self.view.files.len(), delta)
+                }
+                Tab::Trackers => {
+                    self.tracker_selected = move_selection(self.tracker_selected, self.trackers.len(), delta)
+                }
+                Tab::Feeds => self.move_feed(delta),
+                _ => self.view.page_log(-3 * delta),
+            }
+        }
+    }
+
     fn on_modal_key(&mut self, key: KeyEvent) {
         let modal = std::mem::take(&mut self.modal);
         self.modal = match modal {
@@ -2702,6 +2835,7 @@ fn render_session(frame: &mut Frame, snapshot: &Result<SessionState, String>, ap
         return;
     }
     frame.render_widget(Block::default().style(base_style()), area);
+    app.hits = Hits::default();
 
     // Sync even when too small to draw, so keys like `Q` still reach the session.
     if let Ok(state) = snapshot {
@@ -2744,7 +2878,12 @@ fn render_session(frame: &mut Frame, snapshot: &Result<SessionState, String>, ap
         Tab::Trackers => &TRACKERS_FOOTER_KEYS,
         _ => &SESSION_FOOTER_KEYS,
     };
-    render_footer(frame, chunks[4], state.warning.as_deref(), footer_keys);
+    let hints = render_footer(frame, chunks[4], state.warning.as_deref(), footer_keys);
+    app.hits.keys = footer_keys
+        .iter()
+        .zip(hints)
+        .filter_map(|((key, _), rect)| Some((rect, hint_key(key)?)))
+        .collect();
     render_modal(frame, area, app);
 }
 
@@ -2862,6 +3001,8 @@ fn render_torrent_table(frame: &mut Frame, area: Rect, state: &SessionState, app
         .with_selected(app.selected)
         .with_offset(app.table_offset);
     frame.render_stateful_widget(table, area, &mut table_state);
+    app.hits.table = area;
+    app.hits.torrents = row_rects(below_header(inner(area)), app.table_offset, app.visible.len());
 }
 
 fn render_detail(frame: &mut Frame, area: Rect, state: &SessionState, app: &mut SessionApp) {
@@ -2874,6 +3015,13 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &SessionState, app: &mut 
         .split(area);
     frame.render_widget(Paragraph::new(tab_line(app.tab, area.width)), parts[0]);
     let body = parts[1];
+    app.hits.detail = area;
+    let mut x = parts[0].x;
+    for (tab, text) in Tab::ALL.iter().zip(tab_texts(app.tab, area.width)) {
+        let width = (text.len() as u16).min((parts[0].x + parts[0].width).saturating_sub(x));
+        app.hits.tabs.push((Rect { x, width, ..parts[0] }, *tab));
+        x += width;
+    }
 
     if app.tab == Tab::Feeds {
         render_feeds(frame, body, state, app);
@@ -2886,9 +3034,18 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &SessionState, app: &mut 
     };
     match app.tab {
         Tab::General => render_general(frame, body, view),
-        Tab::Peers => render_peers(frame, body, &mut app.view, false),
-        Tab::Files => render_files(frame, body, &mut app.view, true),
-        Tab::Trackers => render_trackers(frame, body, view, app.tracker_selected),
+        Tab::Peers => {
+            render_peers(frame, body, &mut app.view, false);
+            app.hits.list = row_rects(below_header(inner(body)), app.view.offset, app.view.peers.len());
+        }
+        Tab::Files => {
+            render_files(frame, body, &mut app.view, true);
+            app.hits.list = row_rects(below_header(inner(body)), app.view.file_offset, app.view.files.len());
+        }
+        Tab::Trackers => {
+            render_trackers(frame, body, view, app.tracker_selected);
+            app.hits.list = row_rects(inner(body), 0, app.trackers.len());
+        }
         Tab::Log => render_log(frame, body, &view.ui.log, "log", &mut app.view),
         Tab::Session if body.height >= 14 => {
             let parts = Layout::default()
@@ -2903,14 +3060,15 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &SessionState, app: &mut 
     }
 }
 
-fn render_feeds(frame: &mut Frame, area: Rect, state: &SessionState, app: &SessionApp) {
+fn render_feeds(frame: &mut Frame, area: Rect, state: &SessionState, app: &mut SessionApp) {
     let width = usize::from(area.width.saturating_sub(2));
     let height = usize::from(area.height.saturating_sub(2));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let (mut lines, start, end) = feed_lines(&state.feeds, app.feed_selected, now, width);
+    let (mut lines, ranges) = feed_lines(&state.feeds, app.feed_selected, now, width);
+    let selected = app.feed_selected.and_then(|i| ranges.get(i)).cloned().unwrap_or(0..0);
     if lines.is_empty() {
         lines.push(Line::from(Span::styled("No feeds \u{2014} press a to add one", muted_style())));
     }
@@ -2919,8 +3077,18 @@ fn render_feeds(frame: &mut Frame, area: Rect, state: &SessionState, app: &Sessi
         .border_style(border_style())
         .style(base_style())
         .title(Span::styled(format!(" feeds ({}) ", state.feeds.len()), heading_style()));
-    let scroll = feed_scroll(end, height, start) as u16;
-    frame.render_widget(Paragraph::new(Text::from(lines)).block(block).scroll((scroll, 0)), area);
+    let scroll = feed_scroll(selected.end, height, selected.start);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block).scroll((scroll as u16, 0)), area);
+    let body = inner(area);
+    app.hits.list = ranges
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            let top = r.start.saturating_sub(scroll).min(height);
+            let bottom = r.end.saturating_sub(scroll).min(height);
+            (bottom > top).then(|| (Rect { y: body.y + top as u16, height: (bottom - top) as u16, ..body }, i))
+        })
+        .collect();
 }
 
 fn general_lines(view: &TorrentView) -> Vec<Line<'static>> {
@@ -3178,7 +3346,7 @@ fn render_form(frame: &mut Frame, area: Rect, form: &Form) {
 /// Drive the session UI until the user quits or the session shuts down.
 fn run_session_loop(state: Arc<RwLock<SessionState>>) -> Result<()> {
     let (mut terminal, _guard) = setup_terminal()?;
-    let _ = execute!(io::stdout(), EnableBracketedPaste);
+    let _ = execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture);
     terminal.clear().context("failed to clear the terminal")?;
 
     let mut app = SessionApp::new();
@@ -3198,6 +3366,7 @@ fn run_session_loop(state: Arc<RwLock<SessionState>>) -> Result<()> {
         match event::read().context("failed to read a terminal event")? {
             Event::Key(key) if key.kind != KeyEventKind::Release => app.on_key(key),
             Event::Paste(text) => app.on_paste(&text),
+            Event::Mouse(mouse) => app.on_mouse(mouse),
             _ => {}
         }
     }
@@ -4640,6 +4809,78 @@ mod session_tests {
             out.push('\n');
         }
         out
+    }
+
+    fn locate(screen: &str, needle: &str) -> (u16, u16) {
+        let (y, line) = screen.lines().enumerate().find(|(_, l)| l.contains(needle)).unwrap();
+        (line.find(needle).unwrap() as u16, y as u16)
+    }
+
+    fn mouse(kind: MouseEventKind, (column, row): (u16, u16)) -> MouseEvent {
+        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    }
+
+    fn click(app: &mut SessionApp, at: (u16, u16)) {
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), at));
+    }
+
+    #[test]
+    fn clicking_a_torrent_row_selects_it() {
+        let state = session(&["a", "b", "c"]);
+        let (mut app, _rx) = app_with(&state);
+        draw(100, 30, &state, &mut app);
+        assert_eq!(app.selected, Some(0));
+        let (rect, index) = app.hits.torrents[1];
+        assert_eq!(index, 1);
+        click(&mut app, (rect.x + 3, rect.y));
+        assert_eq!(app.selected, Some(1));
+    }
+
+    #[test]
+    fn clicking_a_tab_switches_to_it() {
+        let state = session(&["a", "b", "c"]);
+        let (mut app, _rx) = app_with(&state);
+        let screen = draw(100, 30, &state, &mut app);
+        click(&mut app, locate(&screen, "5 Log"));
+        assert_eq!(app.tab, Tab::Log);
+    }
+
+    #[test]
+    fn wheel_over_the_table_moves_the_selection() {
+        let state = session(&["a", "b", "c"]);
+        let (mut app, _rx) = app_with(&state);
+        draw(100, 30, &state, &mut app);
+        let (rect, _) = app.hits.torrents[0];
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, (rect.x, rect.y)));
+        assert_eq!(app.selected, Some(1));
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, (rect.x, rect.y)));
+        assert_eq!(app.selected, Some(0));
+    }
+
+    #[test]
+    fn clicking_a_hint_acts_like_its_key() {
+        let state = session(&["a", "b", "c"]);
+        let (mut keyed, mut keyed_rx) = app_with(&state);
+        draw(100, 30, &state, &mut keyed);
+        keyed.on_key(ch('p'));
+        let (mut clicked, mut clicked_rx) = app_with(&state);
+        let screen = draw(100, 30, &state, &mut clicked);
+        click(&mut clicked, locate(&screen, "p pause"));
+        let want = keyed_rx.try_recv().unwrap();
+        let got = clicked_rx.try_recv().unwrap();
+        assert!(matches!(&want, SessionCommand::Torrent(id, Command::Pause) if id == "a"));
+        assert!(matches!(&got, SessionCommand::Torrent(id, Command::Pause) if id == "a"));
+    }
+
+    #[test]
+    fn mouse_is_ignored_while_a_modal_is_open() {
+        let state = session(&["a", "b", "c"]);
+        let (mut app, _rx) = app_with(&state);
+        draw(100, 30, &state, &mut app);
+        let (rect, _) = app.hits.torrents[1];
+        app.on_key(ch('?'));
+        click(&mut app, (rect.x + 3, rect.y));
+        assert_eq!(app.selected, Some(0));
     }
 
     #[test]

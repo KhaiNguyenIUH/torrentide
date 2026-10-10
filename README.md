@@ -166,6 +166,8 @@ The session has a small browser interface, off by default.
 | `?` | toggle help |
 | `r` | redraw |
 
+In the multi-torrent session UI, mouse clicks (torrent rows, tabs, footer key hints, list rows) and the wheel work too. Mouse capture takes over plain drags, so to select text hold Shift (Windows Terminal, most Linux terminals) or Option/Fn (macOS Terminal/iTerm).
+
 ## Logging
 
 Logging uses `tracing`. Set the level with `RUST_LOG` (default `torrust=info,warn`), e.g. `RUST_LOG=torrust=debug`. In TUI mode the logs go to `torrust.log` in the data directory so they don't garble the display. The file is owner-only (mode 0600), and a symlink in its place is refused. With `--no-tui` they go to stderr.
