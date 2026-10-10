@@ -1,34 +1,75 @@
-# torrust
+<h1 align="center">torrust</h1>
 
-A BitTorrent client written from scratch in Rust. It runs as a background session that you drive from a terminal UI (ratatui) or a small web UI, and it also has a plain-text mode. The crate is both a library (`torrust`) and a binary.
+<p align="center">A BitTorrent client written from scratch in Rust, with a terminal UI and a web UI.</p>
+
+<p align="center">
+  <a href="https://github.com/KhaiNguyenIUH/torrust/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/KhaiNguyenIUH/torrust"></a>
+  <a href="https://github.com/KhaiNguyenIUH/torrust/actions/workflows/release.yml"><img alt="Release build" src="https://img.shields.io/github/actions/workflow/status/KhaiNguyenIUH/torrust/release.yml?label=build"></a>
+  <img alt="Platforms" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey">
+  <img alt="Rust" src="https://img.shields.io/badge/rust-2021-orange">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
+</p>
+
+torrust runs as a background session that you drive from a terminal UI (ratatui) or a small web UI, and it also has a plain-text mode. Closing either UI leaves downloads running. The crate is both a library (`torrust`) and a binary.
+
+## Download
+
+No Rust needed. Grab the file for your system from the [latest release](https://github.com/KhaiNguyenIUH/torrust/releases/latest), unpack it and run `torrust`.
+
+| System | File | First run |
+| --- | --- | --- |
+| macOS, Apple Silicon | `torrust-vX.Y.Z-aarch64-apple-darwin.tar.gz` | `xattr -d com.apple.quarantine torrust`, or allow it in System Settings |
+| macOS, Intel | `torrust-vX.Y.Z-x86_64-apple-darwin.tar.gz` | same as above |
+| Windows 64-bit | `torrust-vX.Y.Z-x86_64-pc-windows-msvc.zip` | SmartScreen warns: "More info", then "Run anyway" |
+
+The binaries are not signed, which is why each system asks once. The Windows build compiles in CI but has had little testing; on Windows the session runs inside the TUI instead of as a background service.
+
+## Quick start
+
+```sh
+torrust                                  # open the TUI (starts the background session)
+torrust add "magnet:?xt=urn:btih:..."    # add a magnet link or .torrent
+torrust webui-password                   # turn on the web UI at http://127.0.0.1:8080
+torrust stop                             # stop the session
+```
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    TUI[Terminal UI] -- Unix socket --> S
+    CLI[torrust add] -- Unix socket --> S
+    Web[Browser] -- HTTP --> S
+    S[Background session] --> E[Torrent engines]
+    E <--> P[Peers<br/>TCP · uTP · encrypted]
+    E --> T[Trackers]
+    E --> D[DHT]
+    E --> F[(Files on disk)]
+```
 
 ## Features
 
-- `.torrent` files and magnet links (metadata comes from peers, including peers found through the DHT)
-- HTTP, HTTPS and UDP trackers
-- Kademlia DHT for finding peers without a tracker
-- Rarest-first piece selection with endgame mode
-- Resume: data already in the output directory is rechecked against the piece hashes
-- Verified pieces are seeded to other peers while the download continues
-- Skip files and pause from the TUI
-- Import half-finished downloads from other clients, including qBittorrent's `.!qB` files
+| | |
+| --- | --- |
+| Sources | `.torrent` files, magnet links, `http(s)` links to torrents, RSS and Atom feeds |
+| Finding peers | HTTP, HTTPS and UDP trackers, Kademlia DHT, peer exchange, local peer discovery |
+| Connections | uTP and TCP, Message Stream Encryption (prefer or require), NAT-PMP and UPnP port forwarding |
+| Downloading | rarest-first with endgame, resume with recheck, skip files, per-torrent and global speed limits |
+| Seeding | seeds while downloading, ratio target, super-seeding, tit-for-tat choking |
+| Control | terminal UI, web UI with upload and drag-and-drop, schedule, block list, notifications |
+| Other clients | import half-finished downloads, including qBittorrent's `.!qB` files |
+| Creating | build v1 `.torrent` files on all CPU cores and seed them at once |
 
-## Install
-
-Tagged versions are published on the GitHub Releases page with prebuilt macOS binaries for Apple Silicon (`aarch64-apple-darwin`) and Intel (`x86_64-apple-darwin`). The binaries are not signed, so macOS blocks the first run until you allow it in System Settings or clear the quarantine flag:
-
-    xattr -d com.apple.quarantine torrust
-
-To build it yourself:
+## Build from source
 
     cargo build --release
 
 The binary is `target/release/torrust`.
 
-To cut a release, bump `version` in `Cargo.toml`, commit, then push a tag. The release workflow builds both binaries and writes the release notes from the commits since the previous tag.
+To cut a release, bump `version` in `Cargo.toml`, commit, then push a tag. The release workflow builds the macOS and Windows binaries and writes the release notes from the commits since the previous tag.
 
-    git tag v0.1.0
-    git push origin v0.1.0
+    git tag v0.1.2
+    git push origin v0.1.2
 
 ## Usage
 
