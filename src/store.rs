@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -124,6 +125,26 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Our DHT node id and the nodes we knew last time, so a restart rejoins
+    /// the DHT at once instead of starting over from the public routers.
+    pub fn load_dht(&self) -> (Option<[u8; 20]>, Vec<SocketAddr>) {
+        let Ok(text) = fs::read_to_string(self.root.join("dht.nodes")) else {
+            return (None, Vec::new());
+        };
+        let mut lines = text.lines();
+        let id = lines.next().and_then(|l| hex::decode(l.trim()).ok()).and_then(|b| b.try_into().ok());
+        (id, lines.filter_map(|l| l.trim().parse().ok()).take(MAX_DHT_NODES).collect())
+    }
+
+    pub fn save_dht(&self, id: [u8; 20], nodes: &[SocketAddr]) -> Result<()> {
+        let mut text = hex::encode(id);
+        for n in nodes.iter().take(MAX_DHT_NODES) {
+            text.push('\n');
+            text.push_str(&n.to_string());
+        }
+        write_atomic(&self.root.join("dht.nodes"), text.as_bytes())
     }
 
     /// The 128-bit access token that guards a web UI without a password. It is
@@ -293,6 +314,9 @@ impl Store {
         out
     }
 }
+
+/// DHT nodes kept across restarts.
+const MAX_DHT_NODES: usize = 200;
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("path has no parent")?;
@@ -796,6 +820,17 @@ mod tests {
         ));
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn dht_nodes_round_trip_and_tolerate_junk() {
+        let store = Store::at(tmp("dht"));
+        assert_eq!(store.load_dht(), (None, Vec::new()));
+        let nodes: Vec<SocketAddr> = vec!["1.2.3.4:6881".parse().unwrap(), "[2001:db8::1]:51413".parse().unwrap()];
+        store.save_dht([7; 20], &nodes).unwrap();
+        assert_eq!(store.load_dht(), (Some([7; 20]), nodes.clone()));
+        fs::write(store.root().join("dht.nodes"), "nothex\n1.2.3.4:6881\ngarbage\n").unwrap();
+        assert_eq!(store.load_dht(), (None, nodes[..1].to_vec()));
     }
 
     #[cfg(unix)]

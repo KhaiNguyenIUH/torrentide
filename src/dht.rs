@@ -73,6 +73,10 @@ pub const MAX_METADATA_SIZE: usize = 4 * 1024 * 1024;
 /// Largest bencoded message accepted from a peer during metadata exchange.
 const MAX_EXT_MESSAGE_LEN: usize = 2 * 1024 * 1024;
 
+/// Upper bound on the rounds of one iterative lookup; it usually stops
+/// earlier, once no unasked node is left.
+const LOOKUP_ROUNDS: usize = 8;
+
 /// Public DHT routers, used when the caller has none configured.
 pub const DEFAULT_ROUTERS: &[&str] = &[
     "router.bittorrent.com:6881",
@@ -80,7 +84,6 @@ pub const DEFAULT_ROUTERS: &[&str] = &[
     "router.utorrent.com:6881",
     "dht.libtorrent.org:25401",
     "dht.aelitis.com:6881",
-    "router.bitcomet.com:6881",
 ];
 
 // ------------------------------------------------------------------- errors
@@ -654,7 +657,8 @@ pub fn decode_message(bytes: &[u8]) -> Result<Inbound> {
     if bytes.is_empty() {
         return Err(DhtError::Protocol("empty packet".into()));
     }
-    let v = bencode::decode(bytes)?;
+    // Other implementations do not always sort their keys.
+    let v = bencode::decode_unordered(bytes)?;
     if !matches!(v, Value::Dict(_)) {
         return Err(DhtError::Protocol(
             "krpc message is not a dictionary".into(),
@@ -1332,6 +1336,15 @@ impl DhtNode {
         }
     }
 
+    /// The next `K` nodes to ask: the closest to `target` among those just
+    /// learned and those in the table, skipping any already asked. Picking by
+    /// distance, not arrival order, is what makes a lookup converge.
+    fn next_hops(&self, target: &NodeId, mut learned: Vec<(NodeId, SocketAddr)>, seen: &mut HashSet<SocketAddr>) -> Vec<SocketAddr> {
+        learned.extend(lock(&self.shared.table).find_closest(target, K * 2).into_iter().map(|c| (c.id, c.addr)));
+        learned.sort_by(|a, b| a.0.distance(target).cmp(&b.0.distance(target)));
+        learned.into_iter().filter(|(_, addr)| seen.insert(*addr)).take(K).map(|(_, addr)| addr).collect()
+    }
+
     /// Ask the closest known nodes for nodes closer to `target`.
     ///
     /// Returns everything learned, nearest first. Nodes that do not answer are
@@ -1342,7 +1355,7 @@ impl DhtNode {
         let mut found: BTreeMap<NodeId, BencodedNode> = BTreeMap::new();
         let mut frontier = self.candidates(&target_id, &mut seen, K);
 
-        for round in 0..3 {
+        for round in 0..LOOKUP_ROUNDS {
             if frontier.is_empty() {
                 break;
             }
@@ -1352,12 +1365,13 @@ impl DhtNode {
                 async move { (addr, this.query(addr, q).await) }
             });
             let results = join_all(futures).await;
-            let mut next: Vec<SocketAddr> = Vec::new();
+            let mut learned: Vec<(NodeId, SocketAddr)> = Vec::new();
 
             for (addr, result) in results {
                 match result {
                     Ok(Inbound::Response(r)) => {
-                        if let ResponsePayload::Nodes(nodes) = &r.payload {
+                        // Some nodes add a token to find_node replies too.
+                        if let ResponsePayload::Nodes(nodes) | ResponsePayload::GetPeers { nodes, .. } = &r.payload {
                             for n in nodes {
                                 // Never route to ourselves.
                                 if n.id == this.shared.id {
@@ -1365,9 +1379,7 @@ impl DhtNode {
                                 }
                                 this.shared.add_contact(n.id, n.addr);
                                 found.insert(n.id, *n);
-                                if next.len() < K && seen.insert(n.addr) {
-                                    next.push(n.addr);
-                                }
+                                learned.push((n.id, n.addr));
                             }
                         }
                     }
@@ -1379,14 +1391,7 @@ impl DhtNode {
                 }
             }
 
-            // Nodes already in the table that we have not asked yet are usually
-            // the next best hop.
-            for c in lock(&this.shared.table).find_closest(&target_id, K * 2) {
-                if next.len() < K && seen.insert(c.addr) {
-                    next.push(c.addr);
-                }
-            }
-            frontier = next;
+            frontier = this.next_hops(&target_id, learned, &mut seen);
         }
 
         let mut out: Vec<BencodedNode> = found.into_values().collect();
@@ -1400,7 +1405,7 @@ impl DhtNode {
     /// Returns whatever we found, which may be empty: an empty routing table or
     /// unresponsive nodes is a normal outcome, not an error.
     pub async fn get_peers(&self, infohash: InfoHash) -> Result<Vec<SocketAddr>> {
-        Ok(self.get_peers_rounds(infohash, 3).await?.0)
+        Ok(self.get_peers_rounds(infohash, LOOKUP_ROUNDS).await?.0)
     }
 
     /// Peers found, plus every node that answered with a token (id, address, token).
@@ -1429,7 +1434,7 @@ impl DhtNode {
                 async move { (addr, this.query(addr, q).await) }
             });
             let results = join_all(futures).await;
-            let mut next: Vec<SocketAddr> = Vec::new();
+            let mut learned: Vec<(NodeId, SocketAddr)> = Vec::new();
 
             for (addr, result) in results {
                 match result {
@@ -1453,9 +1458,7 @@ impl DhtNode {
                                     continue;
                                 }
                                 this.shared.add_contact(n.id, n.addr);
-                                if next.len() < K && seen_nodes.insert(n.addr) {
-                                    next.push(n.addr);
-                                }
+                                learned.push((n.id, n.addr));
                             }
                         }
                     }
@@ -1467,12 +1470,7 @@ impl DhtNode {
                 }
             }
 
-            for c in lock(&this.shared.table).find_closest(&target_id, K * 2) {
-                if next.len() < K && seen_nodes.insert(c.addr) {
-                    next.push(c.addr);
-                }
-            }
-            frontier = next;
+            frontier = this.next_hops(&target_id, learned, &mut seen_nodes);
         }
 
         tracing::debug!(infohash = %infohash, peers = peers.len(), "get_peers finished");
@@ -1485,7 +1483,7 @@ impl DhtNode {
     /// Announcing is best-effort; failures are logged, not returned.
     pub async fn announce(&self, infohash: InfoHash, port: u16) -> Result<()> {
         let target_id = NodeId(infohash.0);
-        let (_, mut tokens) = self.get_peers_rounds(infohash, 3).await?;
+        let (_, mut tokens) = self.get_peers_rounds(infohash, LOOKUP_ROUNDS).await?;
         if tokens.is_empty() {
             tracing::debug!(infohash = %infohash, "announce_peer skipped: no node gave a token");
             return Ok(());
@@ -1575,7 +1573,12 @@ impl DhtNode {
                 Err(e) => tracing::debug!(%addr, error = %e, "bootstrap router unreachable"),
             }
         }
-        tracing::info!(routers = routers.len(), reachable, "dht bootstrap finished");
+        if reachable > 0 {
+            // Pinging only puts the routers in the table; a lookup of our own
+            // id is what fills it with real nodes near us.
+            let _ = this.find_node(this.shared.id.0).await;
+        }
+        tracing::info!(routers = routers.len(), reachable, nodes = this.node_count(), "dht bootstrap finished");
         reachable
     }
 }
@@ -1735,11 +1738,11 @@ const LOCAL_UT_METADATA_ID: u8 = 1;
 /// for the extended exchange, so a chatty peer cannot stall us indefinitely.
 const MAX_SKIPPED_MESSAGES: usize = 512;
 /// How long a single peer gets during [`fetch_metadata`].
-const PER_PEER_TIMEOUT: Duration = Duration::from_secs(15);
+const PER_PEER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Peers asked at the same time during [`fetch_metadata`].
-const METADATA_CONCURRENCY: usize = 8;
+const METADATA_CONCURRENCY: usize = 32;
 /// Peers tried at most during [`fetch_metadata`].
-const METADATA_MAX_PEERS: usize = 32;
+const METADATA_MAX_PEERS: usize = 200;
 
 /// The BEP 10 handshake, restricted to the fields BEP 9 needs.
 ///

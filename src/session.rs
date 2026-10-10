@@ -41,6 +41,10 @@ use crate::utp::UtpSocket;
 use crate::storage::check_no_symlinks;
 use crate::store::{Record, Snapshot, Store, StoredFeed};
 
+/// How often the DHT is checked, topped up when sparse, and saved.
+const DHT_REFRESH: Duration = Duration::from_secs(5 * 60);
+/// Below this many nodes the DHT bootstraps again from the public routers.
+const DHT_MIN_NODES: usize = 30;
 const TICK: Duration = Duration::from_millis(250);
 const PERSIST_EVERY: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -355,15 +359,27 @@ impl Session {
         };
 
         let dht = if settings.dht {
-            match DhtNode::new(None).await {
+            let (saved_id, saved_nodes) = store.load_dht();
+            match DhtNode::new(saved_id).await {
                 Ok(n) => {
                     let n = Arc::new(n);
                     let bg = Arc::clone(&n);
+                    let dht_store = store.clone();
                     tokio::spawn(async move {
                         let routers: Vec<String> =
                             crate::dht::DEFAULT_ROUTERS.iter().map(|s| (*s).to_owned()).collect();
-                        let up = bg.bootstrap(&routers).await;
+                        let known: Vec<String> = routers.iter().cloned().chain(saved_nodes.iter().map(|a| a.to_string())).collect();
+                        let up = bg.bootstrap(&known).await;
                         tracing::info!(routers_up = up, "dht bootstrapped");
+                        let mut every = tokio::time::interval(DHT_REFRESH);
+                        every.tick().await;
+                        loop {
+                            every.tick().await;
+                            if bg.node_count() < DHT_MIN_NODES {
+                                bg.bootstrap(&routers).await;
+                            }
+                            save_dht(&dht_store, &bg);
+                        }
                     });
                     Some(n)
                 }
@@ -1595,6 +1611,9 @@ impl Core {
             self.stop_entry(i, false).await;
         }
         self.save_all().await;
+        if let Some(dht) = &self.dht {
+            save_dht(&self.store, dht);
+        }
         let settings = self.settings.clone();
         if let Err(e) = self.store.save_settings(&settings) {
             tracing::error!("saving settings: {e:#}");
@@ -2123,6 +2142,13 @@ async fn read_source(source: &str) -> Result<Vec<u8>> {
         Ok(raw)
     })
     .await?
+}
+
+fn save_dht(store: &Store, dht: &DhtNode) {
+    let nodes: Vec<SocketAddr> = dht.good_nodes().into_iter().map(|c| c.addr).collect();
+    if let Err(e) = store.save_dht(dht.node_id().0, &nodes) {
+        tracing::warn!("saving DHT nodes: {e:#}");
+    }
 }
 
 fn lsd_allowed(meta: Option<&Metainfo>) -> bool {

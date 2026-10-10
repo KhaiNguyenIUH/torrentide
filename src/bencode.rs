@@ -146,9 +146,21 @@ pub fn decode(input: &[u8]) -> Result<Value> {
 
 /// Decode one value, returning it plus whatever unconsumed input remains.
 pub fn decode_partial(input: &[u8]) -> Result<(Value, &[u8])> {
-    let mut p = Parser { buf: input, pos: 0, depth: 0 };
+    let mut p = Parser { buf: input, pos: 0, depth: 0, sorted: true };
     let v = p.value()?;
     Ok((v, &input[p.pos..]))
+}
+
+/// Like [`decode`], but accepts dictionary keys in any order (still no
+/// repeats). For peers' wire messages, which some clients send unsorted;
+/// never for anything that is hashed.
+pub fn decode_unordered(input: &[u8]) -> Result<Value> {
+    let mut p = Parser { buf: input, pos: 0, depth: 0, sorted: false };
+    let v = p.value()?;
+    if p.pos != input.len() {
+        return Err(Error::TrailingData(p.pos));
+    }
+    Ok(v)
 }
 
 const MAX_DEPTH: usize = 64;
@@ -157,6 +169,8 @@ struct Parser<'a> {
     buf: &'a [u8],
     pos: usize,
     depth: usize,
+    /// Require dictionary keys in strictly increasing order.
+    sorted: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -279,14 +293,19 @@ impl<'a> Parser<'a> {
                             ))
                         }
                     };
-                    if let Some(p) = &prev_key {
-                        if *p >= key {
-                            return Err(Error::UnsortedDict(self.pos));
+                    if self.sorted {
+                        if let Some(p) = &prev_key {
+                            if *p >= key {
+                                return Err(Error::UnsortedDict(self.pos));
+                            }
                         }
+                        prev_key = Some(key.clone());
                     }
-                    prev_key = Some(key.clone());
+                    let at = self.pos;
                     let v = self.value()?;
-                    map.insert(key, v);
+                    if map.insert(key, v).is_some() {
+                        return Err(Error::UnsortedDict(at));
+                    }
                 }
                 other => return Err(Error::UnexpectedByte(other, self.pos)),
             }
@@ -337,6 +356,15 @@ fn encode_into(v: &Value, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unordered_decoding_accepts_any_key_order_but_no_repeats() {
+        assert!(decode(b"d1:bi1e1:ai2ee").is_err());
+        let v = decode_unordered(b"d1:bi1e1:ai2ee").unwrap();
+        assert_eq!(encode(&v), b"d1:ai2e1:bi1ee");
+        assert!(decode_unordered(b"d1:ai1e1:ai2ee").is_err());
+        assert!(decode_unordered(b"d1:ai1eex").is_err());
+    }
 
     #[test]
     fn decodes_scalars() {
