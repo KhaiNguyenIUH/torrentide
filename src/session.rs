@@ -403,6 +403,17 @@ impl Core {
             SessionCommand::Add { source, dir } => self.add(source, dir).await,
             SessionCommand::Remove { id, delete_data } => self.remove(&id, delete_data).await,
             SessionCommand::MoveQueue { id, up } => self.move_queue(&id, up).await,
+            SessionCommand::SetLabel { id, label } => {
+                if let Some(i) = self.find(&id) {
+                    self.entries[i].rec.label = label.map(|l| l.trim().to_owned()).filter(|l| !l.is_empty());
+                    self.save(i).await;
+                }
+            }
+            SessionCommand::MoveData { id, dir } => {
+                if let Some(i) = self.find(&id) {
+                    self.move_data(i, dir).await;
+                }
+            }
             SessionCommand::Start(id) => {
                 if let Some(i) = self.find(&id) {
                     if self.entries[i].run.is_none() {
@@ -491,6 +502,9 @@ impl Core {
             force: false,
             snapshot: None,
             magnet: None,
+            label: None,
+            sequential: false,
+            moved: false,
         };
         let (ih, meta, magnet) = if source.starts_with("magnet:") {
             let m = Magnet::parse(source)?;
@@ -542,6 +556,7 @@ impl Core {
                 Some(l) if e.meta.as_ref().is_none_or(|m| !m.private) => Some(l.register(e.ih.0)),
                 _ => None,
             },
+            sequential: e.rec.sequential,
         };
         let ui = Arc::clone(&e.ui);
         let dir = e.rec.dir.clone();
@@ -645,6 +660,39 @@ impl Core {
                 stub_ui(&self.entries[i], DownloadState::Queued).await;
             }
         }
+    }
+
+    /// Move a torrent's files to `dir` and keep it going from there. The
+    /// engine is stopped for the move and rebalance restarts it afterwards.
+    async fn move_data(&mut self, i: usize, dir: PathBuf) {
+        let id = self.entries[i].rec.id.clone();
+        let Some(meta) = self.entries[i].meta.clone() else {
+            self.log(Level::Warn, format!("cannot move {id}: no metadata yet, wait until it has been fetched")).await;
+            return;
+        };
+        let from = self.entries[i].rec.dir.clone();
+        if dir == from {
+            return;
+        }
+        self.stop_entry(i, false).await;
+        let (src, dst) = (from.clone(), dir.clone());
+        let moved = tokio::task::spawn_blocking(move || move_files(&meta, &src, &dst))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r);
+        match moved {
+            Ok(()) => {
+                let e = &mut self.entries[i];
+                e.rec.dir = dir.clone();
+                if let Some(t) = &mut e.ui.write().await.torrent {
+                    t.download_dir = dir.display().to_string();
+                }
+                self.save(i).await;
+                self.log(Level::Info, format!("moved {id} to {}", dir.display())).await;
+            }
+            Err(err) => self.log(Level::Error, format!("cannot move {id} to {}: {err:#}", dir.display())).await,
+        }
+        self.rebalance().await;
     }
 
     async fn move_queue(&mut self, id: &str, up: bool) {
@@ -775,10 +823,24 @@ impl Core {
                 dirty = true;
             }
 
-            let before = e.rec.priorities.clone();
+            let before = (e.rec.priorities.clone(), e.rec.sequential);
             refresh(e).await;
-            if dirty || e.rec.priorities != before {
+            let finished = !e.rec.moved
+                && e.run.is_some()
+                && matches!(
+                    e.ui.read().await.torrent.as_ref().map(|t| t.state),
+                    Some(DownloadState::Seeding | DownloadState::Complete)
+                );
+            if finished {
+                e.rec.moved = true;
+            }
+            if dirty || finished || (e.rec.priorities.clone(), e.rec.sequential) != before {
                 self.save(i).await;
+            }
+            if finished {
+                if let Some(to) = self.settings.move_completed_dir.clone() {
+                    self.move_data(i, to).await;
+                }
             }
         }
     }
@@ -809,6 +871,7 @@ impl Core {
                     position += 1;
                     Some(position - 1)
                 },
+                label: e.rec.label.clone(),
             });
         }
         let mut st = self.state.write().await;
@@ -882,6 +945,7 @@ async fn stub_ui(e: &Entry, state: DownloadState) {
         state,
         download_dir: e.rec.dir.display().to_string(),
         uploaded: e.rec.uploaded,
+        sequential: e.rec.sequential,
         ..Default::default()
     };
     let snap = e.rec.snapshot.as_ref();
@@ -927,6 +991,7 @@ async fn refresh(e: &mut Entry) {
     let ui = e.ui.read().await;
     if let Some(t) = &ui.torrent {
         e.rec.uploaded = e.rec.uploaded.max(t.uploaded);
+        e.rec.sequential = t.sequential;
         if !t.files.is_empty() {
             e.rec.priorities = Some(t.files.iter().map(|f| f.priority).collect());
             e.rec.snapshot = Some(Snapshot {
@@ -965,13 +1030,26 @@ fn store_metadata(store: &Store, id: &str, info: &[u8], trackers: &[String]) -> 
 /// Delete exactly the files the torrent describes under `dir`, then any
 /// directories that leave empty. Nothing else is touched.
 fn delete_files(meta: &Metainfo, dir: &Path) {
+    for (path, _) in meta.files.iter() {
+        if is_plain(path) {
+            let _ = std::fs::remove_file(dir.join(path));
+        }
+    }
+    prune_dirs(meta, dir);
+}
+
+fn is_plain(path: &Path) -> bool {
+    path.components().all(|c| matches!(c, Component::Normal(_)))
+}
+
+/// Remove the directories the torrent's files lived in under `dir` that are now empty.
+fn prune_dirs(meta: &Metainfo, dir: &Path) {
     let mut parents = BTreeSet::new();
     for (path, _) in meta.files.iter() {
-        if !path.components().all(|c| matches!(c, Component::Normal(_))) {
+        if !is_plain(path) {
             continue;
         }
         let full = dir.join(path);
-        let _ = std::fs::remove_file(&full);
         for anc in full.ancestors().skip(1) {
             if anc == dir || !anc.starts_with(dir) {
                 break;
@@ -983,6 +1061,81 @@ fn delete_files(meta: &Metainfo, dir: &Path) {
     parents.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
     for p in parents {
         let _ = std::fs::remove_dir(p);
+    }
+}
+
+/// Move exactly the torrent's own files from `from` to `to`, keeping the
+/// layout. Fails before touching anything if a different file is already at a
+/// destination; a failure midway puts the moved files back.
+fn move_files(meta: &Metainfo, from: &Path, to: &Path) -> Result<()> {
+    let mut pairs = Vec::new();
+    for (path, _) in meta.files.iter() {
+        if !is_plain(path) {
+            continue;
+        }
+        let src = from.join(path);
+        if !std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let dst = to.join(path);
+        if std::fs::symlink_metadata(&dst).is_ok() && !same_content(&src, &dst)? {
+            anyhow::bail!("{} already exists and differs", dst.display());
+        }
+        pairs.push((src, dst));
+    }
+    let mut done: Vec<&(PathBuf, PathBuf)> = Vec::new();
+    for pair in &pairs {
+        if let Err(e) = move_file(&pair.0, &pair.1) {
+            for (s, d) in done.iter().rev() {
+                let _ = move_file(d, s);
+            }
+            return Err(e);
+        }
+        done.push(pair);
+    }
+    prune_dirs(meta, from);
+    Ok(())
+}
+
+fn move_file(src: &Path, dst: &Path) -> Result<()> {
+    if dst.exists() {
+        return std::fs::remove_file(src).with_context(|| format!("removing {}", src.display()));
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    let mut part = dst.as_os_str().to_owned();
+    part.push(".torrust-part");
+    let part = PathBuf::from(part);
+    let copied = std::fs::copy(src, &part)
+        .and_then(|_| std::fs::File::open(&part)?.sync_all())
+        .and_then(|_| std::fs::rename(&part, dst));
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&part);
+        return Err(e).with_context(|| format!("copying {} to {}", src.display(), dst.display()));
+    }
+    std::fs::remove_file(src).with_context(|| format!("removing {}", src.display()))
+}
+
+fn same_content(a: &Path, b: &Path) -> Result<bool> {
+    use std::io::Read;
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
     }
 }
 

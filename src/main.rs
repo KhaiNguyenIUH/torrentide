@@ -61,6 +61,52 @@ enum Command {
         no_tui: bool,
     },
 
+    /// Create a .torrent file from a file or directory
+    Create {
+        /// File or directory to share
+        path: PathBuf,
+
+        /// Output file (default: <name>.torrent in the current directory)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Tracker announce URL (repeatable; each gets its own tier)
+        #[arg(short, long = "tracker")]
+        tracker: Vec<String>,
+
+        /// HTTP(S) web seed URL (repeatable)
+        #[arg(long)]
+        web_seed: Vec<String>,
+
+        /// Mark the torrent private (no DHT, PEX or local discovery)
+        #[arg(long)]
+        private: bool,
+
+        /// Piece size in KiB (power of two, 16 to 16384; default: automatic)
+        #[arg(long)]
+        piece_size: Option<u32>,
+
+        /// Free-form comment
+        #[arg(long)]
+        comment: Option<String>,
+
+        /// Source tag (changes the infohash)
+        #[arg(long)]
+        source: Option<String>,
+
+        /// Leave out the creation date
+        #[arg(long)]
+        no_date: bool,
+
+        /// Overwrite an existing output file
+        #[arg(long)]
+        force: bool,
+
+        /// Hand the new torrent to the session and seed it from <path>'s parent
+        #[arg(long)]
+        seed: bool,
+    },
+
     /// Parse a .torrent file and print its contents without downloading
     Inspect {
         /// Path to a .torrent file
@@ -146,6 +192,34 @@ async fn main() -> Result<()> {
             exit_when_done,
             no_tui,
         } => run_download(&source, output, exit_when_done, no_tui).await,
+        Command::Create {
+            path,
+            output,
+            tracker,
+            web_seed,
+            private,
+            piece_size,
+            comment,
+            source,
+            no_date,
+            force,
+            seed,
+        } => {
+            let opts = torrust::create::CreateOptions {
+                path,
+                trackers: tracker,
+                web_seeds: web_seed,
+                private,
+                piece_len: piece_size
+                    .map(|k| k.checked_mul(1024).context("--piece-size is too large"))
+                    .transpose()?,
+                comment,
+                source,
+                no_date,
+                progress: std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            };
+            run_create(opts, output, force, seed).await
+        }
         Command::Inspect { path } => inspect(&path),
         Command::Magnet { uri } => inspect_magnet(&uri),
         Command::Import {
@@ -454,6 +528,54 @@ async fn finish(
 
 async fn log_to(state: &Arc<RwLock<UiState>>, level: Level, msg: String) {
     state.write().await.log(level, msg);
+}
+
+async fn run_create(
+    opts: torrust::create::CreateOptions,
+    output: Option<PathBuf>,
+    force: bool,
+    seed: bool,
+) -> Result<()> {
+    use std::io::Write;
+
+    let output = match output {
+        Some(o) => o,
+        None => PathBuf::from(format!("{}.torrent", torrust::create::torrent_name(&opts.path)?)),
+    };
+    if !force && output.exists() {
+        bail!("{} already exists (use --force to overwrite)", output.display());
+    }
+    let created = torrust::create::build(&opts)?;
+    let mut file = std::fs::OpenOptions::new();
+    file.write(true);
+    if force {
+        file.create(true).truncate(true);
+    } else {
+        file.create_new(true);
+    }
+    file.open(&output)
+        .and_then(|mut f| f.write_all(&created.bytes))
+        .with_context(|| format!("writing {}", output.display()))?;
+
+    println!("name        {}", created.name);
+    println!("size        {}", torrust::state::human_bytes(created.total));
+    println!("pieces      {} x {} KiB", created.pieces, created.piece_len / 1024);
+    println!("infohash    {}", created.infohash);
+    println!("magnet      {}", created.magnet);
+    println!("saved to    {}", output.display());
+
+    if seed {
+        use torrust::ipc::Delivery;
+        let parent = std::fs::canonicalize(&opts.path)?
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        match torrust::ipc::send_add(&output.to_string_lossy(), Some(&parent)).await? {
+            Delivery::Delivered => println!("seeding: added to running session"),
+            Delivery::Queued => println!("seeding: queued; it will start next time torrust runs"),
+        }
+    }
+    Ok(())
 }
 
 fn inspect(path: &std::path::Path) -> Result<()> {

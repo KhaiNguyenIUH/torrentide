@@ -560,3 +560,123 @@ async fn peers_find_each_other_through_local_discovery_alone() {
     quit(seeder).await;
     quit(leecher).await;
 }
+
+fn view_label(st: &SessionState, id: &str) -> Option<String> {
+    st.torrents.iter().find(|t| t.id == id)?.label.clone()
+}
+
+fn download_dir(st: &SessionState, id: &str) -> Option<String> {
+    st.torrents.iter().find(|t| t.id == id)?.ui.torrent.as_ref().map(|t| t.download_dir.clone())
+}
+
+fn at(st: &SessionState, id: &str, dir: &Path) -> bool {
+    is_done(torrent_state(st, id)) && download_dir(st, id) == Some(dir.display().to_string())
+}
+
+async fn seeding_session(fx: &Fixture, dl: &Path) -> (SessionHandle, PathBuf, String) {
+    fx.write_to(dl);
+    let t = mock_tracker(None).await;
+    let (p, id) = write_torrent(fx, &t);
+    let home = temp_dir("home");
+    let h = Session::start_in(Store::at(&home), settings(dl)).await.unwrap();
+    add(&h, &p, dl);
+    wait_for(&h, "seeding", 30, |st| is_done(torrent_state(st, &id))).await;
+    (h, home, id)
+}
+
+#[tokio::test]
+async fn labels_and_sequential_persist_across_restart() {
+    let fx = Fixture::new("lab", 41);
+    let dl = temp_dir("dl");
+    let (h, home, id) = seeding_session(&fx, &dl).await;
+    h.command().send(SessionCommand::SetLabel { id: id.clone(), label: Some("  linux ".into()) }).unwrap();
+    h.command().send(SessionCommand::Torrent(id.clone(), Command::SetSequential(true))).unwrap();
+    let seq = |st: &SessionState| {
+        st.torrents.iter().find(|t| t.id == id).and_then(|t| t.ui.torrent.as_ref()).is_some_and(|t| t.sequential)
+    };
+    wait_for(&h, "label and sequential", 15, |st| view_label(st, &id).as_deref() == Some("linux") && seq(st)).await;
+    quit(h).await;
+
+    let (records, _) = Store::at(&home).load_records();
+    assert_eq!(records[0].label.as_deref(), Some("linux"));
+    assert!(records[0].sequential);
+
+    let h = Session::start_in(Store::at(&home), settings(&dl)).await.unwrap();
+    assert_eq!(view_label(&*h.state().read().await, &id).as_deref(), Some("linux"));
+    wait_for(&h, "seeding with sequential restored", 30, |st| is_done(torrent_state(st, &id)) && seq(st)).await;
+    h.command().send(SessionCommand::SetLabel { id: id.clone(), label: None }).unwrap();
+    wait_for(&h, "label cleared", 15, |st| view_label(st, &id).is_none()).await;
+    quit(h).await;
+    assert_eq!(Store::at(&home).load_records().0[0].label, None);
+}
+
+#[tokio::test]
+async fn move_data_relocates_only_the_torrent_files() {
+    let fx = Fixture::new("mv", 42);
+    let dl = temp_dir("dl");
+    let (h, home, id) = seeding_session(&fx, &dl).await;
+    std::fs::write(dl.join("mv/extra.txt"), b"mine").unwrap();
+    let dest = temp_dir("dest");
+
+    h.command().send(SessionCommand::MoveData { id: id.clone(), dir: dest.clone() }).unwrap();
+    wait_for(&h, "seeding at the new place", 30, |st| at(st, &id, &dest)).await;
+
+    fx.assert_on_disk(&dest);
+    for (path, _) in FILES {
+        assert!(!dl.join("mv").join(path).exists(), "mv/{path} should be gone from the old dir");
+    }
+    assert!(!dl.join("mv/sub").exists());
+    assert_eq!(std::fs::read(dl.join("mv/extra.txt")).unwrap(), b"mine");
+    quit(h).await;
+    assert_eq!(Store::at(&home).load_records().0[0].dir, dest);
+
+    let h = Session::start_in(Store::at(&home), settings(&dl)).await.unwrap();
+    wait_for(&h, "seeding at the new place after restart", 30, |st| at(st, &id, &dest)).await;
+    quit(h).await;
+}
+
+#[tokio::test]
+async fn move_data_refuses_to_overwrite_a_different_file() {
+    let fx = Fixture::new("mvx", 43);
+    let dl = temp_dir("dl");
+    let (h, home, id) = seeding_session(&fx, &dl).await;
+    let dest = temp_dir("dest");
+    std::fs::create_dir_all(dest.join("mvx/sub")).unwrap();
+    std::fs::write(dest.join("mvx/sub/b.bin"), b"someone else's").unwrap();
+
+    h.command().send(SessionCommand::MoveData { id: id.clone(), dir: dest.clone() }).unwrap();
+    wait_for(&h, "error logged", 15, |st| st.log.iter().any(|l| l.message.contains("cannot move"))).await;
+    wait_for(&h, "seeding again in place", 30, |st| at(st, &id, &dl)).await;
+
+    fx.assert_on_disk(&dl);
+    assert_eq!(std::fs::read(dest.join("mvx/sub/b.bin")).unwrap(), b"someone else's");
+    assert!(!dest.join("mvx/a.bin").exists());
+    quit(h).await;
+    assert_eq!(Store::at(&home).load_records().0[0].dir, dl);
+}
+
+#[tokio::test]
+async fn move_completed_runs_once_per_torrent() {
+    let fx = Fixture::new("mc", 44);
+    let seeder = seeder_for(&fx).await;
+    let tracker = mock_tracker(Some(seeder)).await;
+    let (p, id) = write_torrent(&fx, &tracker);
+    let (dl, done, other) = (temp_dir("dl"), temp_dir("done"), temp_dir("other"));
+    let home = temp_dir("home");
+    let with = |d: &Path| Settings { move_completed_dir: Some(d.to_path_buf()), ..settings(&dl) };
+
+    let h = Session::start_in(Store::at(&home), with(&done)).await.unwrap();
+    add(&h, &p, &dl);
+    wait_for(&h, "downloaded and moved", 60, |st| at(st, &id, &done)).await;
+    fx.assert_on_disk(&done);
+    assert!(!dl.join("mc").join("a.bin").exists());
+    quit(h).await;
+    assert_eq!(Store::at(&home).load_records().0[0].dir, done);
+
+    let h = Session::start_in(Store::at(&home), with(&other)).await.unwrap();
+    wait_for(&h, "seeding after restart", 30, |st| at(st, &id, &done)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(at(&*h.state().read().await, &id, &done), "moved again after restart");
+    assert!(!other.join("mc").exists());
+    quit(h).await;
+}

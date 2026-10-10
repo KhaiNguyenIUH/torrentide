@@ -1128,7 +1128,7 @@ pub fn run_tui(state: Arc<RwLock<UiState>>) -> Result<()> {
 
 /// Key bindings advertised in the session footer and help overlay. The most
 /// used keys come first because the footer is clipped on narrow terminals.
-const SESSION_KEYS: [(&str, &str); 17] = [
+const SESSION_KEYS: [(&str, &str); 19] = [
     ("a", "add"),
     ("s", "start/stop"),
     ("p", "pause"),
@@ -1136,6 +1136,8 @@ const SESSION_KEYS: [(&str, &str); 17] = [
     ("l", "limits"),
     ("o", "settings"),
     ("R", "force recheck"),
+    ("L / m", "label / move data"),
+    ("S / f", "sequential / label filter"),
     ("[ / ]", "queue up/down"),
     ("tab/1-6", "panel"),
     ("j/k", "torrents"),
@@ -1149,7 +1151,7 @@ const SESSION_KEYS: [(&str, &str); 17] = [
 ];
 
 /// Footer hints: the global keys only; the modal keys live in the help overlay.
-const SESSION_FOOTER_KEYS: [(&str, &str); 11] = [
+const SESSION_FOOTER_KEYS: [(&str, &str); 15] = [
     ("a", "add"),
     ("s", "start/stop"),
     ("p", "pause"),
@@ -1161,10 +1163,16 @@ const SESSION_FOOTER_KEYS: [(&str, &str); 11] = [
     ("l", "limits"),
     ("o", "settings"),
     ("tab", "panel"),
+    ("L", "label"),
+    ("f", "filter"),
+    ("S", "seq"),
+    ("m", "move"),
 ];
 
 /// Text shown in the torrent table while the session holds nothing.
 const EMPTY_MESSAGE: &str = "No torrents \u{2014} press a to add one";
+
+const FILTERED_MESSAGE: &str = "No torrents with this label \u{2014} press f to change the filter";
 
 /// Name shown before a magnet link has produced metadata.
 const PENDING_NAME: &str = "(fetching metadata...)";
@@ -1238,9 +1246,75 @@ fn view_name(view: &TorrentView) -> String {
     }
 }
 
-const TABLE_HEADERS: [&str; 10] = [
-    "#", "Name", "Size", "Done", "Status", "\u{2193}", "\u{2191}", "ETA", "Peers", "Ratio",
+const TABLE_HEADERS: [&str; 11] = [
+    "#", "Name", "Size", "Done", "Status", "\u{2193}", "\u{2191}", "ETA", "Peers", "Ratio", "Label",
 ];
+
+const LABEL_COLUMN: usize = 10;
+
+fn view_label(view: &TorrentView) -> Option<&str> {
+    view.label.as_deref().filter(|l| !l.is_empty())
+}
+
+/// Name with the label prefixed, for tables too narrow for a label column.
+fn labelled_name(view: &TorrentView) -> String {
+    match view_label(view) {
+        Some(label) => format!("[{label}] {}", view_name(view)),
+        None => view_name(view),
+    }
+}
+
+fn view_sequential(view: &TorrentView) -> bool {
+    view.ui.torrent.as_ref().is_some_and(|t| t.sequential)
+}
+
+/// Status text, with a trailing marker while downloading in sequential order.
+fn status_cell(view: &TorrentView) -> String {
+    let label = view_state(view).label();
+    if view_sequential(view) {
+        format!("{label}\u{21e3}")
+    } else {
+        label.to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum LabelFilter {
+    #[default]
+    All,
+    Label(String),
+    Unlabelled,
+}
+
+impl LabelFilter {
+    fn matches(&self, label: Option<&str>) -> bool {
+        match self {
+            LabelFilter::All => true,
+            LabelFilter::Label(wanted) => label == Some(wanted.as_str()),
+            LabelFilter::Unlabelled => label.is_none(),
+        }
+    }
+
+    fn text(&self) -> String {
+        match self {
+            LabelFilter::All => "all".to_string(),
+            LabelFilter::Label(label) => label.clone(),
+            LabelFilter::Unlabelled => "(no label)".to_string(),
+        }
+    }
+
+    /// All, each label in `labels` (sorted), (no label), then back to all.
+    /// With no labels in use there is nothing to filter on.
+    fn next(&self, labels: &[String]) -> LabelFilter {
+        let mut order = vec![LabelFilter::All];
+        if !labels.is_empty() {
+            order.extend(labels.iter().cloned().map(LabelFilter::Label));
+            order.push(LabelFilter::Unlabelled);
+        }
+        let at = order.iter().position(|f| f == self).unwrap_or(order.len() - 1);
+        order[(at + 1) % order.len()].clone()
+    }
+}
 
 /// Queue number for the `#` column: 1-based, blank for a stopped torrent.
 fn queue_cell(view: &TorrentView) -> String {
@@ -1257,8 +1331,8 @@ fn swarm_cell(view: &TorrentView) -> String {
     }
 }
 
-/// The ten cells of a torrent table row, in [`TABLE_HEADERS`] order.
-fn torrent_cells(view: &TorrentView) -> [String; 10] {
+/// The cells of a torrent table row, in [`TABLE_HEADERS`] order.
+fn torrent_cells(view: &TorrentView) -> [String; 11] {
     let summary = view.ui.torrent.as_ref();
     let size = match summary {
         Some(t) if t.total_length > 0 => compact_bytes(t.total_length),
@@ -1269,20 +1343,23 @@ fn torrent_cells(view: &TorrentView) -> [String; 10] {
         view_name(view),
         size,
         percent(summary.map(|t| t.progress).unwrap_or(0.0)),
-        view_state(view).label().to_string(),
+        status_cell(view),
         compact_rate(summary.map(|t| t.download_rate).unwrap_or(0.0)),
         compact_rate(summary.map(|t| t.upload_rate).unwrap_or(0.0)),
         compact_eta(summary.and_then(|t| t.eta_secs)),
         swarm_cell(view),
         format!("{:.2}", view.ratio),
+        view_label(view).unwrap_or_default().to_string(),
     ]
 }
 
 /// Which table columns fit in `width` cells. Narrow terminals drop the
 /// secondary columns (size, ETA, peers, ratio) rather than crushing the name.
 fn visible_columns(width: u16) -> &'static [usize] {
-    if width >= 80 {
-        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    if width >= 100 {
+        &[0, 1, 10, 2, 3, 4, 5, 6, 7, 8, 9]
+    } else if width >= 80 {
+        &[0, 1, 3, 4, 5, 6, 7, 8, 9]
     } else if width >= 56 {
         &[0, 1, 3, 4, 5, 6]
     } else {
@@ -1296,7 +1373,8 @@ fn column_width(column: usize) -> Constraint {
         1 => Constraint::Min(8),
         2 => Constraint::Length(5),
         3 => Constraint::Length(6),
-        4 => Constraint::Length(11),
+        4 => Constraint::Length(12),
+        LABEL_COLUMN => Constraint::Length(10),
         5 | 6 => Constraint::Length(7),
         7 => Constraint::Length(6),
         8 => Constraint::Length(9),
@@ -1543,6 +1621,10 @@ fn settings_form(settings: &Settings) -> Form {
             Field::number("Max active downloads (0 = any)", settings.max_active_downloads.to_string()),
             Field::number("Max active torrents (0 = any)", settings.max_active_torrents.to_string()),
             Field::toggle("Local peer discovery", settings.lsd),
+            Field::text(
+                "Move completed to (empty = off)",
+                settings.move_completed_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
+            ),
         ],
     )
 }
@@ -1580,6 +1662,9 @@ fn parse_settings(form: &Form, base: &Settings) -> Result<Settings, String> {
         .trim()
         .parse::<usize>()
         .map_err(|_| "Max active torrents: enter a whole number, 0 or more".to_string())?;
+    let move_completed_dir = Some(clean_input(&f[11].input.text))
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from);
     Ok(Settings {
         download_dir: PathBuf::from(dir),
         listen_port,
@@ -1592,6 +1677,7 @@ fn parse_settings(form: &Form, base: &Settings) -> Result<Settings, String> {
         max_active_downloads,
         max_active_torrents,
         lsd: f[10].on,
+        move_completed_dir,
         ..base.clone()
     })
 }
@@ -1641,6 +1727,60 @@ enum Modal {
     Remove { id: TorrentId, name: String },
     Limits { id: TorrentId, form: Form },
     Settings(Form),
+    Text(TextPrompt),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextPurpose {
+    Label,
+    Move,
+}
+
+/// A one-line prompt that acts on a single torrent: set its label or move its data.
+#[derive(Debug, Clone)]
+struct TextPrompt {
+    id: TorrentId,
+    purpose: TextPurpose,
+    input: TextInput,
+    error: Option<String>,
+}
+
+impl TextPrompt {
+    fn new(id: TorrentId, purpose: TextPurpose) -> Self {
+        TextPrompt { id, purpose, input: TextInput::default(), error: None }
+    }
+
+    fn title(&self) -> &'static str {
+        match self.purpose {
+            TextPurpose::Label => "label",
+            TextPurpose::Move => "move data",
+        }
+    }
+
+    fn question(&self) -> &'static str {
+        match self.purpose {
+            TextPurpose::Label => "Label (empty = clear):",
+            TextPurpose::Move => "Move data to folder:",
+        }
+    }
+
+    fn submit(&mut self) -> Option<SessionCommand> {
+        let text = clean_input(&self.input.text);
+        match self.purpose {
+            TextPurpose::Label => Some(SessionCommand::SetLabel {
+                id: self.id.clone(),
+                label: if text.is_empty() { None } else { Some(text) },
+            }),
+            TextPurpose::Move if text.is_empty() => {
+                self.error = Some("enter a destination folder".to_string());
+                None
+            }
+            TextPurpose::Move => Some(SessionCommand::MoveData {
+                id: self.id.clone(),
+                dir: PathBuf::from(text),
+            }),
+        }
+    }
 }
 
 /// The panels under the torrent table.
@@ -1706,10 +1846,18 @@ struct RowInfo {
     state: DownloadState,
     download_limit: u64,
     upload_limit: u64,
+    label: Option<String>,
+    sequential: bool,
 }
 
 struct SessionApp {
+    all_rows: Vec<RowInfo>,
+    /// Rows passing the label filter, in table order.
     rows: Vec<RowInfo>,
+    /// Index into the session's torrent list for each entry of `rows`.
+    visible: Vec<usize>,
+    labels: Vec<String>,
+    filter: LabelFilter,
     selected: Option<usize>,
     selected_id: Option<TorrentId>,
     table_offset: usize,
@@ -1725,7 +1873,11 @@ struct SessionApp {
 impl SessionApp {
     fn new() -> Self {
         SessionApp {
+            all_rows: Vec::new(),
             rows: Vec::new(),
+            visible: Vec::new(),
+            labels: Vec::new(),
+            filter: LabelFilter::default(),
             selected: None,
             selected_id: None,
             table_offset: 0,
@@ -1741,7 +1893,7 @@ impl SessionApp {
     /// Absorb a fresh snapshot: refresh the rows, keep the selection on the
     /// same torrent, and rebuild the per-torrent peer and file views.
     fn sync(&mut self, state: &SessionState) {
-        self.rows = state
+        self.all_rows = state
             .torrents
             .iter()
             .map(|t| RowInfo {
@@ -1750,12 +1902,47 @@ impl SessionApp {
                 state: view_state(t),
                 download_limit: t.download_limit,
                 upload_limit: t.upload_limit,
+                label: view_label(t).map(str::to_string),
+                sequential: view_sequential(t),
             })
             .collect();
         self.settings = state.settings.clone();
         if self.cmd.is_none() {
             self.cmd = state.command_tx.clone();
         }
+        self.apply_filter();
+
+        let current = self.selected.and_then(|i| self.visible.get(i)).and_then(|&j| state.torrents.get(j));
+        self.view.peers = current.map(|t| sort_peers(&t.ui.peers)).unwrap_or_default();
+        self.view.files = current
+            .and_then(|t| t.ui.torrent.as_ref())
+            .map(|s| s.files.clone())
+            .unwrap_or_default();
+        self.view.selected = clamp_selection(self.view.selected, self.view.peers.len());
+        self.view.file_selected = clamp_selection(self.view.file_selected, self.view.files.len());
+    }
+
+    /// Rebuild the visible rows from `all_rows` and the label filter, keeping
+    /// the selection on the same torrent when it is still visible.
+    fn apply_filter(&mut self) {
+        let mut labels: Vec<String> =
+            self.all_rows.iter().filter_map(|r| r.label.clone()).collect();
+        labels.sort();
+        labels.dedup();
+        let stale = match &self.filter {
+            LabelFilter::All => false,
+            LabelFilter::Label(l) => !labels.contains(l),
+            LabelFilter::Unlabelled => labels.is_empty(),
+        };
+        if stale {
+            self.filter = LabelFilter::All;
+        }
+        self.labels = labels;
+
+        self.visible = (0..self.all_rows.len())
+            .filter(|&i| self.filter.matches(self.all_rows[i].label.as_deref()))
+            .collect();
+        self.rows = self.visible.iter().map(|&i| self.all_rows[i].clone()).collect();
 
         let ids: Vec<&str> = self.rows.iter().map(|r| r.id.as_str()).collect();
         self.selected = reselect(self.selected_id.as_deref(), self.selected, &ids);
@@ -1766,15 +1953,6 @@ impl SessionApp {
             self.view.log_scroll = 0;
             self.selected_id = new_id;
         }
-
-        let current = self.selected.and_then(|i| state.torrents.get(i));
-        self.view.peers = current.map(|t| sort_peers(&t.ui.peers)).unwrap_or_default();
-        self.view.files = current
-            .and_then(|t| t.ui.torrent.as_ref())
-            .map(|s| s.files.clone())
-            .unwrap_or_default();
-        self.view.selected = clamp_selection(self.view.selected, self.view.peers.len());
-        self.view.file_selected = clamp_selection(self.view.file_selected, self.view.files.len());
     }
 
     fn current(&self) -> Option<&RowInfo> {
@@ -1857,6 +2035,28 @@ impl SessionApp {
             }
             KeyCode::Char(c @ ('+' | '=' | '-')) if self.tab == Tab::Files => {
                 self.step_file_priority(c != '-');
+            }
+            KeyCode::Char('f') => {
+                self.filter = self.filter.next(&self.labels);
+                self.apply_filter();
+            }
+            KeyCode::Char('L') => {
+                if let Some(row) = self.current() {
+                    self.modal = Modal::Text(TextPrompt::new(row.id.clone(), TextPurpose::Label));
+                }
+            }
+            KeyCode::Char('m') => {
+                if let Some(row) = self.current() {
+                    self.modal = Modal::Text(TextPrompt::new(row.id.clone(), TextPurpose::Move));
+                }
+            }
+            KeyCode::Char('S') => {
+                if let Some(row) = self.current() {
+                    self.send(SessionCommand::Torrent(
+                        row.id.clone(),
+                        Command::SetSequential(!row.sequential),
+                    ));
+                }
             }
             KeyCode::Char('R') => {
                 if let Some(row) = self.current() {
@@ -1969,6 +2169,22 @@ impl SessionApp {
                 },
                 FormAction::None => Modal::Limits { id, form },
             },
+            Modal::Text(mut prompt) => match key.code {
+                KeyCode::Esc => Modal::None,
+                KeyCode::Enter => match prompt.submit() {
+                    Some(cmd) => {
+                        self.send(cmd);
+                        Modal::None
+                    }
+                    None => Modal::Text(prompt),
+                },
+                _ => {
+                    if prompt.input.handle(&key) {
+                        prompt.error = None;
+                    }
+                    Modal::Text(prompt)
+                }
+            },
             Modal::Settings(mut form) => match form.on_key(&key) {
                 FormAction::Cancel => Modal::None,
                 FormAction::Submit => match parse_settings(&form, &self.settings) {
@@ -1990,6 +2206,10 @@ impl SessionApp {
     fn on_paste(&mut self, pasted: &str) {
         match &mut self.modal {
             Modal::Add(prompt) => {
+                prompt.input.paste(pasted);
+                prompt.error = None;
+            }
+            Modal::Text(prompt) => {
                 prompt.input.paste(pasted);
                 prompt.error = None;
             }
@@ -2039,21 +2259,25 @@ fn render_session(frame: &mut Frame, snapshot: &Result<SessionState, String>, ap
         ])
         .split(area);
 
-    render_session_header(frame, chunks[0], state);
+    render_session_header(frame, chunks[0], state, &app.filter);
     render_torrent_table(frame, chunks[1], state, app);
     render_detail(frame, chunks[2], state, app);
     render_footer(frame, chunks[3], state.warning.as_deref(), &SESSION_FOOTER_KEYS);
     render_modal(frame, area, app);
 }
 
-fn render_session_header(frame: &mut Frame, area: Rect, state: &SessionState) {
+fn render_session_header(frame: &mut Frame, area: Rect, state: &SessionState, filter: &LabelFilter) {
     let inner_width = usize::from(area.width.saturating_sub(2));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style())
         .style(base_style())
         .title(Span::styled(" torrust ", heading_style()));
-    let text = truncate_line(&header_summary(state), inner_width);
+    let mut summary = header_summary(state);
+    if *filter != LabelFilter::All {
+        summary.push_str(&format!("  label: {}", filter.text()));
+    }
+    let text = truncate_line(&summary, inner_width);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(text, value_style()))).block(block),
         area,
@@ -2067,9 +2291,10 @@ fn render_torrent_table(frame: &mut Frame, area: Rect, state: &SessionState, app
         .style(base_style())
         .title(Span::styled(" torrents ", heading_style()));
 
-    if state.torrents.is_empty() {
+    if app.visible.is_empty() {
+        let message = if state.torrents.is_empty() { EMPTY_MESSAGE } else { FILTERED_MESSAGE };
         frame.render_widget(
-            Paragraph::new(Span::styled(EMPTY_MESSAGE, muted_style()))
+            Paragraph::new(Span::styled(message, muted_style()))
                 .alignment(Alignment::Center)
                 .block(block),
             area,
@@ -2079,11 +2304,16 @@ fn render_torrent_table(frame: &mut Frame, area: Rect, state: &SessionState, app
 
     let columns = visible_columns(area.width);
     let header = Row::new(columns.iter().map(|&c| Cell::from(TABLE_HEADERS[c]))).style(heading_style());
-    let rows: Vec<Row> = state
-        .torrents
+    let label_column = columns.contains(&LABEL_COLUMN);
+    let rows: Vec<Row> = app
+        .visible
         .iter()
+        .filter_map(|&i| state.torrents.get(i))
         .map(|view| {
-            let cells = torrent_cells(view);
+            let mut cells = torrent_cells(view);
+            if !label_column {
+                cells[1] = labelled_name(view);
+            }
             let status_style = state_style(view_state(view));
             Row::new(columns.iter().map(|&c| {
                 let cell = Cell::from(cells[c].clone());
@@ -2103,7 +2333,7 @@ fn render_torrent_table(frame: &mut Frame, area: Rect, state: &SessionState, app
         app.table_offset,
         app.selected,
         usize::from(area.height.saturating_sub(3)),
-        state.torrents.len(),
+        app.visible.len(),
     );
     let mut table_state = TableState::new()
         .with_selected(app.selected)
@@ -2122,7 +2352,7 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &SessionState, app: &mut 
     frame.render_widget(Paragraph::new(tab_line(app.tab, area.width)), parts[0]);
     let body = parts[1];
 
-    let current = app.selected.and_then(|i| state.torrents.get(i));
+    let current = app.selected.and_then(|i| app.visible.get(i)).and_then(|&j| state.torrents.get(j));
     let Some(view) = current else {
         render_log(frame, body, &state.log, "session log", &mut app.view);
         return;
@@ -2147,6 +2377,8 @@ fn general_lines(view: &TorrentView) -> Vec<Line<'static>> {
             "Queue",
             view.queue_position.map(|p| format!("#{}", p + 1)).unwrap_or_else(|| "-".to_string()),
         ),
+        kv("Label", view_label(view).unwrap_or("-").to_string()),
+        kv("Sequential", if t.sequential { "on" } else { "off" }.to_string()),
         kv(
             "Seeds/Peers",
             format!(
@@ -2237,7 +2469,8 @@ fn modal_block(title: &str) -> Block<'static> {
 fn render_modal(frame: &mut Frame, area: Rect, app: &SessionApp) {
     match &app.modal {
         Modal::None => {}
-        Modal::Help => render_help(frame, area, &SESSION_KEYS, (70, 95)),
+        Modal::Help => render_help(frame, area, &SESSION_KEYS, (70, 100)),
+        Modal::Text(prompt) => render_text_prompt(frame, area, prompt),
         Modal::Add(prompt) => render_add(frame, area, prompt),
         Modal::Remove { name, .. } => render_remove(frame, area, name),
         Modal::Limits { form, .. } | Modal::Settings(form) => render_form(frame, area, form),
@@ -2268,6 +2501,25 @@ fn render_add(frame: &mut Frame, area: Rect, prompt: &AddPrompt) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(modal_block("add torrent")), popup);
 }
 
+fn render_text_prompt(frame: &mut Frame, area: Rect, prompt: &TextPrompt) {
+    let popup = popup_rect(70, 6, area);
+    let width = usize::from(popup.width.saturating_sub(4));
+    let hint = match &prompt.error {
+        Some(message) => Span::styled(message.clone(), error_style()),
+        None => Span::styled("Enter confirm  Esc cancel", muted_style()),
+    };
+    let lines = vec![
+        Line::from(Span::styled(prompt.question(), heading_style())),
+        Line::from(Span::styled(
+            format!("{}_", tail_fit(&prompt.input.text, width.saturating_sub(1))),
+            value_style(),
+        )),
+        Line::from(hint),
+    ];
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(modal_block(prompt.title())), popup);
+}
+
 fn render_remove(frame: &mut Frame, area: Rect, name: &str) {
     let popup = popup_rect(70, 6, area);
     let width = usize::from(popup.width.saturating_sub(4));
@@ -2287,7 +2539,7 @@ fn render_remove(frame: &mut Frame, area: Rect, name: &str) {
 }
 
 fn render_form(frame: &mut Frame, area: Rect, form: &Form) {
-    const LABEL: usize = 26;
+    const LABEL: usize = 31;
     let popup = popup_rect(72, form.fields.len() as u16 + 3, area);
     let inner_width = usize::from(popup.width.saturating_sub(2));
     let value_width = inner_width.saturating_sub(2 + LABEL + 1);
@@ -3035,6 +3287,7 @@ mod session_tests {
             upload_limit: 0,
             added_at: 0,
             queue_position: None,
+            label: None,
         }
     }
 
@@ -3119,7 +3372,8 @@ mod session_tests {
 
     #[test]
     fn narrow_widths_drop_columns() {
-        assert_eq!(visible_columns(120).len(), 10);
+        assert_eq!(visible_columns(120).len(), 11);
+        assert_eq!(visible_columns(90).len(), 9);
         assert_eq!(visible_columns(60), &[0, 1, 3, 4, 5, 6]);
         assert_eq!(visible_columns(40), &[0, 1, 3, 5]);
     }
@@ -3581,6 +3835,158 @@ mod session_tests {
         assert_eq!(tail_fit("abcdef", 4), "\u{2026}def");
         assert_eq!(tail_fit("abc", 0), "");
         assert_eq!(clean_input("  \"/a b/c.torrent\" "), "/a b/c.torrent");
+    }
+
+    fn labelled_session() -> SessionState {
+        let mut state = session(&["a", "b", "c"]);
+        state.torrents[0].label = Some("movies".to_string());
+        state.torrents[1].label = Some("linux".to_string());
+        state.torrents[1].ui.torrent.as_mut().unwrap().sequential = true;
+        state
+    }
+
+    #[test]
+    fn label_sets_and_clears() {
+        let state = labelled_session();
+        let (mut app, mut rx) = app_with(&state);
+        app.on_key(ch('L'));
+        type_text(&mut app, " tv ");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SessionCommand::SetLabel { id: "a".into(), label: Some("tv".into()) }
+        );
+        app.on_key(ch('L'));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::SetLabel { id: "a".into(), label: None });
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[test]
+    fn move_sends_dir_and_rejects_empty() {
+        let state = labelled_session();
+        let (mut app, mut rx) = app_with(&state);
+        app.on_key(ch('m'));
+        app.on_key(key(KeyCode::Enter));
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(&app.modal, Modal::Text(p) if p.error.is_some()));
+        type_text(&mut app, "/mnt/big");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SessionCommand::MoveData { id: "a".into(), dir: PathBuf::from("/mnt/big") }
+        );
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[test]
+    fn shift_s_negates_sequential() {
+        let state = labelled_session();
+        let (mut app, mut rx) = app_with(&state);
+        app.on_key(ch('S'));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SessionCommand::Torrent("a".into(), Command::SetSequential(true))
+        );
+        app.on_key(ch('j'));
+        app.on_key(ch('S'));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SessionCommand::Torrent("b".into(), Command::SetSequential(false))
+        );
+    }
+
+    #[test]
+    fn f_cycles_filters_and_keeps_selection_valid() {
+        let state = labelled_session();
+        let (mut app, _rx) = app_with(&state);
+        app.on_key(ch('j'));
+        app.on_key(ch('j'));
+        assert_eq!(app.selected_id.as_deref(), Some("c"));
+        app.on_key(ch('f'));
+        assert_eq!(app.filter, LabelFilter::Label("linux".into()));
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.selected_id.as_deref(), Some("b"));
+        app.on_key(ch('f'));
+        assert_eq!(app.filter, LabelFilter::Label("movies".into()));
+        assert_eq!(app.selected_id.as_deref(), Some("a"));
+        app.on_key(ch('f'));
+        assert_eq!(app.filter, LabelFilter::Unlabelled);
+        assert_eq!(app.selected_id.as_deref(), Some("c"));
+        app.on_key(ch('f'));
+        assert_eq!(app.filter, LabelFilter::All);
+        assert_eq!(app.rows.len(), 3);
+        assert_eq!(app.selected_id.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn filter_resets_when_its_label_disappears() {
+        let mut state = labelled_session();
+        let (mut app, _rx) = app_with(&state);
+        app.on_key(ch('f'));
+        state.torrents[1].label = None;
+        app.sync(&state);
+        assert_eq!(app.filter, LabelFilter::All);
+        let plain = session(&["a"]);
+        let (mut app, _rx) = app_with(&plain);
+        app.on_key(ch('f'));
+        assert_eq!(app.filter, LabelFilter::All);
+    }
+
+    #[test]
+    fn settings_form_round_trips_move_completed() {
+        let some = Settings { move_completed_dir: Some(PathBuf::from("/done")), max_peers: 77, ..Settings::default() };
+        assert_eq!(parse_settings(&settings_form(&some), &some).unwrap(), some);
+        let none = Settings { max_peers: 77, ..Settings::default() };
+        assert_eq!(parse_settings(&settings_form(&none), &none).unwrap(), none);
+        let mut form = settings_form(&some);
+        form.fields[11].input = TextInput::new("  ");
+        assert_eq!(parse_settings(&form, &some).unwrap().move_completed_dir, None);
+        form.fields[11].input = TextInput::new("/x");
+        assert_eq!(parse_settings(&form, &none).unwrap().move_completed_dir, Some(PathBuf::from("/x")));
+    }
+
+    #[test]
+    fn label_and_sequential_formatting() {
+        let state = labelled_session();
+        let cells = torrent_cells(&state.torrents[1]);
+        assert_eq!(cells[LABEL_COLUMN], "linux");
+        assert_eq!(cells[4], "downloading\u{21e3}");
+        assert_eq!(torrent_cells(&state.torrents[2])[4], "downloading");
+        assert_eq!(labelled_name(&state.torrents[0]), "[movies] name-a");
+        assert_eq!(labelled_name(&state.torrents[2]), "name-c");
+        assert!(visible_columns(100).contains(&LABEL_COLUMN));
+        assert!(!visible_columns(99).contains(&LABEL_COLUMN));
+        let general: String = general_lines(&state.torrents[1])
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(general.contains("linux") && general.contains("Sequential") && general.contains("on"));
+    }
+
+    #[test]
+    fn labelled_filtered_sequential_render_without_panicking() {
+        let state = labelled_session();
+        for (w, h) in [(120, 30), (80, 24), (40, 12)] {
+            let mut app = SessionApp::new();
+            for tab in Tab::ALL {
+                app.set_tab(tab);
+                draw(w, h, &state, &mut app);
+            }
+            app.on_key(ch('f'));
+            let screen = draw(w, h, &state, &mut app);
+            assert!(screen.contains("linux"), "{w}x{h}:\n{screen}");
+            app.set_tab(Tab::General);
+            for c in ['L', 'm', '?', 'o'] {
+                app.on_key(ch(c));
+                draw(w, h, &state, &mut app);
+                app.on_key(key(KeyCode::Esc));
+            }
+        }
+        let mut app = SessionApp::new();
+        let screen = draw(80, 24, &state, &mut app);
+        assert!(screen.contains("[movies] n") && screen.contains("quit"), "{screen}");
     }
 
     fn draw(width: u16, height: u16, state: &SessionState, app: &mut SessionApp) -> String {

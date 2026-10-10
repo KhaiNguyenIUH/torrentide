@@ -202,6 +202,8 @@ pub struct Scheduler {
     /// Below this many pieces remaining we switch to endgame, asking every peer
     /// that claims a piece so a single slow peer cannot stall the download.
     endgame_threshold: usize,
+    /// Request pieces in ascending index order instead of rarest-first.
+    sequential: bool,
 }
 
 impl Scheduler {
@@ -224,7 +226,12 @@ impl Scheduler {
             excluded: HashSet::new(),
             priority: Vec::new(),
             endgame_threshold: 4,
+            sequential: false,
         }
+    }
+
+    pub fn set_sequential(&mut self, on: bool) {
+        self.sequential = on;
     }
 
     /// Replace the set of skipped pieces, e.g. after the user toggles a file.
@@ -454,14 +461,19 @@ impl Scheduler {
             // would discard the rarity ordering entirely, since the second sort
             // becomes the primary ordering.
             pieces.sort_by_key(|p| {
-                let holders = rarity.get(p).copied().unwrap_or(u32::MAX / 2);
+                let holders = if self.sequential {
+                    0
+                } else {
+                    rarity.get(p).copied().unwrap_or(u32::MAX / 2)
+                };
+                let held = if self.sequential { 0 } else { self.piece_block_count(*p) };
                 // Prefer rare pieces; among equally-rare ones, prefer the piece
                 // we have most of, so pieces complete (and become seedable)
                 // sooner; then fall back to ascending index for determinism.
                 (
                     std::cmp::Reverse(self.priority_of(*p)),
                     holders,
-                    std::cmp::Reverse(self.piece_block_count(*p)),
+                    std::cmp::Reverse(held),
                     *p,
                 )
             });
@@ -1049,5 +1061,55 @@ mod tests {
             piece_priorities(&m, &[FilePriority::High, FilePriority::Skip]),
             [FilePriority::High, FilePriority::Skip]
         );
+    }
+
+    #[test]
+    fn sequential_ignores_rarity_and_keeps_bands() {
+        let m = multi(BLOCK_SIZE, &[BLOCK_SIZE as u64; 4]);
+        let mut s = Scheduler::new(&m);
+        s.set_sequential(true);
+        let rarity = HashMap::from([(0u32, 9u32), (1, 5), (2, 3), (3, 1)]);
+        let order: Vec<u32> = s.fill_batch(&rarity, 4).iter().map(|r| r.piece).collect();
+        assert_eq!(order, [0, 1, 2, 3]);
+
+        let mut s = Scheduler::new(&m);
+        s.set_sequential(true);
+        s.set_piece_priorities(piece_priorities(
+            &m,
+            &[FilePriority::Normal, FilePriority::Normal, FilePriority::High, FilePriority::High],
+        ));
+        let order: Vec<u32> = s.fill_batch(&rarity, 4).iter().map(|r| r.piece).collect();
+        assert_eq!(order, [2, 3, 0, 1]);
+
+        let mut s = Scheduler::new(&m);
+        s.set_sequential(true);
+        s.set_piece_priorities(piece_priorities(
+            &m,
+            &[FilePriority::Skip, FilePriority::Normal, FilePriority::Skip, FilePriority::Normal],
+        ));
+        let order: Vec<u32> = s.fill_batch(&rarity, 4).iter().map(|r| r.piece).collect();
+        assert_eq!(order, [1, 3]);
+    }
+
+    #[test]
+    fn toggling_sequential_restores_rarity_order() {
+        let m = multi(BLOCK_SIZE, &[BLOCK_SIZE as u64; 4]);
+        let mut s = Scheduler::new(&m);
+        let rarity = HashMap::from([(0u32, 9u32), (1, 5), (2, 3), (3, 1)]);
+        s.set_sequential(true);
+        s.set_sequential(false);
+        let order: Vec<u32> = s.fill_batch(&rarity, 4).iter().map(|r| r.piece).collect();
+        assert_eq!(order, [3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn sequential_webseed_claims_in_index_order() {
+        let m = meta(BLOCK_SIZE, 4);
+        let mut s = Scheduler::new(&m);
+        s.set_sequential(true);
+        let rarity = HashMap::from([(0u32, 9u32), (1, 5), (2, 3), (3, 1)]);
+        let a = s.claim_piece_for_webseed(&rarity, |_| true).unwrap().0;
+        let b = s.claim_piece_for_webseed(&rarity, |_| true).unwrap().0;
+        assert_eq!((a, b), (0, 1));
     }
 }

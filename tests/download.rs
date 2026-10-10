@@ -17,8 +17,12 @@ const PIECE_LEN: usize = 16 * 1024;
 const FILES: [(&str, usize); 3] = [("a.bin", 100_000), ("sub/b.bin", 40_000), ("sub/c.bin", 131_077)];
 
 fn temp_dir(tag: &str) -> PathBuf {
+    // Tests run in parallel and the clock can return the same value twice, so
+    // a counter keeps two calls from sharing a directory.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let dir = std::env::temp_dir().join(format!("torrust-{tag}-{}-{nanos}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("torrust-{tag}-{}-{nanos}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

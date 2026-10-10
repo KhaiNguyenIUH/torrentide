@@ -87,6 +87,8 @@ pub struct EngineOptions {
     /// Extra peer addresses from session-level discovery (local peer
     /// discovery). Dialled like tracker peers.
     pub extra_peers: Option<mpsc::UnboundedReceiver<Vec<SocketAddr>>>,
+    /// Start in sequential (in-order) download mode.
+    pub sequential: bool,
 }
 
 impl Default for EngineOptions {
@@ -104,6 +106,7 @@ impl Default for EngineOptions {
             port: LOCAL_PORT,
             file_priorities: None,
             extra_peers: None,
+            sequential: false,
         }
     }
 }
@@ -156,6 +159,8 @@ impl Engine {
                 .context("preparing download directory")?,
         );
         let mut scheduler = Scheduler::new(&self.meta);
+        let mut sequential = self.opts.sequential;
+        scheduler.set_sequential(sequential);
         let port = self.opts.port;
         let mut inbound = self.opts.inbound.take();
         let mut extra_peers = self.opts.extra_peers.take();
@@ -179,6 +184,7 @@ impl Engine {
             download_dir: download_dir.display().to_string(),
             trackers: self.meta.announce_list.clone(),
             uploaded: self.opts.uploaded_so_far,
+            sequential,
             files: file_summaries(&self.meta, &scheduler, &priorities),
             ..Default::default()
         });
@@ -228,6 +234,7 @@ impl Engine {
             download_dir: download_dir.display().to_string(),
             trackers: self.meta.announce_list.clone(),
             uploaded: self.opts.uploaded_so_far,
+            sequential,
             files: file_summaries(&self.meta, &scheduler, &priorities),
             ..Default::default()
         };
@@ -479,6 +486,7 @@ impl Engine {
                         CheckEvent::Done(verified) => {
                             check_rx = None;
                             scheduler = Scheduler::new(&self.meta);
+                            scheduler.set_sequential(sequential);
                             let good = apply_verified(&mut scheduler, &verified);
                             scheduler.set_piece_priorities(crate::scheduler::piece_priorities(
                                 &self.meta,
@@ -541,6 +549,13 @@ impl Engine {
                                 return Ok(());
                             }
                             Command::SetMaxPeers(n) => pool.set_max_peers(n),
+                            Command::SetSequential(on) => {
+                                sequential = on;
+                                scheduler.set_sequential(on);
+                                if let Some(t) = &mut self.state.write().await.torrent {
+                                    t.sequential = on;
+                                }
+                            }
                             Command::Recheck => {
                                 if check_rx.is_none() {
                                     // Stop serving while the data is in doubt: a
@@ -794,6 +809,7 @@ impl Engine {
                         if let Some(t) = &mut st.torrent {
                             let checking = check_rx.is_some();
                             t.uploaded = total_up;
+                            t.sequential = sequential;
                             t.download_rate = current_rate;
                             t.upload_rate = upload_rate;
                             t.eta_secs = eta;
@@ -846,6 +862,7 @@ impl Engine {
                                 DownloadState::Complete
                             };
                             t.progress = 1.0;
+                            t.sequential = sequential;
                             // The stats branch runs every 500ms, which the
                             // download can beat. Publish final figures here so
                             // the summary never reports a completed download

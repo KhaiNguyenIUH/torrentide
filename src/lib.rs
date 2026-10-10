@@ -15,6 +15,7 @@
 //! - [`tui`] — the terminal interface
 
 pub mod bencode;
+pub mod create;
 pub mod dht;
 pub mod engine;
 pub mod import;

@@ -60,6 +60,10 @@ pub struct Record {
     pub snapshot: Option<Snapshot>,
     /// The magnet URI, kept until the metadata has been fetched and stored.
     pub magnet: Option<String>,
+    pub label: Option<String>,
+    pub sequential: bool,
+    /// Completion has been seen (and any move-on-complete done); never moved automatically again.
+    pub moved: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -268,6 +272,9 @@ fn encode_settings(s: &Settings) -> Vec<u8> {
     d.insert(b"lsd".to_vec(), int(s.lsd as u64));
     d.insert(b"max_active_downloads".to_vec(), int(s.max_active_downloads as u64));
     d.insert(b"max_active_torrents".to_vec(), int(s.max_active_torrents as u64));
+    if let Some(p) = &s.move_completed_dir {
+        d.insert(b"move_completed_dir".to_vec(), Value::Bytes(path_bytes(p)));
+    }
     bencode::encode(&Value::Dict(d))
 }
 
@@ -307,6 +314,7 @@ fn decode_settings(raw: &[u8]) -> Result<Settings> {
     if let Some(n) = v.get_int_opt("max_active_torrents") {
         s.max_active_torrents = n.max(0) as usize;
     }
+    s.move_completed_dir = v.get_opt("move_completed_dir").map(bytes_path).transpose()?.filter(|p| !p.as_os_str().is_empty());
     Ok(s)
 }
 
@@ -329,11 +337,17 @@ fn encode_record(r: &Record) -> Vec<u8> {
     if let Some(m) = &r.magnet {
         d.insert(b"magnet".to_vec(), Value::Bytes(m.as_bytes().to_vec()));
     }
+    if let Some(l) = &r.label {
+        d.insert(b"label".to_vec(), Value::Bytes(l.as_bytes().to_vec()));
+    }
+    d.insert(b"sequential".to_vec(), int(r.sequential as u64));
+    d.insert(b"moved".to_vec(), int(r.moved as u64));
     bencode::encode(&Value::Dict(d))
 }
 
 fn decode_record(id: &str, raw: &[u8]) -> Result<Record> {
     let v = bencode::decode(raw)?;
+    let snapshot = v.get_opt("snapshot").and_then(decode_snapshot);
     Ok(Record {
         id: id.to_owned(),
         dir: bytes_path(v.get("dir")?)?,
@@ -348,8 +362,11 @@ fn decode_record(id: &str, raw: &[u8]) -> Result<Record> {
         }),
         queue: v.get_int_opt("queue").unwrap_or(0).max(0) as u64,
         force: v.get_int_opt("force").unwrap_or(0) != 0,
-        snapshot: v.get_opt("snapshot").and_then(decode_snapshot),
         magnet: v.get_str_opt("magnet").map(str::to_owned),
+        label: v.get_str_opt("label").filter(|l| !l.is_empty()).map(str::to_owned),
+        sequential: v.get_int_opt("sequential").unwrap_or(0) != 0,
+        moved: v.get_int_opt("moved").map_or_else(|| snapshot.as_ref().is_some_and(|s| s.complete), |n| n != 0),
+        snapshot,
     })
 }
 
@@ -437,6 +454,7 @@ mod tests {
             lsd: false,
             max_active_downloads: 2,
             max_active_torrents: 4,
+            move_completed_dir: Some(PathBuf::from("/done")),
         };
         store.save_settings(&s).unwrap();
         assert_eq!(store.load_settings(), s);
@@ -467,6 +485,9 @@ mod tests {
                 files: vec![10, 0, 30],
             }),
             magnet: None,
+            label: Some("movies".into()),
+            sequential: true,
+            moved: true,
         };
         store.save_torrent(&r.id, b"d4:infode").unwrap();
         store.save_record(&r).unwrap();
@@ -502,6 +523,47 @@ mod tests {
         let r = &got[0];
         assert_eq!(r.priorities, Some(vec![FilePriority::Normal, FilePriority::Skip, FilePriority::Normal]));
         assert!(!r.force && r.snapshot.is_none() && r.queue == 0 && !r.stopped);
+        assert!(r.label.is_none() && !r.sequential && !r.moved);
+    }
+
+    #[test]
+    fn old_complete_record_counts_as_already_moved() {
+        let store = Store::at(tmp("oldcomplete"));
+        let id = "ee".repeat(20);
+        let r = Record {
+            id: id.clone(),
+            dir: PathBuf::from("/d"),
+            added_at: 1,
+            stopped: false,
+            uploaded: 0,
+            download_limit: 0,
+            upload_limit: 0,
+            priorities: None,
+            queue: 0,
+            force: false,
+            snapshot: Some(Snapshot {
+                name: "n".into(),
+                total_length: 1,
+                piece_count: 1,
+                verified_pieces: 1,
+                downloaded: 1,
+                progress: 1.0,
+                complete: true,
+                files: vec![1],
+            }),
+            magnet: None,
+            label: None,
+            sequential: false,
+            moved: false,
+        };
+        let mut d = match bencode::decode(&encode_record(&r)).unwrap() {
+            Value::Dict(d) => d,
+            _ => unreachable!(),
+        };
+        d.remove(b"moved".as_slice());
+        store.save_torrent(&id, b"x").unwrap();
+        write_atomic(&store.state_path(&id), &bencode::encode(&Value::Dict(d))).unwrap();
+        assert!(store.load_records().0[0].moved);
     }
 
     #[test]
@@ -512,6 +574,7 @@ mod tests {
         let s = store.load_settings();
         assert_eq!(s.listen_port, 7);
         assert_eq!(s.max_active_downloads, Settings::default().max_active_downloads);
+        assert_eq!(s.move_completed_dir, None);
     }
 
     #[test]

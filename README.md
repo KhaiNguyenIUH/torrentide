@@ -31,6 +31,13 @@ The binary is `target/release/torrust`.
 - `magnet`: prints what a magnet URI contains.
 - `import`: adopts another client's files for the same torrent (stop that client first). It tolerates the `.!qB` suffix and no-subfolder layouts, transfers the files into `-o` by copy, move or hard-link, and verifies them unless `--no-verify`. With `--start` it begins downloading right after.
 
+## Creating torrents
+
+    torrust create <file|dir> [-o out.torrent] [-t URL]... [--web-seed URL]... [--private] \
+        [--piece-size KiB] [--comment TEXT] [--source TEXT] [--no-date] [--force] [--seed]
+
+Builds a v1 `.torrent` from a file or directory (files sorted by path, symlinks skipped), hashing pieces on all CPU cores. The piece size is chosen automatically (about 1000-2000 pieces) unless `--piece-size` is given. The output defaults to `<name>.torrent` in the current directory and is not overwritten without `--force`. It prints the infohash and a magnet link. `--seed` hands the torrent to the running session (or queues it) with the parent of `<path>` as the download directory, so it seeds at once.
+
 ## Session mode
 
     torrust                      # multi-torrent TUI

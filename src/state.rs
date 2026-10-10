@@ -66,6 +66,8 @@ pub struct TorrentSummary {
     pub trackers: Vec<String>,
     /// Peers with at least one piece of the torrent.
     pub seeders_known: u32,
+    /// Pieces are fetched in order (for watching while downloading).
+    pub sequential: bool,
     pub leecher_known: u32,
     /// Cumulative bytes uploaded for this torrent, including earlier runs.
     pub uploaded: u64,
@@ -92,6 +94,7 @@ impl Default for TorrentSummary {
             download_dir: String::new(),
             trackers: vec![],
             seeders_known: 0,
+            sequential: false,
             leecher_known: 0,
             uploaded: 0,
             files: vec![],
@@ -208,6 +211,8 @@ pub enum Command {
     Recheck,
     /// Set one file's priority by file-list index.
     SetFilePriority(usize, FilePriority),
+    /// Download pieces in order instead of rarest-first.
+    SetSequential(bool),
     /// Change the connection cap while running.
     SetMaxPeers(usize),
 }
@@ -235,6 +240,8 @@ pub struct Settings {
     pub port_forwarding: bool,
     /// Announce and listen for peers on the local network (BEP 14).
     pub lsd: bool,
+    /// Move finished downloads here; `None` leaves them where they are.
+    pub move_completed_dir: Option<PathBuf>,
     /// Queue limits: at most this many torrents downloading, and this many
     /// running in total (downloading + seeding). 0 means no limit.
     pub max_active_downloads: usize,
@@ -259,6 +266,7 @@ impl Default for Settings {
             dht: true,
             port_forwarding: true,
             lsd: true,
+            move_completed_dir: None,
         }
     }
 }
@@ -281,6 +289,8 @@ pub struct TorrentView {
     pub added_at: u64,
     /// Position in the queue (0 = first), or `None` for a stopped torrent.
     pub queue_position: Option<usize>,
+    /// User label (category), e.g. "linux" or "movies".
+    pub label: Option<String>,
 }
 
 /// Everything the session TUI renders. Published by the session every
@@ -333,6 +343,10 @@ pub enum SessionCommand {
     SetTorrentLimits { id: TorrentId, download: u64, upload: u64 },
     /// Move a torrent one place up (`true`) or down in the queue.
     MoveQueue { id: TorrentId, up: bool },
+    /// Set or clear a torrent's label.
+    SetLabel { id: TorrentId, label: Option<String> },
+    /// Move a torrent's data to another folder and keep seeding from there.
+    MoveData { id: TorrentId, dir: PathBuf },
     SetSettings(Settings),
     /// Persist everything and shut down.
     Quit,
