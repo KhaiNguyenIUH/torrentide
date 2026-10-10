@@ -206,17 +206,6 @@ Checks:
 
 The integration tests in `tests/` run the real engine against local seeders and mock trackers, so they need no internet access. One of them, `peers_find_each_other_through_local_discovery_alone`, needs local-network multicast and can fail on machines or CI runners that block it.
 
-### Security
-
-Please don't report security problems in public issues. Use GitHub's [private vulnerability reporting](https://github.com/KhaiNguyenIUH/torrust/security/advisories/new) instead, and allow some time for a fix before disclosing.
-
-### Releasing
-
-For maintainers: bump `version` in `Cargo.toml`, commit, then push a tag. The release workflow builds the macOS and Windows binaries and writes the release notes from the commits since the previous tag.
-
-    git tag vX.Y.Z
-    git push origin vX.Y.Z
-
 ## License
 
 torrust is released under the [MIT License](LICENSE).
