@@ -78,13 +78,13 @@ Subscribe to RSS or Atom feeds (`http(s)` only) and torrents matching your inclu
 
 A small browser interface for the session, off by default. It takes links and magnets only and never shows or accepts local paths or folders.
 
-- Without a password it listens on `127.0.0.1` only. With a password it listens on all interfaces and asks for it (HTTP Basic, any user name) on every request. Use a reverse proxy with TLS if you expose it beyond your network; the connection itself is plain HTTP.
+- Without a password it listens on `127.0.0.1` only and needs an access token: the session creates a random 128-bit token (kept in `webui.token` in the data directory, readable by you alone), logs the one-time URL `http://127.0.0.1:PORT/?token=...` and prints it when `torrust session` starts. Opening that URL stores the token in an HttpOnly cookie and redirects to `/`. Scripts can send `Authorization: Bearer <token>` instead. With a password it listens on all interfaces and asks for it (HTTP Basic, any user name) on every request. After five wrong passwords from one address it answers 429 for a growing time (up to 15 minutes). Use a reverse proxy with TLS if you expose it beyond your network; the connection itself is plain HTTP.
 - Enable it and set the password without putting the password in shell history:
 
       torrust webui-password        # type the password and press Enter
       torrust session --no-tui      # daemon mode: runs headless, serves the web UI, Ctrl-C quits
 
-  The password is stored only as a salted, iterated SHA-1 hash (`sha1$100000$salt$hash`) in `settings.bencode`, which is readable by you alone. The default port is 8080 (`webui.port` in the settings). The session logs the URL it listens on. Run `webui-password` while the session is stopped: a running session writes its own settings when it quits.
+  The password is stored only as a salted, iterated SHA-1 hash (`torrust-sha1$100000$salt$hash`) in `settings.bencode`, which is readable by you alone. The default port is 8080 (`webui.port` in the settings). The session logs the URL it listens on. Run `webui-password` while the session is stopped: a running session writes its own settings when it quits.
 - Settings, feeds and web UI changes made while the session runs are saved at once and take effect after a restart.
 
 ## TUI keys

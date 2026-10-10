@@ -128,6 +128,16 @@ impl Default for EngineOptions {
     }
 }
 
+struct AbortOnDrop(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
+}
+
 /// Whether cumulative uploads have reached the ratio target.
 pub fn ratio_reached(uploaded: u64, total_length: u64, target: f64) -> bool {
     target > 0.0 && total_length > 0 && uploaded as f64 / total_length as f64 >= target
@@ -299,26 +309,21 @@ impl Engine {
         pool.set_blocklist(self.opts.blocklist.clone());
         pool.set_super_seed(self.opts.super_seed);
 
+        let mut listener_tasks = AbortOnDrop(Vec::new());
         if can_seed && inbound.is_none() {
             let (listen_tx, mut listen_rx) =
                 mpsc::unbounded_channel::<(SocketAddr, FromPeer)>();
-            tokio::spawn(async move {
+            listener_tasks.0.push(tokio::spawn(async move {
                 while let Some(ev) = listen_rx.recv().await {
                     if inbound_forward.send(ev).is_err() {
                         break;
                     }
                 }
-            });
+            }));
 
-            match crate::peer::pool::listen(
-                Arc::clone(&self.meta),
-                pool.seeder().cloned(),
-                port,
-                listen_tx,
-            )
-            .await
-            {
-                Ok((addr, _handle)) => {
+            match pool.listen(port, listen_tx).await {
+                Ok((addr, handle)) => {
+                    listener_tasks.0.push(handle);
                     self.log(
                         Level::Info,
                         format!("seeding: listening on {addr} for inbound peers"),
@@ -393,9 +398,6 @@ impl Engine {
 
         loop {
             tokio::select! {
-                // Inbound peer messages get priority over periodic work.
-                biased;
-
                 Some((addr, ev)) = peer_rx.recv() => {
                     if let FromPeer::PexPeers(addrs) = &ev {
                         tracing::debug!(peer = %addr, count = addrs.len(), "pex peers");
@@ -797,8 +799,19 @@ impl Engine {
                     if !ready.is_empty() {
                         let mut confirmed = 0u32;
                         let mut corrupt = Vec::new();
-                        for piece in ready {
-                            match storage.verify_piece(&self.meta, piece) {
+                        let hashed = {
+                            let (storage, meta) = (Arc::clone(&storage), Arc::clone(&self.meta));
+                            tokio::task::spawn_blocking(move || {
+                                ready
+                                    .into_iter()
+                                    .map(|piece| (piece, storage.verify_piece(&meta, piece)))
+                                    .collect::<Vec<_>>()
+                            })
+                            .await
+                            .context("piece verification task")?
+                        };
+                        for (piece, verdict) in hashed {
+                            match verdict {
                                 Ok(true) => {
                                     ws_pieces.remove(&piece);
                                     scheduler.block_map_mut().mark_verified(piece);

@@ -34,6 +34,22 @@ const OPTIMISTIC_ROTATION: u64 = 3;
 /// is revealed even though nobody else reported having it.
 const SUPER_SEED_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long an inbound socket may take to finish its handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on inbound handshakes in flight at once.
+const MAX_PENDING_HANDSHAKES: usize = 32;
+
+/// First wait after a failed dial; it doubles per failure up to the cap.
+const RETRY_FIRST: Duration = Duration::from_secs(300);
+const RETRY_CAP: Duration = Duration::from_secs(3600);
+
+/// How long a peer that disconnected cleanly stays undialled.
+const REDIAL_AFTER_DISCONNECT: Duration = Duration::from_secs(120);
+
+/// Most addresses remembered; the least recently touched go first.
+const MAX_KNOWN: usize = 10_000;
+
 /// Where we learned of a peer's address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -41,6 +57,14 @@ pub enum Source {
     Pex,
     Lsd,
     Dht,
+}
+
+/// What we remember about an address we have dialled or been told about.
+struct Known {
+    source: Source,
+    retry_after: Instant,
+    failures: u32,
+    touched: Instant,
 }
 
 /// Super-seeding progress for one peer: the piece it is currently holding,
@@ -63,8 +87,8 @@ pub struct PeerPool {
     auto_unchoke: bool,
     rechoke_round: u64,
     optimistic: Option<SocketAddr>,
-    /// Addresses we have already tried, so we do not redial dead ones.
-    seen: HashSet<SocketAddr>,
+    /// Addresses we know of and when each may be dialled again.
+    known: HashMap<SocketAddr, Known>,
     /// Union of every connected peer's bitfield.
     availability: Bitfield,
     piece_count: usize,
@@ -91,7 +115,6 @@ pub struct PeerPool {
     ext: Ext,
     blocklist: Option<Arc<BlockList>>,
     blocked_total: u64,
-    sources: HashMap<SocketAddr, Source>,
     super_seed: bool,
     reveal: HashMap<SocketAddr, Reveal>,
     super_seed_timeout: Duration,
@@ -124,7 +147,7 @@ impl PeerPool {
             auto_unchoke,
             rechoke_round: 0,
             optimistic: None,
-            seen: HashSet::new(),
+            known: HashMap::new(),
             availability: Bitfield::with_pieces(piece_count),
             piece_count,
             meta,
@@ -140,7 +163,6 @@ impl PeerPool {
             ext,
             blocklist: None,
             blocked_total: 0,
-            sources: HashMap::new(),
             super_seed: false,
             reveal: HashMap::new(),
             super_seed_timeout: SUPER_SEED_TIMEOUT,
@@ -291,7 +313,7 @@ impl PeerPool {
         if h.inbound {
             f.push('I');
         } else {
-            match self.sources.get(addr) {
+            match self.known.get(addr).map(|k| k.source) {
                 Some(Source::Pex) => f.push('X'),
                 Some(Source::Lsd) => f.push('L'),
                 Some(Source::Dht) => f.push('H'),
@@ -399,12 +421,31 @@ impl PeerPool {
         self.seeder.as_ref()
     }
 
+    /// Bind a listener for inbound peers that serves what the pool serves:
+    /// the same shared seeder, rate limits, unchoke policy and peer cap.
+    pub async fn listen(
+        &self,
+        port: u16,
+        events: mpsc::UnboundedSender<(SocketAddr, FromPeer)>,
+    ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        listen_with(
+            Arc::clone(&self.meta),
+            Arc::clone(&self.shared),
+            self.limits.clone(),
+            self.auto_unchoke,
+            self.max_peers,
+            port,
+            events,
+        )
+        .await
+    }
+
     pub fn connected(&self) -> usize {
         self.peers.len()
     }
 
     pub fn total_peers(&self) -> usize {
-        self.seen.len()
+        self.known.len()
     }
 
     /// Number of pieces at least one connected peer has.
@@ -437,9 +478,12 @@ impl PeerPool {
     pub fn discover_from(&mut self, peers: &[SocketAddrLite], source: Source) -> Vec<SocketAddr> {
         let mut fresh = Vec::new();
         let mut blocked = 0u64;
+        let now = Instant::now();
         for p in peers {
             let addr = SocketAddr::new(p.ip, p.port);
-            if self.seen.contains(&addr) || self.peers.contains_key(&addr) {
+            if self.peers.contains_key(&addr)
+                || self.known.get(&addr).is_some_and(|k| k.retry_after > now)
+            {
                 continue;
             }
             if self.blocked(&addr) {
@@ -452,8 +496,7 @@ impl PeerPool {
             // `dial` reserves the connection slot. Reserving it here as well
             // counted every peer twice, so a batch of 50 filled the pool with
             // phantom handshakes and `dial` refused to dial any of them.
-            self.seen.insert(addr);
-            self.sources.insert(addr, source);
+            self.remember(addr, source, now, RETRY_FIRST, None);
             fresh.push(addr);
         }
         if blocked > 0 {
@@ -461,6 +504,30 @@ impl PeerPool {
             tracing::debug!(blocked, total = self.blocked_total, "skipped blocklisted peers");
         }
         fresh
+    }
+
+    fn remember(&mut self, addr: SocketAddr, source: Source, now: Instant, wait: Duration, failures: Option<u32>) {
+        if !self.known.contains_key(&addr) && self.known.len() >= MAX_KNOWN {
+            if let Some(oldest) = self.known.iter().min_by_key(|(_, k)| k.touched).map(|(a, _)| *a) {
+                self.known.remove(&oldest);
+            }
+        }
+        let k = self.known.entry(addr).or_insert(Known { source, retry_after: now, failures: 0, touched: now });
+        k.source = source;
+        k.retry_after = now + wait;
+        k.touched = now;
+        if let Some(f) = failures {
+            k.failures = f;
+        }
+    }
+
+    fn mark_gone(&mut self, addr: SocketAddr, inbound: bool) {
+        if inbound {
+            return;
+        }
+        let now = Instant::now();
+        let source = self.known.get(&addr).map_or(Source::Tracker, |k| k.source);
+        self.remember(addr, source, now, REDIAL_AFTER_DISCONNECT, Some(0));
     }
 
     /// Dial a batch of peers without blocking the caller.
@@ -658,6 +725,10 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                         }
                     }
                 }
+                if let Some(k) = self.known.get_mut(&addr) {
+                    k.failures = 0;
+                    k.touched = Instant::now();
+                }
                 self.peers.insert(addr, *handle);
                 self.manage_new_peer(addr).await;
                 tracing::info!(peer = %addr, "connected");
@@ -665,6 +736,10 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
             FromPeer::ConnectFailed(addr, why) => {
                 self.connecting = self.connecting.saturating_sub(1);
                 self.dial_gen.remove(&addr);
+                let failures = self.known.get(&addr).map_or(0, |k| k.failures).saturating_add(1);
+                let wait = RETRY_FIRST.saturating_mul(1 << (failures - 1).min(4)).min(RETRY_CAP);
+                let source = self.known.get(&addr).map_or(Source::Tracker, |k| k.source);
+                self.remember(addr, source, Instant::now(), wait, Some(failures));
                 tracing::debug!(peer = %addr, error = %why, "connect failed");
             }
             FromPeer::Bitfield(bf) => {
@@ -685,6 +760,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                 self.reveal.remove(&addr);
                 if let Some(p) = self.peers.remove(&addr) {
                     self.retired_uploaded += p.state.lock().await.uploaded;
+                    self.mark_gone(addr, p.inbound);
                     // Recompute availability from the survivors only.
                     self.availability = Bitfield::with_pieces(self.piece_count);
                     for (_, h) in &self.peers {
@@ -766,6 +842,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
             self.reveal.remove(&addr);
             if let Some(p) = self.peers.remove(&addr) {
                 self.retired_uploaded += p.state.lock().await.uploaded;
+                self.mark_gone(addr, p.inbound);
             }
             removed += 1;
         }
@@ -827,14 +904,40 @@ async fn list_dead(peers: &HashMap<SocketAddr, PeerHandle>) -> Vec<SocketAddr> {
     dead
 }
 
+/// Start listening for inbound peer connections with a private seeder and
+/// default limits. See [`listen_with`].
+pub async fn listen(
+    meta: Arc<Metainfo>,
+    seeder: Option<super::connection::Seeder>,
+    port: u16,
+    events: mpsc::UnboundedSender<(SocketAddr, FromPeer)>,
+) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    listen_with(
+        meta,
+        Arc::new(RwLock::new(seeder)),
+        Limits::default(),
+        true,
+        MAX_PEERS,
+        port,
+        events,
+    )
+    .await
+}
+
 /// Start listening for inbound peer connections.
 ///
 /// Returns the bound address so the caller can advertise it, plus the accept
 /// loop's join handle. A client that never listens downloads fine but
-/// contributes nothing back to the swarm.
-pub async fn listen(
+/// contributes nothing back to the swarm. Sockets that do not finish the
+/// handshake within [`HANDSHAKE_TIMEOUT`] are closed, at most
+/// [`MAX_PENDING_HANDSHAKES`] handshakes run at once and at most `max_peers`
+/// connections are live.
+pub async fn listen_with(
     meta: Arc<Metainfo>,
-    seeder: Option<super::connection::Seeder>,
+    seeder: SharedSeeder,
+    limits: Limits,
+    auto_unchoke: bool,
+    max_peers: usize,
     port: u16,
     events: mpsc::UnboundedSender<(SocketAddr, FromPeer)>,
 ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
@@ -842,22 +945,29 @@ pub async fn listen(
     let local = listener.local_addr()?;
     let infohash = meta.infohash;
     let piece_count = meta.piece_count();
-    let seeder: SharedSeeder = Arc::new(RwLock::new(seeder));
     let ext = ext_for(&meta, local.port());
+    let pending = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+    let live = Arc::new(tokio::sync::Semaphore::new(max_peers));
 
     let handle = tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
+                    let (Ok(pending_permit), Ok(live_permit)) =
+                        (Arc::clone(&pending).try_acquire_owned(), Arc::clone(&live).try_acquire_owned())
+                    else {
+                        tracing::debug!(peer = %addr, "inbound limit reached, dropping connection");
+                        continue;
+                    };
                     let seeder = Arc::clone(&seeder);
                     let events = events.clone();
                     let ext = ext.clone();
-                    // Serve each inbound peer independently; one misbehaving
-                    // peer must not stop us accepting others.
+                    let limits = limits.clone();
                     tokio::spawn(async move {
                         let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<FromPeer>();
                         let tagged = events.clone();
                         tokio::spawn(async move {
+                            let _live = live_permit;
                             while let Some(ev) = peer_rx.recv().await {
                                 if tagged.send((addr, ev)).is_err() {
                                     break;
@@ -865,24 +975,27 @@ pub async fn listen(
                             }
                         });
 
-                        match super::connection::accept(
-                            stream,
-                            infohash,
-                            piece_count,
-                            seeder,
-                            peer_tx,
-                            Limits::default(),
-                            true,
-                            ext,
+                        let shaken = tokio::time::timeout(
+                            HANDSHAKE_TIMEOUT,
+                            super::connection::accept(
+                                stream,
+                                infohash,
+                                piece_count,
+                                seeder,
+                                peer_tx,
+                                limits,
+                                auto_unchoke,
+                                ext,
+                            ),
                         )
-                        .await
-                        {
-                            // Hand the peer to the pool like an outbound one, so
-                            // its uploads are counted and it can serve us too.
-                            Ok(h) => {
+                        .await;
+                        drop(pending_permit);
+                        match shaken {
+                            Ok(Ok(h)) => {
                                 let _ = events.send((addr, FromPeer::Connected(Box::new(h))));
                             }
-                            Err(e) => tracing::debug!(peer = %addr, error = %e, "accept failed"),
+                            Ok(Err(e)) => tracing::debug!(peer = %addr, error = %e, "accept failed"),
+                            Err(_) => tracing::debug!(peer = %addr, "inbound handshake timed out"),
                         }
                     });
                 }
@@ -1413,10 +1526,62 @@ mod tests {
         let lite = |ip: [u8; 4]| SocketAddrLite { ip: std::net::IpAddr::from(ip), port: 1 };
         let fresh = pool.discover_from(&[lite([10, 0, 0, 5]), lite([11, 0, 0, 5])], Source::Dht);
         assert_eq!(fresh, vec!["11.0.0.5:1".parse::<SocketAddr>().unwrap()]);
-        assert_eq!(pool.sources.get(&fresh[0]), Some(&Source::Dht));
+        assert_eq!(pool.known.get(&fresh[0]).map(|k| k.source), Some(Source::Dht));
         assert_eq!(pool.blocked_total, 1);
         pool.dial(&["10.0.0.5:1".parse().unwrap()]);
         assert_eq!(pool.connecting, 0, "a blocked address is never dialled");
+    }
+
+    fn lite(addr: SocketAddr) -> SocketAddrLite {
+        SocketAddrLite { ip: addr.ip(), port: addr.port() }
+    }
+
+    #[tokio::test]
+    async fn disconnected_peer_is_dialable_again_after_its_window() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = PeerPool::new(small_meta(4), None, 6881, tx, Limits::default(), MAX_PEERS, true);
+        let addr: SocketAddr = "11.0.0.5:1".parse().unwrap();
+        assert_eq!(pool.discover(&[lite(addr)]), vec![addr]);
+        assert!(pool.discover(&[lite(addr)]).is_empty(), "held while the dial is pending");
+        pool.peers.insert(addr, fake_handle(Bitfield::with_pieces(4), false, 0));
+        pool.on_event(addr, FromPeer::Disconnected("gone".into())).await;
+        assert!(pool.discover(&[lite(addr)]).is_empty(), "too soon after a clean disconnect");
+        let k = pool.known.get_mut(&addr).unwrap();
+        assert!(k.retry_after <= Instant::now() + REDIAL_AFTER_DISCONNECT);
+        k.retry_after = Instant::now() - Duration::from_secs(1);
+        assert_eq!(pool.discover(&[lite(addr)]), vec![addr]);
+    }
+
+    #[tokio::test]
+    async fn failed_dials_back_off_exponentially_up_to_an_hour() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = PeerPool::new(small_meta(4), None, 6881, tx, Limits::default(), MAX_PEERS, true);
+        let addr: SocketAddr = "11.0.0.6:1".parse().unwrap();
+        pool.discover(&[lite(addr)]);
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            pool.on_event(addr, FromPeer::ConnectFailed(addr, "refused".into())).await;
+            let k = &pool.known[&addr];
+            waits.push(k.retry_after.saturating_duration_since(Instant::now()).as_secs().div_ceil(60));
+        }
+        assert_eq!(waits, vec![5, 10, 20, 40, 60, 60, 60]);
+    }
+
+    #[tokio::test]
+    async fn known_addresses_are_bounded_and_evict_the_oldest() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = PeerPool::new(small_meta(4), None, 6881, tx, Limits::default(), MAX_PEERS, true);
+        let base = Instant::now();
+        for i in 0..MAX_KNOWN as u32 {
+            let a = SocketAddr::from(([10, (i >> 16) as u8, (i >> 8) as u8, i as u8], 1));
+            pool.remember(a, Source::Tracker, base + Duration::from_millis(i as u64), RETRY_FIRST, None);
+        }
+        let oldest = SocketAddr::from(([10, 0, 0, 0], 1));
+        assert!(pool.known.contains_key(&oldest));
+        pool.remember("11.1.1.1:1".parse().unwrap(), Source::Pex, base + Duration::from_secs(60), RETRY_FIRST, None);
+        assert_eq!(pool.known.len(), MAX_KNOWN);
+        assert!(!pool.known.contains_key(&oldest));
+        assert_eq!(pool.total_peers(), MAX_KNOWN);
     }
 
     fn pex_peer(pool: &mut PeerPool, addr: &str, pex_id: Option<u8>) -> mpsc::UnboundedReceiver<ToPeer> {

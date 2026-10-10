@@ -122,6 +122,25 @@ impl Store {
         &self.root
     }
 
+    /// The 128-bit access token that guards a web UI without a password. It is
+    /// created on first use and kept (readable by the owner only) so that the
+    /// URL stays valid across restarts.
+    pub fn web_token(&self) -> Result<String> {
+        let path = self.root.join("webui.token");
+        if let Ok(t) = fs::read_to_string(&path) {
+            let t = t.trim();
+            if t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Ok(t.to_owned());
+            }
+        }
+        use rand::RngCore;
+        let mut raw = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut raw);
+        let token = hex::encode(raw);
+        write_private(&path, token.as_bytes())?;
+        Ok(token)
+    }
+
     pub fn socket_path(&self) -> PathBuf {
         self.root.join("torrust.sock")
     }
@@ -314,17 +333,19 @@ fn write_tmp(tmp: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
     f.write_all(bytes)
 }
 
-const HASH_SCHEME: &str = "sha1";
+const HASH_SCHEME: &str = "torrust-sha1";
+const LEGACY_HASH_SCHEME: &str = "sha1";
 const HASH_ITERATIONS: u32 = 100_000;
-const MAX_HASH_ITERATIONS: u32 = 5_000_000;
+const MAX_HASH_ITERATIONS: u32 = 1_000_000;
 
 /// Whether `stored` is already a salted hash from [`hash_password`].
 pub fn is_password_hash(stored: &str) -> bool {
     parse_hash(stored).is_some()
 }
 
-/// `sha1$<iterations>$<salt hex>$<hash hex>`: SHA-1 over salt and password,
-/// then iterated so each guess costs 100 000 rounds. The plaintext is never stored.
+/// `torrust-sha1$<iterations>$<salt hex>$<hash hex>`: SHA-1 over salt and
+/// password, then iterated so each guess costs 100 000 rounds. The plaintext is
+/// never stored. The older `sha1$...` spelling is still read.
 pub fn hash_password(password: &str) -> String {
     use rand::RngCore;
     let mut salt = [0u8; 16];
@@ -350,8 +371,14 @@ pub fn verify_password(stored: &str, given: &[u8]) -> bool {
         Some((iterations, salt, hash)) => {
             crate::webui::ct_eq(&derive(&salt, given, iterations), &hash)
         }
+        None if has_hash_scheme(stored) => false,
         None => crate::webui::ct_eq(given, stored.as_bytes()),
     }
+}
+
+fn has_hash_scheme(stored: &str) -> bool {
+    let scheme = stored.split('$').next().unwrap_or("");
+    stored.contains('$') && (scheme == HASH_SCHEME || scheme == LEGACY_HASH_SCHEME)
 }
 
 fn derive(salt: &[u8], password: &[u8], iterations: u32) -> [u8; 20] {
@@ -365,7 +392,7 @@ fn derive(salt: &[u8], password: &[u8], iterations: u32) -> [u8; 20] {
 
 fn parse_hash(stored: &str) -> Option<(u32, Vec<u8>, [u8; 20])> {
     let mut parts = stored.split('$');
-    if parts.next()? != HASH_SCHEME {
+    if !matches!(parts.next()?, HASH_SCHEME | LEGACY_HASH_SCHEME) {
         return None;
     }
     let iterations: u32 = parts.next()?.parse().ok().filter(|n| (1..=MAX_HASH_ITERATIONS).contains(n))?;
@@ -878,6 +905,44 @@ mod tests {
     }
 
     #[test]
+    fn hash_grammar_is_strict_and_reads_the_old_spelling() {
+        let salt = "00112233";
+        let hash = hex::encode(derive(&hex::decode(salt).unwrap(), b"pw", 3));
+        let legacy = format!("sha1$3${salt}${hash}");
+        let current = format!("torrust-sha1$3${salt}${hash}");
+        for h in [&legacy, &current] {
+            assert!(is_password_hash(h));
+            assert!(verify_password(h, b"pw") && !verify_password(h, b"px"));
+        }
+        let too_many = format!("torrust-sha1${}${salt}${hash}", MAX_HASH_ITERATIONS + 1);
+        let legacy_too_many = format!("sha1$99999999${salt}${hash}");
+        for bad in [too_many, legacy_too_many, format!("sha1$0${salt}${hash}"), format!("sha1$3$${hash}")] {
+            assert!(!is_password_hash(&bad), "{bad}");
+            assert!(!verify_password(&bad, bad.as_bytes()), "{bad}");
+            assert!(!verify_password(&bad, b"pw"), "{bad}");
+        }
+        assert!(verify_password("sha1", b"sha1") && verify_password("my$pass", b"my$pass"));
+    }
+
+    #[test]
+    fn web_token_is_random_stable_and_private() {
+        let root = tmp("token");
+        let store = Store::at(&root);
+        let t = store.web_token().unwrap();
+        assert_eq!(t.len(), 32);
+        assert!(t.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(Store::at(&root).web_token().unwrap(), t);
+        assert_ne!(Store::at(tmp("token2")).web_token().unwrap(), t);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(root.join("webui.token")).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        fs::write(root.join("webui.token"), "short").unwrap();
+        assert_eq!(store.web_token().unwrap().len(), 32);
+    }
+
+    #[test]
     fn password_is_never_written_in_plaintext() {
         let root = tmp("pw");
         let store = Store::at(&root);
@@ -887,7 +952,7 @@ mod tests {
         let raw = fs::read(root.join("settings.bencode")).unwrap();
         assert!(!String::from_utf8_lossy(&raw).contains("correct horse"));
         let stored = store.load_settings().webui.password.unwrap();
-        assert!(is_password_hash(&stored) && stored.starts_with("sha1$100000$"));
+        assert!(is_password_hash(&stored) && stored.starts_with("torrust-sha1$100000$"));
         assert!(verify_password(&stored, b"correct horse battery"));
         assert!(!verify_password(&stored, b"correct horse batterz"));
         assert!(!verify_password(&stored, b""));

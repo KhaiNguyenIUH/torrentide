@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -49,6 +50,8 @@ const SUMMARY_EVERY: Duration = Duration::from_secs(5);
 const FEED_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const FETCH_SLOTS: usize = 2;
+const FEED_FETCH_SLOTS: usize = 1;
+const MAX_PENDING_FETCHES: usize = 32;
 const MAX_TORRENT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_FEED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FEEDS: usize = 64;
@@ -80,6 +83,14 @@ struct Feed {
     fetching: bool,
 }
 
+struct PendingFetch(Arc<AtomicUsize>);
+
+impl Drop for PendingFetch {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// A network fetch finished; handled on the core task so only it touches entries.
 enum Fetched {
     Torrent { source: String, dir: Option<PathBuf>, result: Result<Vec<u8>> },
@@ -102,6 +113,7 @@ pub struct SessionHandle {
     tx: UnboundedSender<SessionCommand>,
     port: u16,
     webui: Option<SocketAddr>,
+    webui_url: Option<String>,
     join: JoinHandle<Result<()>>,
 }
 
@@ -124,6 +136,11 @@ impl SessionHandle {
         self.webui
     }
 
+    /// The one-time URL (with the access token) of a web UI that has no password.
+    pub fn webui_url(&self) -> Option<&str> {
+        self.webui_url.as_deref()
+    }
+
     /// Resolves once the session has shut down.
     pub async fn wait(self) -> Result<()> {
         self.join.await.context("session task panicked")?
@@ -139,6 +156,9 @@ impl Session {
         let mut handle = Self::start(settings).await?;
         let state = handle.state();
         let tx = handle.command();
+        if let Some(url) = handle.webui_url() {
+            println!("web UI: open {url}");
+        }
         if ui {
             let thread = std::thread::spawn(move || {
                 if let Err(e) = crate::tui::run_session_tui(state) {
@@ -249,17 +269,33 @@ impl Session {
         };
 
         let mut webui = None;
-        if settings.webui.enabled {
+        let mut webui_url = None;
+        let access = match (settings.webui.enabled, settings.webui.password.clone()) {
+            (false, _) => None,
+            (true, Some(pw)) => Some(crate::webui::Access::Password(pw)),
+            (true, None) => match store.web_token() {
+                Ok(t) => Some(crate::webui::Access::Token(t)),
+                Err(e) => {
+                    state.write().await.log(Level::Warn, format!("web UI disabled, cannot create its access token: {e:#}"));
+                    None
+                }
+            },
+        };
+        if let Some(access) = access {
             match TcpListener::bind(crate::webui::bind_addr(&settings.webui)).await {
                 Ok(l) => {
                     let addr = l.local_addr()?;
-                    let protected = settings.webui.password.is_some();
-                    accepts.push(tokio::spawn(crate::webui::serve(l, Arc::clone(&state), settings.webui.password.clone())));
-                    let msg = if protected {
-                        format!("web UI on port {} (all interfaces, password required): http://localhost:{}", addr.port(), addr.port())
-                    } else {
-                        format!("web UI on http://127.0.0.1:{} (this machine only; set a password to allow other machines)", addr.port())
+                    let msg = match &access {
+                        crate::webui::Access::Password(_) => {
+                            format!("web UI on port {} (all interfaces, password required): http://localhost:{}", addr.port(), addr.port())
+                        }
+                        crate::webui::Access::Token(t) => {
+                            let url = format!("http://127.0.0.1:{}/?token={t}", addr.port());
+                            webui_url = Some(url.clone());
+                            format!("web UI (this machine only; set a password to allow other machines): open {url}")
+                        }
                     };
+                    accepts.push(tokio::spawn(crate::webui::serve(l, Arc::clone(&state), access)));
                     tracing::info!("{msg}");
                     state.write().await.log(Level::Info, msg);
                     webui = Some(addr);
@@ -340,6 +376,8 @@ impl Session {
             next_feed_id: 1,
             fetch_tx,
             fetch_slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
+            feed_slots: Arc::new(Semaphore::new(FEED_FETCH_SLOTS)),
+            pending_fetches: Arc::new(AtomicUsize::new(0)),
             blocklist,
             last_eff: None,
             sched_paused: BTreeSet::new(),
@@ -349,7 +387,7 @@ impl Session {
         core.init().await;
 
         let join = tokio::spawn(core.run(rx, pm_rx, fetch_rx));
-        Ok(SessionHandle { state, tx, port, webui, join })
+        Ok(SessionHandle { state, tx, port, webui, webui_url, join })
     }
 }
 
@@ -461,8 +499,12 @@ struct Core {
     feeds: Vec<Feed>,
     next_feed_id: FeedId,
     fetch_tx: UnboundedSender<Fetched>,
-    /// Bounds concurrent feed and torrent downloads.
+    /// Bounds concurrent torrent downloads started by an add.
     fetch_slots: Arc<Semaphore>,
+    /// Feed polls have their own slot so manual adds cannot starve them.
+    feed_slots: Arc<Semaphore>,
+    /// Add downloads waiting or running, capped at `MAX_PENDING_FETCHES`.
+    pending_fetches: Arc<AtomicUsize>,
     blocklist: SharedBlocklist,
     /// What the schedule last applied.
     last_eff: Option<Effective>,
@@ -696,7 +738,16 @@ impl Core {
 
     async fn add(&mut self, source: String, dir: Option<PathBuf>) {
         if is_http(&source) {
-            self.spawn_fetch(source.clone(), MAX_TORRENT_BYTES, move |tx, result| {
+            let pending = Arc::clone(&self.pending_fetches);
+            if pending.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_FETCHES {
+                pending.fetch_sub(1, Ordering::AcqRel);
+                self.log(Level::Warn, format!("too many pending downloads, not adding {}", shown(&source))).await;
+                return;
+            }
+            let guard = PendingFetch(pending);
+            let shown_source = source.clone();
+            self.spawn_fetch(Arc::clone(&self.fetch_slots), shown_source, MAX_TORRENT_BYTES, move |tx, result| {
+                drop(guard);
                 let _ = tx.send(Fetched::Torrent { source, dir, result });
             });
             return;
@@ -726,10 +777,9 @@ impl Core {
         }
     }
 
-    /// Download `url` (at most `max` bytes, two at a time) off the core task.
-    fn spawn_fetch(&self, url: String, max: usize, done: impl FnOnce(UnboundedSender<Fetched>, Result<Vec<u8>>) + Send + 'static) {
+    /// Download `url` (at most `max` bytes, `slots` at a time) off the core task.
+    fn spawn_fetch(&self, slots: Arc<Semaphore>, url: String, max: usize, done: impl FnOnce(UnboundedSender<Fetched>, Result<Vec<u8>>) + Send + 'static) {
         let tx = self.fetch_tx.clone();
-        let slots = Arc::clone(&self.fetch_slots);
         tokio::spawn(async move {
             let _slot = slots.acquire_owned().await;
             let result = match tokio::time::timeout(FETCH_TIMEOUT, crate::webseed::get_capped(&url, max)).await {
@@ -789,7 +839,7 @@ impl Core {
     }
 
     fn fetch_feed(&self, id: FeedId, url: String) {
-        self.spawn_fetch(url.clone(), MAX_FEED_BYTES, move |tx, result| {
+        self.spawn_fetch(Arc::clone(&self.feed_slots), url.clone(), MAX_FEED_BYTES, move |tx, result| {
             let result = result.and_then(|body| rss::parse_at(&String::from_utf8_lossy(&body), &url));
             let _ = tx.send(Fetched::Feed { id, result });
         });

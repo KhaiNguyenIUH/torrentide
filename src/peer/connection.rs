@@ -707,12 +707,18 @@ where
                             forward = Some(FromPeer::Choking(false));
                         }
                         Message::Have { index } => {
+                            if index as usize >= piece_count {
+                                err_msg = Some(format!("have {index} out of range"));
+                                break;
+                            }
                             st.bitfield.set(index);
                             forward = Some(FromPeer::Have(index));
                         }
                         Message::Bitfield { bits } => {
-                            // Clamp to the real piece count: a peer may claim
-                            // more pieces than the torrent has.
+                            if bits.len() != piece_count.div_ceil(8) {
+                                err_msg = Some(format!("bitfield of {} bytes for {piece_count} pieces", bits.len()));
+                                break;
+                            }
                             let bf = Bitfield::from_wire(&bits, piece_count);
                             st.bitfield = bf.clone();
                             forward = Some(FromPeer::Bitfield(bf));
@@ -1049,13 +1055,8 @@ where
     })
 }
 
-/// Encode a bitfield for the wire, trimming any trailing all-zero byte.
 fn encode_bitfield(bf: &Bitfield) -> Vec<u8> {
-    let mut bytes = bf.as_bytes().to_vec();
-    while bytes.len() > 1 && *bytes.last().unwrap() == 0 {
-        bytes.pop();
-    }
-    bytes
+    bf.as_bytes().to_vec()
 }
 
 /// Number of blocks in a piece of the given length.
@@ -1161,14 +1162,11 @@ mod tests {
     }
 
     #[test]
-    fn encode_bitfield_trims_trailing_zero_bytes() {
-        let mut bf = Bitfield::with_pieces(8);
+    fn encode_bitfield_is_exactly_ceil_pieces_over_8_bytes() {
+        let mut bf = Bitfield::with_pieces(24);
         bf.set(0);
-        assert_eq!(encode_bitfield(&bf), vec![0b1000_0000]);
-        // All-zero bitfield still encodes as one byte, since a zero-length
-        // bitfield message is invalid.
-        let empty = Bitfield::with_pieces(8);
-        assert_eq!(encode_bitfield(&empty), vec![0]);
+        assert_eq!(encode_bitfield(&bf), vec![0b1000_0000, 0, 0]);
+        assert_eq!(encode_bitfield(&Bitfield::with_pieces(9)).len(), 2);
     }
 
     #[tokio::test]

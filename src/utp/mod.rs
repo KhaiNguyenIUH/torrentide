@@ -24,7 +24,7 @@ use tokio::{
     time::{timeout_at, Instant},
 };
 
-use conn::{Incoming, Params, Registry, MSS, RX_QUEUE};
+use conn::{HalfOpen, HalfOpenTable, Incoming, Params, Registry, MSS, RX_QUEUE};
 pub use conn::UtpStream;
 use packet::{decode_sack, Header, Kind};
 
@@ -43,6 +43,7 @@ struct Config {
 struct Inner {
     udp: Arc<UdpSocket>,
     registry: Registry,
+    half_open: HalfOpenTable,
     accept_tx: mpsc::Sender<(UtpStream, SocketAddr)>,
     config: Config,
 }
@@ -68,6 +69,7 @@ impl UtpSocket {
         let inner = Arc::new(Inner {
             udp: Arc::new(socket),
             registry: Arc::new(Mutex::new(HashMap::new())),
+            half_open: HalfOpenTable::default(),
             accept_tx,
             config,
         });
@@ -159,6 +161,7 @@ impl UtpSocket {
             idle: inner.config.idle,
             rx,
             respond: false,
+            half_open: None,
         }))
     }
 }
@@ -198,6 +201,7 @@ async fn read_loop(inner: Arc<Inner>) {
 
 fn accept_syn(inner: &Inner, remote: SocketAddr, syn: Header) {
     let Ok(permit) = inner.accept_tx.try_reserve() else { return };
+    let Some(half_open) = HalfOpen::try_new(&inner.half_open, remote.ip()) else { return };
     let (tx, rx) = mpsc::channel(RX_QUEUE);
     let recv_id = syn.conn_id.wrapping_add(1);
     inner.registry.lock().unwrap().insert((remote, recv_id), tx);
@@ -213,6 +217,7 @@ fn accept_syn(inner: &Inner, remote: SocketAddr, syn: Header) {
         idle: inner.config.idle,
         rx,
         respond: true,
+        half_open: Some(half_open),
     });
     permit.send((stream, remote));
 }

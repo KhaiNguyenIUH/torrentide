@@ -264,7 +264,7 @@ async fn web_ui_with_password_runs_in_a_headless_session() {
     s.webui = WebUiSettings { enabled: true, port: 0, password: Some("correct horse battery".into()) };
     let h = Session::start_in(Store::at(&home), s).await.unwrap();
     let addr = SocketAddr::from(([127, 0, 0, 1], h.webui_addr().expect("web UI bound").port()));
-    assert!(h.state().read().await.settings.webui.password.as_deref().unwrap().starts_with("sha1$"));
+    assert!(h.state().read().await.settings.webui.password.as_deref().unwrap().starts_with("torrust-sha1$"));
 
     assert_eq!(request(addr, "GET", "/api/state", None, "").await, 401);
     assert_eq!(request(addr, "GET", "/api/state", Some("wrong"), "").await, 401);
@@ -278,7 +278,7 @@ async fn web_ui_with_password_runs_in_a_headless_session() {
     quit(h).await;
     let raw = std::fs::read(home.join("settings.bencode")).unwrap();
     assert!(!String::from_utf8_lossy(&raw).contains("correct horse"));
-    assert!(Store::at(&home).load_settings().webui.password.unwrap().starts_with("sha1$100000$"));
+    assert!(Store::at(&home).load_settings().webui.password.unwrap().starts_with("torrust-sha1$100000$"));
 }
 
 #[tokio::test]
@@ -303,5 +303,80 @@ async fn web_ui_bind_failure_is_a_warning() {
     let h = Session::start_in(Store::at(temp_dir("home")), s).await.unwrap();
     assert!(h.webui_addr().is_none());
     assert_eq!(logged(&*h.state().read().await, "web UI unavailable"), 1);
+    quit(h).await;
+}
+
+async fn http_get(addr: SocketAddr, path: &str, extra: &str) -> (u16, String) {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{extra}Connection: close\r\n\r\n", addr.port());
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out).await;
+    let text = String::from_utf8_lossy(&out).into_owned();
+    let status = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    (status, text)
+}
+
+#[tokio::test]
+async fn web_ui_without_a_password_needs_the_logged_token() {
+    let home = temp_dir("home");
+    let mut s = settings(&temp_dir("dl"));
+    s.webui = WebUiSettings { enabled: true, port: 0, password: None };
+    let h = Session::start_in(Store::at(&home), s.clone()).await.unwrap();
+    let addr = SocketAddr::from(([127, 0, 0, 1], h.webui_addr().expect("web UI bound").port()));
+    let url = h.webui_url().expect("token URL").to_owned();
+    let token = url.split("?token=").nth(1).unwrap().to_owned();
+    assert_eq!(url, format!("http://127.0.0.1:{}/?token={token}", addr.port()));
+    assert_eq!(logged(&*h.state().read().await, &url), 1);
+    assert_eq!(std::fs::read_to_string(home.join("webui.token")).unwrap().trim(), token);
+
+    assert_eq!(http_get(addr, "/api/state", "").await.0, 401);
+    assert_eq!(http_get(addr, "/api/state", "Cookie: torrust_token=0000\r\n").await.0, 401);
+    assert_eq!(http_get(addr, "/?token=0000", "").await.0, 401);
+    let (status, head) = http_get(addr, &format!("/?token={token}"), "").await;
+    assert_eq!(status, 303);
+    assert!(head.contains(&format!("Set-Cookie: torrust_token={token}; HttpOnly; SameSite=Strict; Path=/")), "{head}");
+    assert!(head.contains("Location: /\r\n"));
+    let cookie = format!("Cookie: torrust_token={token}\r\n");
+    assert_eq!(http_get(addr, "/", &cookie).await.0, 200);
+    assert_eq!(http_get(addr, "/api/state", &cookie).await.0, 200);
+    assert_eq!(http_get(addr, "/api/state", &format!("Authorization: Bearer {token}\r\n")).await.0, 200);
+    let rebound = format!("GET /api/state HTTP/1.1\r\nHost: evil.example\r\n{cookie}Connection: close\r\n\r\n");
+    let mut c = TcpStream::connect(addr).await.unwrap();
+    c.write_all(rebound.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out).await;
+    assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 403"));
+    quit(h).await;
+
+    let h = Session::start_in(Store::at(&home), s).await.unwrap();
+    assert_eq!(h.webui_url().unwrap().split("?token=").nth(1).unwrap(), token);
+    quit(h).await;
+}
+
+#[tokio::test]
+async fn pending_downloads_are_bounded_and_feeds_have_their_own_slot() {
+    let hang = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hang_addr = hang.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = hang.accept().await {
+            held.push(s);
+        }
+    });
+    let (addr, routes) = http_server().await;
+    routes.lock().unwrap().insert("/feed".into(), feed_xml(&[("Alpha one", "alpha1.torrent")], addr));
+
+    let h = Session::start_in(Store::at(temp_dir("home")), settings(&temp_dir("dl"))).await.unwrap();
+    for i in 0..40 {
+        h.command().send(SessionCommand::Add { source: format!("http://{hang_addr}/t{i}.torrent"), dir: None }).unwrap();
+    }
+    h.command()
+        .send(SessionCommand::AddFeed { url: format!("http://{addr}/feed"), include: vec![], exclude: vec![], dir: None })
+        .unwrap();
+    wait_for(&h, "feed fetched while adds hang", |st| st.feeds.iter().any(|f| f.last_fetch.is_some())).await;
+    wait_for(&h, "refusals", |st| logged(st, "too many pending downloads") == 8).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(logged(&*h.state().read().await, "too many pending downloads"), 8);
     quit(h).await;
 }

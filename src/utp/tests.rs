@@ -275,3 +275,128 @@ async fn twenty_streams_demux_and_junk_is_ignored() {
     let ids = tokio::time::timeout(Duration::from_secs(30), server).await.unwrap().unwrap();
     assert_eq!(ids, (0..STREAMS).collect::<Vec<_>>());
 }
+
+fn raw(kind: Kind, conn_id: u16, seq_nr: u16, ack_nr: u16, sack: &[u8], payload: &[u8]) -> Vec<u8> {
+    Header { kind, conn_id, timestamp: 0, timestamp_diff: 0, wnd_size: 1_000_000, seq_nr, ack_nr }
+        .encode_sack(sack, payload)
+}
+
+async fn recv_within(sock: &UdpSocket, wait: Duration) -> Option<Vec<u8>> {
+    let mut buf = [0u8; 2048];
+    let (n, _) = tokio::time::timeout(wait, sock.recv_from(&mut buf)).await.ok()?.ok()?;
+    Some(buf[..n].to_vec())
+}
+
+async fn handshake(att: &UdpSocket, victim: SocketAddr, id: u16) -> u16 {
+    att.send_to(&raw(Kind::Syn, id, 100, 0, &[], &[]), victim).await.unwrap();
+    let reply = recv_within(att, Duration::from_secs(2)).await.expect("no SYN-ACK");
+    decode(&reply).unwrap().0.seq_nr
+}
+
+#[tokio::test]
+async fn syn_flood_from_one_ip_is_capped_and_silent() {
+    let victim = UtpSocket::bind(udp().await);
+    let att = udp().await;
+    for id in 0..40u16 {
+        att.send_to(&raw(Kind::Syn, id * 2, 100, 0, &[], &[]), victim.local_addr().unwrap()).await.unwrap();
+    }
+    let mut replies = 0;
+    while recv_within(&att, Duration::from_millis(400)).await.is_some() {
+        replies += 1;
+    }
+    assert_eq!(replies, 8);
+    assert_eq!(victim.inner.registry.lock().unwrap().len(), 8);
+}
+
+#[test]
+fn half_open_table_caps_total_and_releases_on_drop() {
+    let table = HalfOpenTable::default();
+    let ip = |n: u32| std::net::IpAddr::from(std::net::Ipv4Addr::from(n));
+    let held: Vec<_> = (0..128).map(|n| conn::HalfOpen::try_new(&table, ip(n)).unwrap()).collect();
+    assert!(conn::HalfOpen::try_new(&table, ip(999)).is_none());
+    drop(held);
+    assert_eq!(table.lock().unwrap().total(), 0);
+    let same: Vec<_> = (0..8).map(|_| conn::HalfOpen::try_new(&table, ip(1)).unwrap()).collect();
+    assert!(conn::HalfOpen::try_new(&table, ip(1)).is_none());
+    assert!(conn::HalfOpen::try_new(&table, ip(2)).is_some());
+    drop(same);
+}
+
+#[tokio::test]
+async fn stream_dropped_before_data_goes_quiet_at_once() {
+    let victim = UtpSocket::bind(udp().await);
+    let att = udp().await;
+    handshake(&att, victim.local_addr().unwrap(), 500).await;
+    let (stream, _) = victim.accept().await.unwrap();
+    drop(stream);
+    assert!(recv_within(&att, Duration::from_millis(1500)).await.is_none());
+    assert!(victim.inner.registry.lock().unwrap().is_empty());
+    assert_eq!(victim.inner.half_open.lock().unwrap().total(), 0);
+}
+
+#[tokio::test]
+async fn peer_that_never_sends_data_is_reaped() {
+    let victim = UtpSocket::bind_with(udp().await, Config { idle: Duration::from_secs(1), first_seq: None });
+    let to = victim.local_addr().unwrap();
+    let att = udp().await;
+    let seq = handshake(&att, to, 700).await;
+    let (mut stream, _) = victim.accept().await.unwrap();
+    for _ in 0..12 {
+        att.send_to(&raw(Kind::State, 701, 101, seq.wrapping_sub(1), &[], &[]), to).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(victim.inner.registry.lock().unwrap().is_empty());
+    assert_eq!(stream.read(&mut [0u8; 8]).await.err().unwrap().kind(), io::ErrorKind::TimedOut);
+}
+
+#[tokio::test]
+async fn sacking_everything_but_the_first_packet_cannot_grow_inflight() {
+    let victim = UtpSocket::bind(udp().await);
+    let to = victim.local_addr().unwrap();
+    let att = udp().await;
+    let seq = handshake(&att, to, 900).await;
+    let (mut stream, _) = victim.accept().await.unwrap();
+    tokio::spawn(async move {
+        let _ = stream.write_all(&vec![7u8; 4 * 1024 * 1024]).await;
+        std::future::pending::<()>().await;
+    });
+    let ack = seq.wrapping_sub(1);
+    let mut seen = std::collections::HashSet::new();
+    let mut mask = vec![0u8; 252];
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while let Some(p) = recv_within(&att, deadline.saturating_duration_since(Instant::now())).await {
+        let (h, payload) = decode(&p).unwrap();
+        if h.kind != Kind::Data || payload.is_empty() {
+            continue;
+        }
+        seen.insert(h.seq_nr);
+        let i = seq_diff(h.seq_nr, ack) as usize;
+        if i >= 2 && (i - 2) / 8 < mask.len() {
+            mask[(i - 2) / 8] |= 1 << ((i - 2) % 8);
+        }
+        att.send_to(&raw(Kind::State, 901, 101, ack, &mask, &[]), to).await.unwrap();
+    }
+    assert!(seen.len() <= 1024, "{} distinct packets in flight", seen.len());
+    assert!(seen.len() > 100);
+}
+
+#[tokio::test]
+async fn out_of_order_fin_then_hole_fill_keeps_connection_alive() {
+    let victim = UtpSocket::bind(udp().await);
+    let to = victim.local_addr().unwrap();
+    let att = udp().await;
+    let seq = handshake(&att, to, 1000).await;
+    let (mut stream, _) = victim.accept().await.unwrap();
+    let ack = seq.wrapping_sub(1);
+    att.send_to(&raw(Kind::Data, 1001, 103, ack, &[], b"c"), to).await.unwrap();
+    att.send_to(&raw(Kind::Fin, 1001, 102, ack, &[], &[]), to).await.unwrap();
+    att.send_to(&raw(Kind::Data, 1001, 101, ack, &[], b"a"), to).await.unwrap();
+    let mut acked_fin = false;
+    while let Some(p) = recv_within(&att, Duration::from_secs(1)).await {
+        acked_fin |= decode(&p).unwrap().0.ack_nr == 102;
+    }
+    assert!(acked_fin, "actor died on out-of-order FIN");
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).await.unwrap();
+    assert_eq!(got, b"a");
+}

@@ -8,11 +8,13 @@
 //! must prove they come from this page (Origin/Referer host == Host) to stop
 //! cross-site form posts and DNS-rebinding style attacks from a visited page.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use percent_encoding::percent_decode_str;
+use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, Semaphore};
@@ -22,8 +24,18 @@ use crate::state::{Command, SessionCommand, SessionState, WebUiSettings};
 const INDEX_HTML: &str = include_str!("webui/index.html");
 const MAX_HEAD: usize = 8 * 1024;
 const MAX_BODY: usize = 64 * 1024;
-const MAX_CONNECTIONS: usize = 32;
+const MAX_CONNECTIONS: usize = 64;
+const MAX_PER_IP: usize = 6;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+const HEAD_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_AUTH_HEADER: usize = 256;
+const VERIFY_SLOTS: usize = 2;
+const FAILS_BEFORE_BLOCK: u32 = 5;
+const FAIL_WINDOW: Duration = Duration::from_secs(60);
+const BLOCK_BASE: Duration = Duration::from_secs(15);
+const BLOCK_MAX: Duration = Duration::from_secs(15 * 60);
+const MAX_TRACKED_IPS: usize = 1024;
+const TOKEN_COOKIE: &str = "torrust_token";
 
 /// `script-src 'unsafe-inline'` because the page is one self-contained file;
 /// all dynamic content reaches the DOM through `textContent`, never HTML.
@@ -41,25 +53,154 @@ pub fn bind_addr(settings: &WebUiSettings) -> SocketAddr {
     SocketAddr::new(ip, settings.port)
 }
 
+/// How a client proves it may use the interface: the configured password
+/// (HTTP Basic), or without one an access token the session generated.
+pub enum Access {
+    Password(String),
+    Token(String),
+}
+
+#[derive(Default)]
+struct Strikes {
+    count: u32,
+    level: u32,
+    window_start: Option<Instant>,
+    blocked_until: Option<Instant>,
+}
+
+struct Guard {
+    access: Access,
+    verifying: Semaphore,
+    last_good: Mutex<Option<[u8; 20]>>,
+    strikes: Mutex<HashMap<IpAddr, Strikes>>,
+    conns: Mutex<HashMap<IpAddr, usize>>,
+}
+
+struct Conn {
+    guard: Arc<Guard>,
+    ip: IpAddr,
+}
+
+impl Conn {
+    fn enter(guard: &Arc<Guard>, ip: IpAddr) -> Option<Conn> {
+        let mut conns = guard.conns.lock().unwrap();
+        let n = conns.entry(ip).or_insert(0);
+        if *n >= MAX_PER_IP {
+            return None;
+        }
+        *n += 1;
+        Some(Conn { guard: Arc::clone(guard), ip })
+    }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        let mut conns = self.guard.conns.lock().unwrap();
+        if let Some(n) = conns.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                conns.remove(&self.ip);
+            }
+        }
+    }
+}
+
+impl Guard {
+    fn blocked_for(&self, ip: IpAddr) -> Option<Duration> {
+        let now = Instant::now();
+        let strikes = self.strikes.lock().unwrap();
+        let until = strikes.get(&ip)?.blocked_until?;
+        until.checked_duration_since(now).filter(|d| !d.is_zero())
+    }
+
+    fn fail(&self, ip: IpAddr) {
+        let now = Instant::now();
+        let mut strikes = self.strikes.lock().unwrap();
+        if strikes.len() >= MAX_TRACKED_IPS {
+            strikes.retain(|_, e| e.blocked_until.is_some_and(|u| now < u + BLOCK_MAX));
+        }
+        let e = strikes.entry(ip).or_default();
+        if e.window_start.map_or(true, |w| now.duration_since(w) > FAIL_WINDOW) {
+            e.count = 0;
+            e.window_start = Some(now);
+        }
+        e.count += 1;
+        if e.count >= FAILS_BEFORE_BLOCK {
+            e.count = 0;
+            e.level = (e.level + 1).min(10);
+            let wait = BLOCK_BASE.saturating_mul(1 << (e.level - 1)).min(BLOCK_MAX);
+            e.blocked_until = Some(now + wait);
+        }
+    }
+
+    fn forgive(&self, ip: IpAddr) {
+        self.strikes.lock().unwrap().remove(&ip);
+    }
+
+    fn cached(&self, digest: &[u8; 20]) -> bool {
+        self.last_good.lock().unwrap().as_ref().is_some_and(|d| ct_eq(d, digest))
+    }
+
+    async fn check_password(&self, stored: &str, req: &Request, ip: IpAddr) -> Gate {
+        let Some(value) = req.header("authorization") else {
+            return Gate::Reply(unauthorized());
+        };
+        let digest: [u8; 20] = Sha1::digest(value.as_bytes()).into();
+        if value.len() <= MAX_AUTH_HEADER && self.cached(&digest) {
+            return Gate::Open;
+        }
+        if let Some(wait) = self.blocked_for(ip) {
+            return Gate::Reply(too_many(wait));
+        }
+        let given = match basic_password(value).filter(|_| value.len() <= MAX_AUTH_HEADER) {
+            Some(g) => g,
+            None => {
+                self.fail(ip);
+                return Gate::Reply(unauthorized());
+            }
+        };
+        let _permit = self.verifying.acquire().await;
+        let stored = stored.to_owned();
+        let ok = tokio::task::spawn_blocking(move || crate::store::verify_password(&stored, &given))
+            .await
+            .unwrap_or(false);
+        if ok {
+            *self.last_good.lock().unwrap() = Some(digest);
+            self.forgive(ip);
+            Gate::Open
+        } else {
+            self.fail(ip);
+            Gate::Reply(unauthorized())
+        }
+    }
+}
+
+enum Gate {
+    Open,
+    Reply(Vec<u8>),
+}
+
 /// Serve the web UI on an already-bound listener until the task is dropped.
-pub async fn serve(
-    listener: TcpListener,
-    state: Arc<RwLock<SessionState>>,
-    password: Option<String>,
-) {
-    serve_with(listener, state, password, IO_TIMEOUT).await
+pub async fn serve(listener: TcpListener, state: Arc<RwLock<SessionState>>, access: Access) {
+    serve_with(listener, state, access, IO_TIMEOUT).await
 }
 
 async fn serve_with(
     listener: TcpListener,
     state: Arc<RwLock<SessionState>>,
-    password: Option<String>,
+    access: Access,
     io_timeout: Duration,
 ) {
-    let password: Option<Arc<str>> = password.filter(|p| !p.is_empty()).map(Arc::from);
+    let guard = Arc::new(Guard {
+        access,
+        verifying: Semaphore::new(VERIFY_SLOTS),
+        last_good: Mutex::new(None),
+        strikes: Mutex::default(),
+        conns: Mutex::default(),
+    });
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let (stream, _) = match listener.accept().await {
+        let (stream, peer) = match listener.accept().await {
             Ok(c) => c,
             Err(_) => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -69,10 +210,13 @@ async fn serve_with(
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             continue;
         };
+        let Some(conn) = Conn::enter(&guard, peer.ip()) else {
+            continue;
+        };
         let state = state.clone();
-        let password = password.clone();
         tokio::spawn(async move {
-            handle(stream, state, password.as_deref(), io_timeout).await;
+            handle(stream, peer.ip(), state, &conn.guard, io_timeout).await;
+            drop(conn);
             drop(permit);
         });
     }
@@ -95,11 +239,12 @@ impl Request {
 
 async fn handle(
     mut stream: TcpStream,
+    ip: IpAddr,
     state: Arc<RwLock<SessionState>>,
-    password: Option<&str>,
+    guard: &Guard,
     io_timeout: Duration,
 ) {
-    let out = respond(&mut stream, &state, password, io_timeout).await;
+    let out = respond(&mut stream, ip, &state, guard, io_timeout).await;
     if out.is_empty() {
         return;
     }
@@ -113,29 +258,23 @@ async fn handle(
 /// Returns the full response bytes, or nothing when the peer just went away.
 async fn respond(
     stream: &mut TcpStream,
+    ip: IpAddr,
     state: &RwLock<SessionState>,
-    password: Option<&str>,
+    guard: &Guard,
     io_timeout: Duration,
 ) -> Vec<u8> {
-    let (req, leftover) = match tokio::time::timeout(io_timeout, read_head(stream)).await {
+    let head_timeout = io_timeout.min(HEAD_TIMEOUT);
+    let (req, leftover) = match tokio::time::timeout(head_timeout, read_head(stream)).await {
         Ok(Ok(v)) => v,
         Ok(Err(resp)) => return resp,
         Err(_) => return error(408, "request timed out"),
     };
-    match password {
-        Some(pw) => {
-            if !authorized(&req, pw) {
-                return unauthorized();
-            }
-        }
-        // Without a password the only protection is the loopback bind. A
-        // DNS-rebinding page reaches 127.0.0.1 under its own host name, and
-        // its Origin then matches Host, so the Host itself must be loopback.
-        None => {
-            if !loopback_host(&req) {
-                return error(403, "use http://localhost or 127.0.0.1, or set a password");
-            }
-        }
+    let gate = match &guard.access {
+        Access::Password(pw) => guard.check_password(pw, &req, ip).await,
+        Access::Token(token) => token_gate(&req, token),
+    };
+    if let Gate::Reply(resp) = gate {
+        return resp;
     }
     let post = match req.method.as_str() {
         "GET" => false,
@@ -262,24 +401,57 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// HTTP Basic; any user name, the password decides.
-fn authorized(req: &Request, password: &str) -> bool {
-    let Some(value) = req.header("authorization") else {
-        return false;
-    };
-    let Some((scheme, cred)) = value.split_once(' ') else {
-        return false;
-    };
+fn basic_password(value: &str) -> Option<Vec<u8>> {
+    let (scheme, cred) = value.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("basic") {
-        return false;
+        return None;
     }
-    let Some(decoded) = base64_decode(cred.trim()) else {
-        return false;
-    };
-    let given = match decoded.iter().position(|&b| b == b':') {
-        Some(i) => &decoded[i + 1..],
-        None => &decoded[..],
-    };
-    crate::store::verify_password(password, given)
+    let decoded = base64_decode(cred.trim())?;
+    Some(match decoded.iter().position(|&b| b == b':') {
+        Some(i) => decoded[i + 1..].to_vec(),
+        None => decoded,
+    })
+}
+
+/// Without a password the interface needs the session's access token, as a
+/// cookie or a bearer header. `GET /?token=` trades it for the cookie and
+/// redirects so it does not stay in the address bar. The loopback Host check
+/// stays: a DNS-rebinding page must not reach it under its own name.
+fn token_gate(req: &Request, token: &str) -> Gate {
+    if !loopback_host(req) {
+        return Gate::Reply(error(403, "use http://localhost or 127.0.0.1, or set a password"));
+    }
+    let (path, query) = req.target.split_once('?').unwrap_or((&req.target, ""));
+    if req.method == "GET" && path == "/" {
+        let given = query.split('&').find_map(|p| p.strip_prefix("token="));
+        if let Some(t) = given {
+            return Gate::Reply(if ct_eq(t.as_bytes(), token.as_bytes()) {
+                response(
+                    303,
+                    "text/plain; charset=utf-8",
+                    &format!(
+                        "Location: /\r\nSet-Cookie: {TOKEN_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/\r\n"
+                    ),
+                    b"",
+                )
+            } else {
+                token_required()
+            });
+        }
+    }
+    let bearer = req
+        .header("authorization")
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, t)| t.trim());
+    let cookie = req.header("cookie").and_then(|c| {
+        c.split(';').find_map(|p| p.trim().strip_prefix(TOKEN_COOKIE)?.strip_prefix('='))
+    });
+    if [bearer, cookie].into_iter().flatten().any(|t| ct_eq(t.as_bytes(), token.as_bytes())) {
+        Gate::Open
+    } else {
+        Gate::Reply(token_required())
+    }
 }
 
 fn host_of(url: &str) -> &str {
@@ -314,12 +486,14 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        303 => "See Other",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         _ => "Service Unavailable",
     }
@@ -328,7 +502,7 @@ fn reason(status: u16) -> &'static str {
 fn response(status: u16, content_type: &str, extra: &str, body: &[u8]) -> Vec<u8> {
     let mut out = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-         Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\n\
+         Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n\
          Content-Security-Policy: {CSP}\r\nConnection: close\r\n{extra}\r\n",
         reason(status),
         body.len()
@@ -352,6 +526,19 @@ fn unauthorized() -> Vec<u8> {
         "application/json; charset=utf-8",
         "WWW-Authenticate: Basic realm=\"torrust\", charset=\"UTF-8\"\r\n",
         b"{\"error\":\"authentication required\"}",
+    )
+}
+
+fn token_required() -> Vec<u8> {
+    error(401, "access token required: open the URL the session printed at startup")
+}
+
+fn too_many(wait: Duration) -> Vec<u8> {
+    response(
+        429,
+        "application/json; charset=utf-8",
+        &format!("Retry-After: {}\r\n", wait.as_secs() + 1),
+        b"{\"error\":\"too many failed attempts, try again later\"}",
     )
 }
 
@@ -645,16 +832,21 @@ mod tests {
         (Arc::new(RwLock::new(st)), rx)
     }
 
+    const COOKIE: &str = "Cookie: torrust_token=tok123\r\n";
+
     async fn start(
         state: Arc<RwLock<SessionState>>,
-        password: Option<&str>,
+        access: Access,
         io_timeout: Duration,
     ) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let password = password.map(String::from);
-        tokio::spawn(serve_with(listener, state, password, io_timeout));
+        tokio::spawn(serve_with(listener, state, access, io_timeout));
         addr
+    }
+
+    async fn start_open(state: Arc<RwLock<SessionState>>, io_timeout: Duration) -> SocketAddr {
+        start(state, Access::Token("tok123".into()), io_timeout).await
     }
 
     async fn raw(addr: SocketAddr, request: &[u8]) -> (u16, String, String) {
@@ -725,9 +917,9 @@ mod tests {
     #[tokio::test]
     async fn serves_page_and_state() {
         let (state, _rx) = fake_state(true);
-        let addr = start(state, None, IO_TIMEOUT).await;
+        let addr = start_open(state, IO_TIMEOUT).await;
 
-        let (status, head, body) = raw(addr, &get(addr, "/", "")).await;
+        let (status, head, body) = raw(addr, &get(addr, "/", COOKIE)).await;
         assert_eq!(status, 200);
         assert!(body.contains("<title>torrust</title>"));
         let lower = head.to_ascii_lowercase();
@@ -736,7 +928,7 @@ mod tests {
         assert!(lower.contains("x-frame-options: deny"));
         assert!(lower.contains("content-security-policy: default-src 'none'"));
 
-        let (status, head, body) = raw(addr, &get(addr, "/api/state", "")).await;
+        let (status, head, body) = raw(addr, &get(addr, "/api/state", COOKIE)).await;
         assert_eq!(status, 200);
         assert!(head.contains("application/json"));
         assert_valid_json(&body);
@@ -750,14 +942,14 @@ mod tests {
         assert!(body.contains("\"feeds\":[{\"id\":7"));
         assert!(body.contains("\"download_rate\":0"));
 
-        assert_eq!(raw(addr, &get(addr, "/nope", "")).await.0, 404);
-        assert_eq!(raw(addr, b"DELETE / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await.0, 405);
+        assert_eq!(raw(addr, &get(addr, "/nope", COOKIE)).await.0, 404);
+        assert_eq!(raw(addr, b"DELETE / HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: torrust_token=tok123\r\n\r\n").await.0, 405);
     }
 
     #[tokio::test]
     async fn posts_become_commands() {
         let (state, mut rx) = fake_state(true);
-        let addr = start(state, None, IO_TIMEOUT).await;
+        let addr = start_open(state, IO_TIMEOUT).await;
         let id = ID_A.to_string();
 
         let cases: Vec<(String, String, SessionCommand)> = vec![
@@ -795,16 +987,16 @@ mod tests {
         .collect();
 
         for (path, body, want) in cases {
-            let (status, _, _) = raw(addr, &post(addr, &path, &body, "")).await;
+            let (status, _, _) = raw(addr, &post(addr, &path, &body, COOKIE)).await;
             assert_eq!(status, 200, "{path}");
             assert_eq!(rx.try_recv().unwrap(), want, "{path}");
         }
 
-        let (status, _, _) = raw(addr, &post(addr, "/api/torrents/deadbeef/start", "", "")).await;
+        let (status, _, _) = raw(addr, &post(addr, "/api/torrents/deadbeef/start", "", COOKIE)).await;
         assert_eq!(status, 404);
-        let (status, _, _) = raw(addr, &post(addr, "/api/feeds/99/remove", "", "")).await;
+        let (status, _, _) = raw(addr, &post(addr, "/api/feeds/99/remove", "", COOKIE)).await;
         assert_eq!(status, 404);
-        let (status, _, _) = raw(addr, &post(addr, &format!("/api/torrents/{ID_A}/explode"), "", "")).await;
+        let (status, _, _) = raw(addr, &post(addr, &format!("/api/torrents/{ID_A}/explode"), "", COOKIE)).await;
         assert_eq!(status, 404);
         for bad in [
             "dir=x",
@@ -812,11 +1004,11 @@ mod tests {
             "source=file%3A%2F%2F%2Fetc%2Fpasswd",
             "source=magnet%3A%3Fxt%3Dx&dir=%2Ftmp",
         ] {
-            let (status, _, _) = raw(addr, &post(addr, "/api/add", bad, "")).await;
+            let (status, _, _) = raw(addr, &post(addr, "/api/add", bad, COOKIE)).await;
             assert_eq!(status, 400, "{bad}");
         }
         for bad in ["url=%2Fetc%2Fpasswd", "url=http%3A%2F%2Fa&dir=%2Ftmp"] {
-            let (status, _, _) = raw(addr, &post(addr, "/api/feeds", bad, "")).await;
+            let (status, _, _) = raw(addr, &post(addr, "/api/feeds", bad, COOKIE)).await;
             assert_eq!(status, 400, "{bad}");
         }
         assert!(rx.try_recv().is_err());
@@ -825,15 +1017,15 @@ mod tests {
     #[tokio::test]
     async fn missing_command_channel_is_503() {
         let (state, _rx) = fake_state(false);
-        let addr = start(state, None, IO_TIMEOUT).await;
-        let (status, _, _) = raw(addr, &post(addr, &format!("/api/torrents/{ID_A}/stop"), "", "")).await;
+        let addr = start_open(state, IO_TIMEOUT).await;
+        let (status, _, _) = raw(addr, &post(addr, &format!("/api/torrents/{ID_A}/stop"), "", COOKIE)).await;
         assert_eq!(status, 503);
     }
 
     #[tokio::test]
     async fn password_is_required_on_every_request() {
         let (state, mut rx) = fake_state(true);
-        let addr = start(state, Some("s3cret"), IO_TIMEOUT).await;
+        let addr = start(state, Access::Password("s3cret".into()), IO_TIMEOUT).await;
         let good = "Authorization: Basic YWRtaW46czNjcmV0\r\n";
         let bad = "Authorization: Basic YWRtaW46d3Jvbmc=\r\n";
 
@@ -865,17 +1057,17 @@ mod tests {
     #[tokio::test]
     async fn cross_origin_posts_are_refused() {
         let (state, mut rx) = fake_state(true);
-        let addr = start(state, None, IO_TIMEOUT).await;
+        let addr = start_open(state, IO_TIMEOUT).await;
         let path = "/api/feeds/7/remove";
 
         let evil = format!(
-            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://evil.example\r\nContent-Length: 0\r\n\r\n"
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nCookie: torrust_token=tok123\r\nOrigin: http://evil.example\r\nContent-Length: 0\r\n\r\n"
         );
         assert_eq!(raw(addr, evil.as_bytes()).await.0, 403);
-        let none = format!("POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\n\r\n");
+        let none = format!("POST {path} HTTP/1.1\r\nHost: {addr}\r\nCookie: torrust_token=tok123\r\nContent-Length: 0\r\n\r\n");
         assert_eq!(raw(addr, none.as_bytes()).await.0, 403);
         let referer = format!(
-            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nReferer: http://{addr}/\r\nContent-Length: 0\r\n\r\n"
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nCookie: torrust_token=tok123\r\nReferer: http://{addr}/\r\nContent-Length: 0\r\n\r\n"
         );
         assert_eq!(raw(addr, referer.as_bytes()).await.0, 200);
         assert_eq!(rx.try_recv().unwrap(), SessionCommand::RemoveFeed(7));
@@ -885,13 +1077,13 @@ mod tests {
     #[tokio::test]
     async fn oversized_requests_are_rejected() {
         let (state, _rx) = fake_state(true);
-        let addr = start(state, None, IO_TIMEOUT).await;
+        let addr = start_open(state, IO_TIMEOUT).await;
 
         let big = format!("X-Pad: {}\r\n", "a".repeat(MAX_HEAD + 100));
         assert_eq!(raw(addr, &get(addr, "/", &big)).await.0, 431);
 
         let req = format!(
-            "POST /api/add HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nContent-Length: {}\r\n\r\n",
+            "POST /api/add HTTP/1.1\r\nHost: {addr}\r\nCookie: torrust_token=tok123\r\nOrigin: http://{addr}\r\nContent-Length: {}\r\n\r\n",
             MAX_BODY + 1
         );
         assert_eq!(raw(addr, req.as_bytes()).await.0, 413);
@@ -900,13 +1092,13 @@ mod tests {
     #[tokio::test]
     async fn slow_clients_time_out() {
         let (state, _rx) = fake_state(true);
-        let addr = start(state, None, Duration::from_millis(200)).await;
+        let addr = start_open(state, Duration::from_millis(200)).await;
 
         let (status, _, _) = raw(addr, b"GET / HTTP/1.1\r\nHost: x\r\n").await;
         assert_eq!(status, 408);
 
         let req = format!(
-            "POST /api/add HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nContent-Length: 50\r\n\r\nsource=x"
+            "POST /api/add HTTP/1.1\r\nHost: {addr}\r\nCookie: torrust_token=tok123\r\nOrigin: http://{addr}\r\nContent-Length: 50\r\n\r\nsource=x"
         );
         assert_eq!(raw(addr, req.as_bytes()).await.0, 408);
     }
@@ -924,5 +1116,185 @@ mod tests {
         for bad in ["evil.example:8080", "127.0.0.1.evil.example", "localhost.evil:80", ""] {
             assert!(!loopback_host(&req(bad)), "{bad}");
         }
+    }
+
+    fn auth_basic(password: &str) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let data = format!("u:{password}").into_bytes();
+        let mut out = String::new();
+        for c in data.chunks(3) {
+            let n = c.iter().fold(0u32, |a, b| a << 8 | *b as u32) << (8 * (3 - c.len()));
+            for i in 0..=c.len() {
+                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+            }
+            out.extend(std::iter::repeat('=').take(3 - c.len()));
+        }
+        format!("Authorization: Basic {out}\r\n")
+    }
+
+    async fn hashed_server() -> (SocketAddr, Duration) {
+        let (state, _rx) = fake_state(true);
+        let stored = crate::store::hash_password("s3cret");
+        let t = Instant::now();
+        assert!(!crate::store::verify_password(&stored, b"wrong"));
+        let hash_time = t.elapsed();
+        (start(state, Access::Password(stored), IO_TIMEOUT).await, hash_time)
+    }
+
+    #[tokio::test]
+    async fn long_credentials_are_rejected_without_hashing() {
+        let (addr, hash_time) = hashed_server().await;
+        let long = auth_basic(&"x".repeat(3000));
+        let t = Instant::now();
+        assert_eq!(raw(addr, &get(addr, "/api/state", &long)).await.0, 401);
+        assert!(t.elapsed() < hash_time / 2, "{:?} vs {:?}", t.elapsed(), hash_time);
+        assert_eq!(raw(addr, &get(addr, "/api/state", &auth_basic("s3cret"))).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn password_checks_do_not_block_the_runtime() {
+        let (addr, hash_time) = hashed_server().await;
+        let ticker = tokio::spawn(async move {
+            let mut worst = Duration::ZERO;
+            let mut last = Instant::now();
+            for _ in 0..(hash_time.as_millis() as u64 * 4 / 5 + 50) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                worst = worst.max(last.elapsed());
+                last = Instant::now();
+            }
+            worst
+        });
+        let floods: Vec<_> = (0..4)
+            .map(|i| {
+                let req = get(addr, "/api/state", &auth_basic(&format!("wrong{i}")));
+                tokio::spawn(async move { raw(addr, &req).await.0 })
+            })
+            .collect();
+        for f in floods {
+            assert_eq!(f.await.unwrap(), 401);
+        }
+        let worst = ticker.await.unwrap();
+        assert!(worst < hash_time / 2 + Duration::from_millis(100), "timer stalled {worst:?}, one hash {hash_time:?}");
+    }
+
+    #[tokio::test]
+    async fn repeated_failures_earn_a_429_without_hashing() {
+        let (addr, hash_time) = hashed_server().await;
+        for i in 0..FAILS_BEFORE_BLOCK {
+            assert_eq!(raw(addr, &get(addr, "/api/state", &auth_basic(&format!("no{i}")))).await.0, 401);
+        }
+        let t = Instant::now();
+        let (status, head, _) = raw(addr, &get(addr, "/api/state", &auth_basic("s3cret"))).await;
+        assert_eq!(status, 429);
+        assert!(head.contains("Retry-After: "));
+        assert!(t.elapsed() < hash_time / 2);
+        assert_eq!(raw(addr, &get(addr, "/api/state", "")).await.0, 401);
+    }
+
+    #[test]
+    fn block_windows_grow_and_are_capped() {
+        let guard = Guard {
+            access: Access::Token(String::new()),
+            verifying: Semaphore::new(1),
+            last_good: Mutex::new(None),
+            strikes: Mutex::default(),
+            conns: Mutex::default(),
+        };
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let other: IpAddr = "10.0.0.2".parse().unwrap();
+        assert!(guard.blocked_for(ip).is_none());
+        let mut last = Duration::ZERO;
+        for round in 0..12 {
+            for _ in 0..FAILS_BEFORE_BLOCK {
+                guard.fail(ip);
+            }
+            let wait = guard.blocked_for(ip).expect("blocked");
+            assert!(wait <= BLOCK_MAX);
+            assert!(round == 0 || wait + Duration::from_secs(1) >= last.min(BLOCK_MAX) || last >= BLOCK_MAX);
+            last = wait;
+        }
+        assert!(last > BLOCK_MAX - Duration::from_secs(5));
+        assert!(guard.blocked_for(other).is_none());
+        guard.forgive(ip);
+        assert!(guard.blocked_for(ip).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_good_password_is_cached_after_one_derivation() {
+        let (addr, hash_time) = hashed_server().await;
+        let good = auth_basic("s3cret");
+        assert_eq!(raw(addr, &get(addr, "/api/state", &good)).await.0, 200);
+        let t = Instant::now();
+        for _ in 0..5 {
+            assert_eq!(raw(addr, &get(addr, "/api/state", &good)).await.0, 200);
+        }
+        assert!(t.elapsed() < hash_time * 2, "{:?} vs {:?}", t.elapsed(), hash_time);
+        assert_eq!(raw(addr, &get(addr, "/api/state", &auth_basic("s3creT"))).await.0, 401);
+    }
+
+    #[tokio::test]
+    async fn idle_sockets_cannot_lock_out_a_client() {
+        let (state, _rx) = fake_state(true);
+        let addr = start_open(state, IO_TIMEOUT).await;
+        let mut idle = Vec::new();
+        for _ in 0..40 {
+            idle.push(TcpStream::connect(addr).await.unwrap());
+        }
+        let started = Instant::now();
+        let status = loop {
+            let status = raw(addr, &get(addr, "/api/state", COOKIE)).await.0;
+            if status == 200 || started.elapsed() > Duration::from_secs(5) {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(status, 200);
+        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+        drop(idle);
+    }
+
+    #[tokio::test]
+    async fn the_head_must_arrive_within_two_seconds() {
+        let (state, _rx) = fake_state(true);
+        let addr = start_open(state, IO_TIMEOUT).await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out).await;
+        assert!(String::from_utf8_lossy(&out).contains("408"));
+        assert!(t.elapsed() < Duration::from_millis(3500), "{:?}", t.elapsed());
+    }
+
+    #[tokio::test]
+    async fn without_a_password_the_token_is_required() {
+        let (state, mut rx) = fake_state(true);
+        let addr = start_open(state, IO_TIMEOUT).await;
+
+        for path in ["/", "/api/state"] {
+            assert_eq!(raw(addr, &get(addr, path, "")).await.0, 401, "{path}");
+            assert_eq!(raw(addr, &get(addr, path, "Cookie: torrust_token=nope\r\n")).await.0, 401);
+            assert_eq!(raw(addr, &get(addr, path, "Authorization: Bearer nope\r\n")).await.0, 401);
+        }
+        assert_eq!(raw(addr, &get(addr, "/?token=nope", "")).await.0, 401);
+        assert_eq!(raw(addr, &post(addr, "/api/feeds/7/remove", "", "")).await.0, 401);
+        assert!(rx.try_recv().is_err());
+
+        let (status, head, _) = raw(addr, &get(addr, "/?token=tok123", "")).await;
+        assert_eq!(status, 303);
+        assert!(head.contains("Location: /\r\n"));
+        let cookie = head.lines().find(|l| l.starts_with("Set-Cookie: ")).unwrap();
+        assert_eq!(cookie, "Set-Cookie: torrust_token=tok123; HttpOnly; SameSite=Strict; Path=/");
+
+        assert_eq!(raw(addr, &get(addr, "/", COOKIE)).await.0, 200);
+        assert_eq!(raw(addr, &get(addr, "/api/state", "Cookie: a=b; torrust_token=tok123\r\n")).await.0, 200);
+        assert_eq!(raw(addr, &get(addr, "/api/state", "Authorization: Bearer tok123\r\n")).await.0, 200);
+        assert_eq!(raw(addr, &post(addr, "/api/feeds/7/remove", "", COOKIE)).await.0, 200);
+        assert_eq!(rx.try_recv().unwrap(), SessionCommand::RemoveFeed(7));
+
+        let rebound = "GET /api/state HTTP/1.1\r\nHost: evil.example\r\nCookie: torrust_token=tok123\r\n\r\n";
+        assert_eq!(raw(addr, rebound.as_bytes()).await.0, 403);
+        let rebound = "GET /?token=tok123 HTTP/1.1\r\nHost: evil.example\r\n\r\n";
+        assert_eq!(raw(addr, rebound.as_bytes()).await.0, 403);
     }
 }

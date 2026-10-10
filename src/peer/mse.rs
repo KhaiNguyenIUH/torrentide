@@ -8,6 +8,7 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::{Arc, LazyLock};
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use anyhow::{bail, Context as _, Result};
 use rand::Rng;
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::Semaphore;
 
 use super::AsyncStream;
 use crate::metainfo::InfoHash;
@@ -28,6 +30,17 @@ const MAX_PAD: usize = 512;
 const RC4_DISCARD: usize = 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_CHUNK: usize = 16 * 1024;
+const DH_QUEUE: Duration = Duration::from_secs(2);
+
+static DH_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    Arc::new(Semaphore::new((cpus / 2).max(1)))
+});
+
+#[cfg(test)]
+thread_local! {
+    static MULMODS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 type U768 = [u64; 12];
 
@@ -101,6 +114,8 @@ fn add_mod(a: &mut U768, b: &U768) {
 }
 
 fn mulmod(a: &U768, b: &U768) -> U768 {
+    #[cfg(test)]
+    MULMODS.with(|c| c.set(c.get() + 1));
     let mut acc = [0u64; 12];
     for limb in b.iter().rev() {
         for bit in (0..64).rev() {
@@ -114,17 +129,40 @@ fn mulmod(a: &U768, b: &U768) -> U768 {
     acc
 }
 
+fn bit_len(n: &U768) -> usize {
+    n.iter()
+        .rposition(|l| *l != 0)
+        .map_or(0, |i| i * 64 + 64 - n[i].leading_zeros() as usize)
+}
+
 fn powmod(base: &U768, exp: &U768) -> U768 {
     let mut acc: U768 = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    for limb in exp.iter().rev() {
-        for bit in (0..64).rev() {
-            acc = mulmod(&acc, &acc);
-            if (limb >> bit) & 1 == 1 {
-                acc = mulmod(&acc, base);
-            }
+    for bit in (0..bit_len(exp)).rev() {
+        acc = mulmod(&acc, &acc);
+        if (exp[bit / 64] >> (bit % 64)) & 1 == 1 {
+            acc = mulmod(&acc, base);
         }
     }
     acc
+}
+
+async fn modexp(
+    permits: Arc<Semaphore>,
+    wait: Option<Duration>,
+    jobs: Vec<(U768, U768)>,
+) -> Result<Vec<U768>> {
+    let permit = match wait {
+        Some(wait) => tokio::time::timeout(wait, permits.acquire_owned())
+            .await
+            .context("too many concurrent key exchanges")??,
+        None => permits.acquire_owned().await?,
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        jobs.iter().map(|(b, e)| powmod(b, e)).collect()
+    })
+    .await
+    .context("key exchange task failed")
 }
 
 /// 160-bit private exponent, which is what deployed clients use.
@@ -423,7 +461,8 @@ async fn connect_handshake<S: AsyncStream>(
         bail!("initial payload too large");
     };
     let x = random_exponent();
-    let mut out = to_be_bytes(&powmod(&TWO, &x)).to_vec();
+    let public = modexp(DH_PERMITS.clone(), None, vec![(TWO, x)]).await?[0];
+    let mut out = to_be_bytes(&public).to_vec();
     out.extend(random_pad());
     s.write_all(&out).await?;
 
@@ -434,7 +473,7 @@ async fn connect_handshake<S: AsyncStream>(
         bail!("invalid DH public value");
     }
     buf.drain(..KEY_LEN);
-    let secret = to_be_bytes(&powmod(&yb, &x));
+    let secret = to_be_bytes(&modexp(DH_PERMITS.clone(), None, vec![(yb, x)]).await?[0]);
 
     let skey = infohash.0;
     let mut enc = Rc4::mse(&hash(&[b"keyA", &secret, &skey]));
@@ -507,10 +546,11 @@ async fn accept_handshake<S: AsyncStream>(
     buf.drain(..KEY_LEN);
 
     let y = random_exponent();
-    let mut out = to_be_bytes(&powmod(&TWO, &y)).to_vec();
+    let dh = modexp(DH_PERMITS.clone(), Some(DH_QUEUE), vec![(TWO, y), (ya, y)]).await?;
+    let mut out = to_be_bytes(&dh[0]).to_vec();
     out.extend(random_pad());
     s.write_all(&out).await?;
-    let secret = to_be_bytes(&powmod(&ya, &y));
+    let secret = to_be_bytes(&dh[1]);
 
     sync(&mut s, &mut buf, &hash(&[b"req1", &secret]), MAX_PAD).await?;
     fill(&mut s, &mut buf, 20).await?;
@@ -609,6 +649,67 @@ mod tests {
         let (x, y) = (random_exponent(), random_exponent());
         let (a, b) = (powmod(&TWO, &x), powmod(&TWO, &y));
         assert_eq!(powmod(&b, &x), powmod(&a, &y));
+    }
+
+    #[test]
+    fn short_exponent_skips_leading_zero_bits() {
+        let x = hex_u768("ffffffffffffffffffffffffffffffffffffffff");
+        MULMODS.with(|c| c.set(0));
+        powmod(&TWO, &x);
+        let short = MULMODS.with(|c| c.get());
+        assert!(short <= 2 * 160, "{short} mulmods");
+        let mut full = x;
+        full[11] = 1 << 63;
+        MULMODS.with(|c| c.set(0));
+        powmod(&TWO, &full);
+        assert!(MULMODS.with(|c| c.get()) >= 768);
+        assert_eq!(bit_len(&[0; 12]), 0);
+        assert_eq!(bit_len(&hex_u768("1")), 1);
+    }
+
+    #[tokio::test]
+    async fn dh_does_not_block_the_runtime() {
+        let started = tokio::time::Instant::now();
+        let worst = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ticker = {
+            let (worst, ticks) = (worst.clone(), ticks.clone());
+            tokio::spawn(async move {
+                let mut last = started;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    let now = tokio::time::Instant::now();
+                    let gap = (now - last).as_micros() as u64;
+                    worst.fetch_max(gap, std::sync::atomic::Ordering::Relaxed);
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    last = now;
+                }
+            })
+        };
+        let permits = Arc::new(Semaphore::new(4));
+        let job = || modexp(permits.clone(), Some(DH_QUEUE), vec![(TWO, P), (TWO, P)]);
+        let (a, b, c, d) = tokio::join!(job(), job(), job(), job());
+        for r in [a, b, c, d] {
+            r.unwrap();
+        }
+        let total = started.elapsed().as_micros() as u64;
+        ticker.abort();
+        let worst = worst.load(std::sync::atomic::Ordering::Relaxed);
+        let ticks = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(ticks >= 3 && worst * 2 < total, "runtime stalled: {ticks} ticks, worst gap {worst}us of {total}us");
+    }
+
+    #[tokio::test]
+    async fn dh_queue_gives_up_when_saturated() {
+        let none = Arc::new(Semaphore::new(0));
+        let started = std::time::Instant::now();
+        let err = modexp(none, Some(Duration::from_millis(50)), vec![(TWO, TWO)]).await;
+        assert!(err.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let one = Arc::new(Semaphore::new(1));
+        let ok = modexp(one.clone(), Some(Duration::from_millis(50)), vec![(TWO, TWO)]).await;
+        assert_eq!(ok.unwrap()[0], [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(one.available_permits(), 1);
     }
 
     #[test]

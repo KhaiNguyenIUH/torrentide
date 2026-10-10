@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
@@ -29,10 +29,67 @@ const MIN_RTO: Duration = Duration::from_millis(500);
 const INIT_RTO: Duration = Duration::from_secs(1);
 const MAX_RTO: Duration = Duration::from_secs(5);
 const LINGER: Duration = Duration::from_secs(5);
+const MAX_INFLIGHT: usize = 1024;
+const MAX_HELD_BYTES: usize = MAX_CWND;
+const MAX_HALF_OPEN: usize = 128;
+const MAX_HALF_OPEN_PER_IP: usize = 8;
+const HALF_OPEN_REAP: Duration = Duration::from_secs(10);
 pub const RX_QUEUE: usize = 512;
 
 pub type Registry = Arc<Mutex<HashMap<(SocketAddr, u16), mpsc::Sender<Incoming>>>>;
 type Failure = (io::ErrorKind, &'static str);
+
+#[derive(Default)]
+pub struct HalfOpenCounts {
+    total: usize,
+    per_ip: HashMap<IpAddr, usize>,
+}
+
+pub type HalfOpenTable = Arc<Mutex<HalfOpenCounts>>;
+
+pub struct HalfOpen {
+    table: HalfOpenTable,
+    ip: IpAddr,
+}
+
+impl HalfOpenCounts {
+    #[cfg(test)]
+    pub fn total(&self) -> usize {
+        self.total
+    }
+}
+
+impl HalfOpen {
+    pub fn try_new(table: &HalfOpenTable, ip: IpAddr) -> Option<HalfOpen> {
+        let mut c = table.lock().unwrap();
+        let from_ip = c.per_ip.get(&ip).copied().unwrap_or(0);
+        if c.total >= MAX_HALF_OPEN || from_ip >= MAX_HALF_OPEN_PER_IP {
+            return None;
+        }
+        c.total += 1;
+        c.per_ip.insert(ip, from_ip + 1);
+        Some(HalfOpen { table: table.clone(), ip })
+    }
+}
+
+impl Drop for HalfOpen {
+    fn drop(&mut self) {
+        let mut c = self.table.lock().unwrap();
+        c.total -= 1;
+        if let Some(n) = c.per_ip.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                c.per_ip.remove(&self.ip);
+            }
+        }
+    }
+}
+
+struct Handshake {
+    _slot: HalfOpen,
+    reap_at: Instant,
+    first_ack: u16,
+}
 
 pub struct Incoming {
     pub header: Header,
@@ -162,12 +219,18 @@ pub struct Params {
     pub idle: Duration,
     pub rx: mpsc::Receiver<Incoming>,
     pub respond: bool,
+    pub half_open: Option<HalfOpen>,
 }
 
 pub fn spawn(p: Params) -> UtpStream {
     let link = Arc::new(Link::default());
     let stream = UtpStream { link: link.clone(), peer: p.remote };
     let respond = p.respond;
+    let handshake = p.half_open.map(|slot| Handshake {
+        _slot: slot,
+        reap_at: Instant::now() + HALF_OPEN_REAP.min(p.idle),
+        first_ack: p.seq_nr.wrapping_sub(1),
+    });
     let mut actor = Actor {
         udp: p.udp,
         registry: p.registry,
@@ -179,6 +242,8 @@ pub fn spawn(p: Params) -> UtpStream {
         ack_nr: p.ack_nr,
         inflight: VecDeque::new(),
         flight_bytes: 0,
+        held_bytes: 0,
+        handshake,
         reorder: HashMap::new(),
         reorder_bytes: 0,
         cwnd: 2 * MSS,
@@ -228,6 +293,8 @@ struct Actor {
     ack_nr: u16,
     inflight: VecDeque<Out>,
     flight_bytes: usize,
+    held_bytes: usize,
+    handshake: Option<Handshake>,
     reorder: HashMap<u16, (bool, Vec<u8>)>,
     reorder_bytes: usize,
     cwnd: usize,
@@ -251,6 +318,9 @@ struct Actor {
 impl Actor {
     async fn run(&mut self, mut rx: mpsc::Receiver<Incoming>) {
         loop {
+            if self.handshake.is_some() && self.link.pipe.lock().unwrap().dropped {
+                break;
+            }
             self.pump();
             if self.failure.is_some() || (self.fin_acked && self.peer_fin) {
                 break;
@@ -283,6 +353,10 @@ impl Actor {
     fn deadline(&self) -> Instant {
         let idle = if self.lingering() { LINGER.min(self.idle) } else { self.idle };
         let idle_at = self.last_recv + idle;
+        let idle_at = match &self.handshake {
+            Some(h) => idle_at.min(h.reap_at),
+            None => idle_at,
+        };
         match self.inflight.front() {
             Some(f) => idle_at.min(f.sent + self.rto),
             None => idle_at,
@@ -312,12 +386,13 @@ impl Actor {
 
     /// Bit `i` (LSB first) says seq `ack_nr + 2 + i` sits in the reorder buffer.
     fn sack_mask(&self) -> Vec<u8> {
-        let Some(top) = self.reorder.keys().map(|&s| seq_diff(s, self.ack_nr)).max() else {
+        let diffs = || self.reorder.keys().map(|&s| seq_diff(s, self.ack_nr)).filter(|&d| d >= 2);
+        let Some(top) = diffs().max() else {
             return Vec::new();
         };
         let mut mask = vec![0u8; (top as usize - 1).div_ceil(32) * 4];
-        for &s in self.reorder.keys() {
-            let i = seq_diff(s, self.ack_nr) as usize - 2;
+        for d in diffs() {
+            let i = d as usize - 2;
             mask[i / 8] |= 1 << (i % 8);
         }
         mask
@@ -332,6 +407,7 @@ impl Actor {
         self.seq_nr = seq.wrapping_add(1);
         self.send_raw(if fin { Kind::Fin } else { Kind::Data }, seq, &payload);
         self.flight_bytes += payload.len();
+        self.held_bytes += payload.len();
         self.inflight.push_back(Out { seq, fin, payload, sent: Instant::now(), retransmits: 0, sacked: false });
     }
 
@@ -347,6 +423,9 @@ impl Actor {
         while !self.fin_sent {
             let limit = self.cwnd.min(self.peer_wnd);
             if !(self.inflight.is_empty() || self.flight_bytes < limit) {
+                break;
+            }
+            if self.inflight.len() >= MAX_INFLIGHT || self.held_bytes >= MAX_HELD_BYTES {
                 break;
             }
             let mut p = self.link.pipe.lock().unwrap();
@@ -390,10 +469,19 @@ impl Actor {
             _ => {}
         }
         self.peer_wnd = h.wnd_size as usize;
+        if matches!(h.kind, Kind::Data | Kind::Fin) && self.handshake_complete(h.ack_nr) {
+            self.handshake = None;
+        }
         self.on_ack(h.ack_nr, h.kind == Kind::State, &packet.sack);
         if matches!(h.kind, Kind::Data | Kind::Fin) {
             self.on_data(&h, payload);
         }
+    }
+
+    fn handshake_complete(&self, ack: u16) -> bool {
+        self.handshake.as_ref().is_some_and(|h| {
+            seq_diff(ack, h.first_ack) >= 0 && seq_diff(ack, self.seq_nr.wrapping_sub(1)) <= 0
+        })
     }
 
     fn on_ack(&mut self, ack: u16, pure: bool, sack: &[u8]) {
@@ -417,6 +505,7 @@ impl Actor {
                     break;
                 }
                 let f = self.inflight.pop_front().unwrap();
+                self.held_bytes -= f.payload.len();
                 if !f.sacked {
                     acked += f.payload.len();
                     self.flight_bytes -= f.payload.len();
@@ -546,6 +635,8 @@ impl Actor {
         if fin {
             self.peer_fin = true;
             p.eof = true;
+            self.reorder.clear();
+            self.reorder_bytes = 0;
         }
         let reader = p.reader.take();
         drop(p);
@@ -556,6 +647,10 @@ impl Actor {
 
     fn on_timer(&mut self) {
         let now = Instant::now();
+        if self.handshake.as_ref().is_some_and(|h| now >= h.reap_at) {
+            self.failure = Some((io::ErrorKind::TimedOut, "no data after handshake"));
+            return;
+        }
         let idle = if self.lingering() { LINGER.min(self.idle) } else { self.idle };
         if now >= self.last_recv + idle {
             self.failure = Some((io::ErrorKind::TimedOut, "connection idle"));

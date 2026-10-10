@@ -225,13 +225,7 @@ where
         4 => Message::Have {
             index: be32(payload, 0)?,
         },
-        5 => {
-            // Pad to a multiple of 8 so the caller can index it bitwise.
-            let pad = (8 - payload.len() % 8) % 8;
-            let mut bits = payload.to_vec();
-            bits.extend(std::iter::repeat(0).take(pad));
-            Message::Bitfield { bits }
-        }
+        5 => Message::Bitfield { bits: payload.to_vec() },
         6 => Message::Request {
             index: be32(payload, 0)?,
             begin: be32(payload, 4)?,
@@ -549,12 +543,7 @@ mod tests {
         let mut input = framed.as_slice();
         match read_message(&mut input).await.unwrap() {
             Message::Bitfield { bits } => {
-                assert_eq!(bits[0], 0b1110_0000, "payload bytes must survive");
-                assert_eq!(
-                    bits.len() % 8,
-                    0,
-                    "decoded bitfield must be padded to a byte boundary"
-                );
+                assert_eq!(bits, vec![0b1110_0000], "payload must be delivered as sent, unpadded");
             }
             other => panic!("expected Bitfield, got {other:?}"),
         }

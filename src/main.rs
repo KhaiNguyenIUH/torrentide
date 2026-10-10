@@ -184,7 +184,7 @@ async fn main() -> Result<()> {
             let settings = torrust::store::Store::open().load_settings();
             torrust::session::Session::run(settings, !no_tui).await
         }
-        Command::WebuiPassword => set_webui_password(),
+        Command::WebuiPassword => set_webui_password().await,
         Command::Add { source, output } => {
             use torrust::ipc::Delivery;
             match torrust::ipc::send_add(&source, output.as_deref()).await? {
@@ -254,10 +254,54 @@ async fn main() -> Result<()> {
     }
 }
 
-fn set_webui_password() -> Result<()> {
+struct EchoOff(String);
+
+impl EchoOff {
+    #[cfg(unix)]
+    fn new() -> Option<EchoOff> {
+        use std::io::IsTerminal;
+        use std::process::{Command, Stdio};
+        if !std::io::stdin().is_terminal() {
+            return None;
+        }
+        let saved = Command::new("stty").arg("-g").stdin(Stdio::inherit()).output().ok()?;
+        let saved = String::from_utf8(saved.stdout).ok()?.trim().to_owned();
+        let off = Command::new("stty").arg("-echo").status().ok()?;
+        (off.success() && !saved.is_empty()).then_some(EchoOff(saved))
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> Option<EchoOff> {
+        None
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = std::process::Command::new("stty").arg(&self.0).status();
+    }
+}
+
+async fn set_webui_password() -> Result<()> {
     eprintln!("New web UI password (one line):");
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line).context("reading the password")?;
+    let echo = EchoOff::new();
+    let read = tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).map(|_| line)
+    });
+    let line = tokio::select! {
+        r = read => r.context("reading the password")?.context("reading the password")?,
+        _ = tokio::signal::ctrl_c() => {
+            drop(echo);
+            eprintln!();
+            std::process::exit(130);
+        }
+    };
+    if echo.is_some() {
+        drop(echo);
+        eprintln!();
+    }
     let password = line.trim_end_matches(['\r', '\n']);
     if password.is_empty() {
         bail!("the password cannot be empty");
