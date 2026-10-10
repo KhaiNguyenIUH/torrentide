@@ -178,6 +178,7 @@ fn settings(dir: &Path) -> Settings {
         port_forwarding: false,
         lsd: false,
         notifications: false,
+        allow_local_urls: true,
         ..Settings::default()
     }
 }

@@ -1723,6 +1723,8 @@ const SCHEDULE_ON: usize = 19;
 const SCHEDULE_DOWN: usize = 20;
 const SCHEDULE_UP: usize = 21;
 const SCHEDULE_RULE: usize = 22;
+const WEBUI_LAN: usize = 23;
+const LOCAL_URLS: usize = 24;
 
 fn settings_form(settings: &Settings) -> Form {
     let mut form = Form::new(
@@ -1757,6 +1759,8 @@ fn settings_form(settings: &Settings) -> Form {
             Field::number("Schedule limited down (KiB/s)", kib_text(settings.schedule.limited_down)),
             Field::number("Schedule limited up (KiB/s)", kib_text(settings.schedule.limited_up)),
             Field::text("Schedule rule (e.g. weekdays 09-18 limited)", ""),
+            Field::toggle("Web UI on LAN (needs password)", settings.webui.lan),
+            Field::toggle("Allow local network URLs", settings.allow_local_urls),
         ],
     );
     form.has_password = settings.webui.password.is_some();
@@ -1836,10 +1840,11 @@ fn parse_settings(form: &Form, base: &Settings) -> Result<Settings, String> {
         move_completed_dir,
         encryption,
         utp: f[13].on,
-        webui: WebUiSettings { enabled: f[WEBUI_ON].on, port: webui_port, password, lan: base.webui.lan },
+        webui: WebUiSettings { enabled: f[WEBUI_ON].on, port: webui_port, password, lan: f[WEBUI_LAN].on },
         blocklist,
         notifications: f[NOTIFY_FIELD].on,
         schedule,
+        allow_local_urls: f[LOCAL_URLS].on,
         ..base.clone()
     })
 }
@@ -4933,11 +4938,14 @@ mod session_tests {
         let mut form = settings_form(&base);
         form.fields[SCHEDULE_RULE].input.text = "weekdays 09-18 limited; sat 00-24 off".to_string();
         form.fields[NOTIFY_FIELD].on = true;
+        form.fields[WEBUI_LAN].on = true;
+        form.fields[LOCAL_URLS].on = true;
         form.fields[BLOCKLIST_FIELD].input.text = String::new();
         form.fields[SCHEDULE_DOWN].input.text = "5".to_string();
         let parsed = parse_settings(&form, &base).unwrap();
         assert_eq!(parsed.blocklist, None);
         assert!(parsed.notifications);
+        assert!(parsed.webui.lan && parsed.allow_local_urls);
         assert_eq!(parsed.schedule.limited_down, 5120);
         assert_eq!(parsed.schedule.utc_offset_minutes, 60);
         assert_eq!(parsed.schedule.grid[0][9], crate::schedule::Slot::Limited);

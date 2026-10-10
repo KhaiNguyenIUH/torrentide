@@ -511,6 +511,8 @@ fn encode_settings(s: &Settings) -> Vec<u8> {
         d.insert(b"blocklist".to_vec(), Value::Bytes(path_bytes(p)));
     }
     d.insert(b"notifications".to_vec(), int(s.notifications as u64));
+    d.insert(b"webui_lan".to_vec(), int(s.webui.lan as u64));
+    d.insert(b"allow_local_urls".to_vec(), int(s.allow_local_urls as u64));
     let sc = &s.schedule;
     d.insert(b"schedule_enabled".to_vec(), int(sc.enabled as u64));
     d.insert(b"schedule_grid".to_vec(), Value::Bytes(sc.to_string_grid().into_bytes()));
@@ -571,6 +573,12 @@ fn decode_settings(raw: &[u8]) -> Result<Settings> {
     s.webui.password = v.get_str_opt("webui_password").filter(|p| !p.is_empty()).map(str::to_owned);
     s.move_completed_dir = v.get_opt("move_completed_dir").map(bytes_path).transpose()?.filter(|p| !p.as_os_str().is_empty());
     s.blocklist = v.get_opt("blocklist").map(bytes_path).transpose()?.filter(|p| !p.as_os_str().is_empty());
+    if let Some(n) = v.get_int_opt("webui_lan") {
+        s.webui.lan = n != 0;
+    }
+    if let Some(n) = v.get_int_opt("allow_local_urls") {
+        s.allow_local_urls = n != 0;
+    }
     if let Some(n) = v.get_int_opt("notifications") {
         s.notifications = n != 0;
     }
@@ -1027,11 +1035,14 @@ mod tests {
         let s = Settings {
             encryption: EncryptionMode::Require,
             utp: false,
-            webui: crate::state::WebUiSettings { enabled: true, port: 9123, password: Some(hash_password("pw")), lan: false },
+            webui: crate::state::WebUiSettings { enabled: true, port: 9123, password: Some(hash_password("pw")), lan: true },
+            allow_local_urls: true,
             ..Settings::default()
         };
         store.save_settings(&s).unwrap();
         assert_eq!(store.load_settings(), s);
+        let d = Settings::default();
+        assert!(!d.webui.lan && !d.allow_local_urls);
     }
 
     #[test]

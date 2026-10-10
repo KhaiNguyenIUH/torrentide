@@ -159,7 +159,7 @@ async fn run(corrupt_first: bool) -> usize {
         ..Default::default()
     };
     let engine = Engine::with_options(meta, ui.clone(), cmd_rx, opts);
-    match tokio::time::timeout(Duration::from_secs(60), engine.run(dir.clone())).await {
+    match tokio::time::timeout(Duration::from_secs(60), torrust::webseed::ALLOW_LOCAL.scope(true, engine.run(dir.clone()))).await {
         Ok(r) => r.expect("engine failed"),
         Err(_) => {
             let st = ui.read().await;

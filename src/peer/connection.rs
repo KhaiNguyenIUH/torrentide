@@ -401,7 +401,7 @@ async fn negotiate(
     } else {
         stream
     };
-    wire::handshake_outgoing(&mut stream, &infohash.0, true, true, pex).await?;
+    wire::handshake_outgoing(&mut stream, &infohash.0, pex, true, pex).await?;
     let hs = wire::handshake_incoming(&mut stream).await?;
     if hs.infohash != infohash.0 {
         return Err(anyhow!(
@@ -604,7 +604,7 @@ pub async fn accept_handshaken(
     }
     let (rd, mut wr) = split(stream);
     // The dialer waits for our half of the handshake before sending anything.
-    wire::handshake_outgoing(&mut wr, &infohash.0, true, true, ext.port.is_some()).await?;
+    wire::handshake_outgoing(&mut wr, &infohash.0, ext.port.is_some(), true, ext.port.is_some()).await?;
 
     // Announce acceptance before the tasks take ownership of the sender.
     let _ = inbound_tx.send(FromPeer::Accepted(addr));

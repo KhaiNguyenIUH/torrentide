@@ -42,10 +42,11 @@ const TOKEN_COOKIE: &str = "torrust_token";
 const CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
                    connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
-/// Where to listen: loopback unless a password protects the interface.
+/// Where to listen: loopback unless LAN access is on and a password protects
+/// the interface.
 pub fn bind_addr(settings: &WebUiSettings) -> SocketAddr {
     let protected = settings.password.as_deref().is_some_and(|p| !p.is_empty());
-    let ip = if protected {
+    let ip = if protected && settings.lan {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     } else {
         IpAddr::V4(Ipv4Addr::LOCALHOST)
@@ -270,6 +271,9 @@ async fn respond(
         Err(_) => return error(408, "request timed out"),
     };
     let gate = match &guard.access {
+        Access::Password(_) if !literal_host(&req) => {
+            return error(403, "use the server's IP address or localhost in the URL");
+        }
         Access::Password(pw) => guard.check_password(pw, &req, ip).await,
         Access::Token(token) => token_gate(&req, token),
     };
@@ -459,16 +463,23 @@ fn host_of(url: &str) -> &str {
     rest.split(['/', '?', '#']).next().unwrap_or("")
 }
 
-/// True when the request's Host names this machine's loopback interface.
-fn loopback_host(req: &Request) -> bool {
-    let Some(host) = req.header("host") else {
-        return false;
-    };
-    let name = match host.strip_prefix('[') {
+fn host_name(req: &Request) -> Option<&str> {
+    let host = req.header("host")?;
+    Some(match host.strip_prefix('[') {
         Some(v6) => v6.split(']').next().unwrap_or(""),
         None => host.rsplit_once(':').map_or(host, |(h, _)| h),
-    };
-    name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "::1"
+    })
+}
+
+/// True when the request's Host names this machine's loopback interface.
+fn loopback_host(req: &Request) -> bool {
+    host_name(req).is_some_and(|name| name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "::1")
+}
+
+/// True when the Host is an IP literal or `localhost`: a DNS name could be a
+/// rebinding page reaching this server under its own origin.
+fn literal_host(req: &Request) -> bool {
+    host_name(req).is_some_and(|name| name.eq_ignore_ascii_case("localhost") || name.parse::<IpAddr>().is_ok())
 }
 
 /// A state-changing request must name its origin and it must be this server.
@@ -1062,7 +1073,27 @@ mod tests {
         s.password = Some(String::new());
         assert!(bind_addr(&s).ip().is_loopback());
         s.password = Some("pw".into());
+        assert_eq!(bind_addr(&s), "127.0.0.1:9000".parse().unwrap());
+        s.lan = true;
         assert_eq!(bind_addr(&s), "0.0.0.0:9000".parse().unwrap());
+        s.password = None;
+        assert!(bind_addr(&s).ip().is_loopback());
+        s.password = Some(String::new());
+        assert!(bind_addr(&s).ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn password_mode_requires_ip_or_localhost_host() {
+        let (state, _rx) = fake_state(true);
+        let addr = start(state, Access::Password("s3cret".into()), IO_TIMEOUT).await;
+        let auth = "Authorization: Basic YWRtaW46czNjcmV0\r\n";
+        let with_host = |h: &str| format!("GET /api/state HTTP/1.1\r\nHost: {h}\r\n{auth}\r\n").into_bytes();
+        for bad in ["evil.example", "evil.example:80", "127.0.0.1.evil.example"] {
+            assert_eq!(raw(addr, &with_host(bad)).await.0, 403, "{bad}");
+        }
+        for ok in ["localhost:8080", "LOCALHOST", "192.168.1.5:8080", "[::1]:8080", "[fe80::1]:80"] {
+            assert_eq!(raw(addr, &with_host(ok)).await.0, 200, "{ok}");
+        }
     }
 
     #[tokio::test]

@@ -215,31 +215,40 @@ async fn receive(sock: Arc<UdpSocket>, shared: Arc<Mutex<Shared>>) {
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         };
-        let cookie = shared.lock().unwrap().cookie.clone();
-        let Some((port, hashes)) = parse_announce(&buf[..n], &cookie) else {
-            continue;
-        };
-        let mut peer = from;
-        peer.set_port(port);
-        let now = Instant::now();
-        let mut s = shared.lock().unwrap();
+        deliver(&shared, &buf[..n], from);
+    }
+}
+
+/// Handle one datagram. Only LAN sources count: a unicast announce from the
+/// internet must not make us dial an address of the sender's choosing.
+fn deliver(shared: &Mutex<Shared>, buf: &[u8], from: SocketAddr) {
+    if !crate::peer::pex::is_lan(from.ip()) {
+        return;
+    }
+    let cookie = shared.lock().unwrap().cookie.clone();
+    let Some((port, hashes)) = parse_announce(buf, &cookie) else {
+        return;
+    };
+    let mut peer = from;
+    peer.set_port(port);
+    let now = Instant::now();
+    let mut s = shared.lock().unwrap();
+    if s.seen.len() > SEEN_CAP {
+        s.seen.retain(|_, t| now.duration_since(*t) < SEEN_TTL);
         if s.seen.len() > SEEN_CAP {
-            s.seen.retain(|_, t| now.duration_since(*t) < SEEN_TTL);
-            if s.seen.len() > SEEN_CAP {
-                s.seen.clear();
-            }
+            s.seen.clear();
         }
-        for h in hashes {
-            if !s.torrents.contains_key(&h) {
-                continue;
-            }
-            if s.seen.get(&(from.ip(), h)).is_some_and(|t| now.duration_since(*t) < SEEN_TTL) {
-                continue;
-            }
-            s.seen.insert((from.ip(), h), now);
-            if s.torrents[&h].tx.send(vec![peer]).is_err() {
-                s.torrents.remove(&h);
-            }
+    }
+    for h in hashes {
+        if !s.torrents.contains_key(&h) {
+            continue;
+        }
+        if s.seen.get(&(from.ip(), h)).is_some_and(|t| now.duration_since(*t) < SEEN_TTL) {
+            continue;
+        }
+        s.seen.insert((from.ip(), h), now);
+        if s.torrents[&h].tx.send(vec![peer]).is_err() {
+            s.torrents.remove(&h);
         }
     }
 }
@@ -303,6 +312,26 @@ mod tests {
         s.torrents.insert([1; 20], Entry { tx, fresh: true });
         assert_eq!(due(&mut s).len(), 1);
         assert!(due(&mut s).is_empty());
+    }
+
+    #[test]
+    fn announces_from_non_lan_sources_are_dropped() {
+        let shared = Mutex::new(Shared {
+            cookie: "me".into(),
+            port: 1,
+            group_port: 1,
+            torrents: HashMap::new(),
+            sent: HashMap::new(),
+            seen: HashMap::new(),
+        });
+        let (tx, mut rx) = unbounded_channel();
+        shared.lock().unwrap().torrents.insert([7; 20], Entry { tx, fresh: true });
+        let msg = announce_message("239.192.152.143:6771", 4444, &[[7; 20]], "other");
+        deliver(&shared, msg.as_bytes(), "8.8.8.8:6771".parse().unwrap());
+        deliver(&shared, msg.as_bytes(), "[2606:4700::1]:6771".parse().unwrap());
+        assert!(rx.try_recv().is_err());
+        deliver(&shared, msg.as_bytes(), "192.168.1.7:6771".parse().unwrap());
+        assert_eq!(rx.try_recv().unwrap(), vec!["192.168.1.7:4444".parse::<SocketAddr>().unwrap()]);
     }
 
     #[tokio::test]

@@ -118,6 +118,9 @@ pub struct PeerPool {
     super_seed: bool,
     reveal: HashMap<SocketAddr, Reveal>,
     super_seed_timeout: Duration,
+    /// Per address, `Disconnected` events still due from connections that a
+    /// duplicate replaced: they must not evict the connection that won.
+    stray: HashMap<SocketAddr, u32>,
 }
 
 fn ext_for(meta: &Metainfo, port: u16) -> Ext {
@@ -166,6 +169,7 @@ impl PeerPool {
             super_seed: false,
             reveal: HashMap::new(),
             super_seed_timeout: SUPER_SEED_TIMEOUT,
+            stray: HashMap::new(),
         }
     }
 
@@ -486,6 +490,9 @@ impl PeerPool {
             {
                 continue;
             }
+            if source == Source::Pex && crate::peer::pex::is_lan(p.ip) {
+                continue;
+            }
             if self.blocked(&addr) {
                 blocked += 1;
                 continue;
@@ -593,6 +600,31 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
     }
 }
 
+    /// Whether a new connection to `addr` should replace one we already have.
+    /// When both sides dial each other at once (LSD announces are symmetric,
+    /// and uTP reuses the listen port) each ends up with two connections under
+    /// one address. Both sides keep the one dialled by whoever has the lower
+    /// (peer id, listen port), so exactly one survives.
+    fn new_wins(&self, addr: SocketAddr, their_id: &[u8; 20], inbound: bool) -> bool {
+        match self.peers.get(&addr) {
+            Some(old) if old.inbound != inbound => {
+                let we_lead = (super::wire::local_peer_id(), self.port) < (their_id, addr.port());
+                we_lead != inbound
+            }
+            _ => true,
+        }
+    }
+
+    /// Close the connection a duplicate is about to replace, without treating
+    /// the peer as gone.
+    async fn retire_duplicate(&mut self, addr: SocketAddr) {
+        if let Some(old) = self.peers.remove(&addr) {
+            self.retired_uploaded += old.state.lock().await.uploaded;
+            let _ = old.tx.send(ToPeer::Close);
+            *self.stray.entry(addr).or_default() += 1;
+        }
+    }
+
     /// Take over an inbound socket whose handshake the caller already read.
     pub async fn adopt_inbound(&mut self, stream: PeerStream, addr: SocketAddr, hs: Handshake) {
         if self.blocked(&addr) {
@@ -602,6 +634,10 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
         }
         if self.peers.len() >= self.max_peers {
             tracing::debug!(peer = %addr, "pool full, dropping inbound connection");
+            return;
+        }
+        if !self.new_wins(addr, &hs.peer_id, true) {
+            tracing::debug!(peer = %addr, "already connected the other way, dropping inbound connection");
             return;
         }
         let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<FromPeer>();
@@ -638,6 +674,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                 if !complete {
                     let _ = h.tx.send(ToPeer::SetInterested(true));
                 }
+                self.retire_duplicate(addr).await;
                 self.peers.insert(addr, h);
                 self.manage_new_peer(addr).await;
             }
@@ -715,6 +752,13 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                     let _ = handle.tx.send(ToPeer::Close);
                     return;
                 }
+                if !self.new_wins(addr, &handle.peer_id, false) {
+                    tracing::debug!(peer = %addr, "already connected the other way, dropping new connection");
+                    let _ = handle.tx.send(ToPeer::Close);
+                    *self.stray.entry(addr).or_default() += 1;
+                    return;
+                }
+                self.retire_duplicate(addr).await;
                 let managed = handle.state.lock().await.super_seeded;
                 if !managed && dialed_at.is_some_and(|g| g != self.seeder_gen) {
                     if let Some(s) = &self.seeder {
@@ -757,6 +801,13 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                 self.super_seed_saw(addr, i);
             }
             FromPeer::Disconnected(_) => {
+                if let Some(n) = self.stray.get_mut(&addr) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.stray.remove(&addr);
+                    }
+                    return;
+                }
                 self.reveal.remove(&addr);
                 if let Some(p) = self.peers.remove(&addr) {
                     self.retired_uploaded += p.state.lock().await.uploaded;
@@ -1532,6 +1583,37 @@ mod tests {
         assert_eq!(pool.connecting, 0, "a blocked address is never dialled");
     }
 
+    #[test]
+    fn both_ends_of_a_simultaneous_open_keep_the_same_connection() {
+        let id = *crate::peer::wire::local_peer_id();
+        let side = |port: u16, other: u16, old_inbound: bool| {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut pool = PeerPool::new(small_meta(4), None, port, tx, Limits::default(), MAX_PEERS, true);
+            let addr: SocketAddr = format!("10.0.0.1:{other}").parse().unwrap();
+            let (mut h, _) = fake_handle_with_rx(Bitfield::with_pieces(4), false, 0);
+            h.inbound = old_inbound;
+            pool.peers.insert(addr, h);
+            pool.new_wins(addr, &id, !old_inbound)
+        };
+        for (a_old_inbound, b_old_inbound) in [(false, false), (true, true), (false, true), (true, false)] {
+            let a_keeps_dialled_by_a = side(2000, 1000, a_old_inbound) == a_old_inbound;
+            let b_keeps_dialled_by_a = side(1000, 2000, b_old_inbound) != b_old_inbound;
+            assert_eq!(a_keeps_dialled_by_a, b_keeps_dialled_by_a);
+        }
+    }
+
+    #[test]
+    fn pex_discovered_lan_addresses_are_dropped_but_other_sources_keep_them() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = PeerPool::new(small_meta(4), None, 6881, tx, Limits::default(), MAX_PEERS, true);
+        let lite = |s: &str| SocketAddrLite { ip: s.parse().unwrap(), port: 1 };
+        let lan = ["127.0.0.1", "10.0.0.5", "172.16.3.4", "192.168.1.9", "169.254.1.1", "::1", "fd00::1", "fe80::2"];
+        let peers: Vec<_> = lan.iter().map(|s| lite(s)).chain([lite("8.8.8.8")]).collect();
+        let fresh = pool.discover_from(&peers, Source::Pex);
+        assert_eq!(fresh, vec!["8.8.8.8:1".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(pool.discover_from(&peers[..1], Source::Lsd).len(), 1);
+    }
+
     fn lite(addr: SocketAddr) -> SocketAddrLite {
         SocketAddrLite { ip: addr.ip(), port: addr.port() }
     }
@@ -1602,48 +1684,48 @@ mod tests {
     async fn pex_tick_sends_added_then_dropped_never_the_recipient() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut pool = PeerPool::new(small_meta(16), None, 6881, tx, Limits::default(), MAX_PEERS, true);
-        let mut a = pex_peer(&mut pool, "10.0.0.1:1000", Some(7));
-        let mut b = pex_peer(&mut pool, "10.0.0.2:2000", Some(8));
-        let mut c = pex_peer(&mut pool, "10.0.0.3:3000", None);
+        let mut a = pex_peer(&mut pool, "11.0.0.1:1000", Some(7));
+        let mut b = pex_peer(&mut pool, "11.0.0.2:2000", Some(8));
+        let mut c = pex_peer(&mut pool, "11.0.0.3:3000", None);
 
         pool.pex_tick().await;
         let (id, m) = sent_pex(&mut a).unwrap();
         assert_eq!(id, 7);
         let mut added = m.added.clone();
         added.sort();
-        assert_eq!(added, vec!["10.0.0.2:2000".parse().unwrap(), "10.0.0.3:3000".parse().unwrap()]);
+        assert_eq!(added, vec!["11.0.0.2:2000".parse().unwrap(), "11.0.0.3:3000".parse().unwrap()]);
         assert!(m.dropped.is_empty());
         let (id, m) = sent_pex(&mut b).unwrap();
         assert_eq!(id, 8);
-        assert!(!m.added.contains(&"10.0.0.2:2000".parse().unwrap()));
+        assert!(!m.added.contains(&"11.0.0.2:2000".parse().unwrap()));
         assert_eq!(m.added.len(), 2);
         assert!(sent_pex(&mut c).is_none(), "peer without ut_pex gets nothing");
 
         pool.pex_tick().await;
         assert!(sent_pex(&mut a).is_none(), "nothing changed, nothing sent");
 
-        pool.peers.remove(&"10.0.0.3:3000".parse().unwrap());
+        pool.peers.remove(&"11.0.0.3:3000".parse().unwrap());
         pool.pex_tick().await;
         let (_, m) = sent_pex(&mut a).unwrap();
         assert!(m.added.is_empty());
-        assert_eq!(m.dropped, vec!["10.0.0.3:3000".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(m.dropped, vec!["11.0.0.3:3000".parse::<SocketAddr>().unwrap()]);
     }
 
     #[tokio::test]
     async fn pex_tick_skips_inbound_peers_without_a_listen_port() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut pool = PeerPool::new(small_meta(16), None, 6881, tx, Limits::default(), MAX_PEERS, true);
-        let mut a = pex_peer(&mut pool, "10.0.0.1:1000", Some(7));
-        let _b = pex_peer(&mut pool, "10.0.0.2:55555", None);
-        let _c = pex_peer(&mut pool, "10.0.0.3:55556", None);
-        for (addr, port) in [("10.0.0.2:55555", None), ("10.0.0.3:55556", Some(6881u16))] {
+        let mut a = pex_peer(&mut pool, "11.0.0.1:1000", Some(7));
+        let _b = pex_peer(&mut pool, "11.0.0.2:55555", None);
+        let _c = pex_peer(&mut pool, "11.0.0.3:55556", None);
+        for (addr, port) in [("11.0.0.2:55555", None), ("11.0.0.3:55556", Some(6881u16))] {
             let h = pool.peers.get_mut(&addr.parse().unwrap()).unwrap();
             h.inbound = true;
             h.state.try_lock().unwrap().listen_port = port;
         }
         pool.pex_tick().await;
         let (_, m) = sent_pex(&mut a).unwrap();
-        assert_eq!(m.added, vec!["10.0.0.3:6881".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(m.added, vec!["11.0.0.3:6881".parse::<SocketAddr>().unwrap()]);
     }
 
     #[tokio::test]

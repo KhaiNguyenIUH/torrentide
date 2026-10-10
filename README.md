@@ -63,7 +63,7 @@ Subscribe to RSS or Atom feeds (`http(s)` only) and torrents matching your inclu
 
 - Items already in the feed when you subscribe are not downloaded; only items that show up later are. The session logs `watching N existing items`.
 - Feeds and the items already seen are kept in `feeds.bencode` in the data directory, so a restart never re-adds anything.
-- A session also adds an `http(s)` link to a `.torrent` (up to 10 MiB), which is how feed items and the web UI's add box deliver torrents. `torrust add` accepts them too.
+- A session also adds an `http(s)` link to a `.torrent` (up to 10 MiB), which is how feed items and the web UI's add box deliver torrents. `torrust add` accepts them too. Links, feeds, redirects and web seeds that resolve to loopback, private (LAN), link-local, CGNAT or other non-public addresses are refused with "address not allowed" unless you turn on "Allow local network URLs" in settings (`allow_local_urls`). Peers learned through peer exchange on those addresses are skipped too, and local peer discovery only accepts announces from your own network.
 
 ## Block list, schedule and notifications
 
@@ -78,7 +78,7 @@ Subscribe to RSS or Atom feeds (`http(s)` only) and torrents matching your inclu
 
 A small browser interface for the session, off by default. It takes links and magnets only and never shows or accepts local paths or folders.
 
-- Without a password it listens on `127.0.0.1` only and needs an access token: the session creates a random 128-bit token (kept in `webui.token` in the data directory, readable by you alone), logs the one-time URL `http://127.0.0.1:PORT/?token=...` and prints it when `torrust session` starts. Opening that URL stores the token in an HttpOnly cookie and redirects to `/`. Scripts can send `Authorization: Bearer <token>` instead. With a password it listens on all interfaces and asks for it (HTTP Basic, any user name) on every request. After five wrong passwords from one address it answers 429 for a growing time (up to 15 minutes). Use a reverse proxy with TLS if you expose it beyond your network; the connection itself is plain HTTP.
+- Without a password it listens on `127.0.0.1` only and needs an access token: the session creates a random 128-bit token (kept in `webui.token` in the data directory, readable by you alone), logs the one-time URL `http://127.0.0.1:PORT/?token=...` and prints it when `torrust session` starts. Opening that URL stores the token in an HttpOnly cookie and redirects to `/`. Scripts can send `Authorization: Bearer <token>` instead. With a password it still listens on `127.0.0.1` only, and asks for the password (HTTP Basic, any user name) on every request; the `Host` header must be an IP address or `localhost`, which blocks DNS rebinding. The settings screen has "Web UI on LAN (needs password)" (`webui_lan`): only with that on and a password set does it listen on all interfaces, and the session then logs a warning, because the connection is plain HTTP. After five wrong passwords from one address it answers 429 for a growing time (up to 15 minutes). To reach it from another machine prefer an SSH tunnel over LAN mode: `ssh -L 8080:127.0.0.1:8080 host`, then open `http://127.0.0.1:8080/` locally. Use a reverse proxy with TLS if you must expose it beyond that.
 - Enable it and set the password without putting the password in shell history:
 
       torrust webui-password        # type the password and press Enter

@@ -34,8 +34,8 @@ pub struct ParsedFeed {
     pub items: Vec<Item>,
 }
 
-pub async fn fetch(url: &str) -> Result<Vec<Item>> {
-    let body = tokio::time::timeout(FETCH_TIMEOUT, crate::webseed::get_capped(url, MAX_FEED_BYTES))
+pub async fn fetch(url: &str, allow_local: bool) -> Result<Vec<Item>> {
+    let body = tokio::time::timeout(FETCH_TIMEOUT, crate::webseed::get_capped(url, MAX_FEED_BYTES, allow_local))
         .await
         .map_err(|_| anyhow!("feed fetch timed out"))??;
     Ok(parse_at(&String::from_utf8_lossy(&body), url)?.items)
@@ -686,16 +686,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(serve(listener, RSS_REL));
-        let items = fetch(&format!("http://127.0.0.1:{port}/old")).await.unwrap();
+        let items = fetch(&format!("http://127.0.0.1:{port}/old"), true).await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "Rel");
         assert_eq!(
             items[0].torrent.as_deref(),
             Some(format!("http://127.0.0.1:{port}/dl/r.torrent").as_str())
         );
-        assert!(fetch(&format!("http://127.0.0.1:{port}/missing")).await.is_err());
-        assert!(fetch(&format!("http://127.0.0.1:{port}/big")).await.is_err());
-        assert!(fetch("ftp://x/").await.is_err());
+        assert!(fetch(&format!("http://127.0.0.1:{port}/missing"), true).await.is_err());
+        assert!(fetch(&format!("http://127.0.0.1:{port}/big"), true).await.is_err());
+        assert!(fetch("ftp://x/", true).await.is_err());
     }
 
     const RSS_REL: &str = "<rss><channel><item><title>Rel</title><link>/dl/r.torrent</link></item></channel></rss>";

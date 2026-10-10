@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,14 @@ pub const MAX_UDP_PAYLOAD: usize = 4096;
 pub const MAX_MESSAGE_LEN: usize = 2048;
 /// Kademlia `k`: bucket size and the number of closest nodes to ask.
 pub const K: usize = 8;
+/// Longest announce token we will store or echo.
+const MAX_TOKEN_LEN: usize = 64;
+/// A contact heard from within this window is "good" (BEP 5).
+const FRESH_FOR: Duration = Duration::from_secs(15 * 60);
+/// Unanswered queries after which a contact is "bad" and may be replaced.
+const BAD_FAILURES: u32 = 2;
+/// How often the token secret rotates; the previous one is still accepted.
+const SECRET_ROTATION: Duration = Duration::from_secs(5 * 60);
 
 /// How long a single query waits for its matching response.
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -327,8 +335,6 @@ fn socket_from_compact6(b: &[u8]) -> Result<SocketAddr> {
     Ok(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port))
 }
 
-
-
 /// One node in a `find_node` / `get_peers` response: 20-byte id plus a compact
 /// address, i.e. BEP 5's 26-byte compact node info.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,30 +439,17 @@ pub struct QueryMsg {
     pub query: Query,
 }
 
-/// What came back in a `get_peers` `values` list: either a bare peer address or
-/// a full node entry (some clients include both).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerEntry {
-    Compact(SocketAddr),
-    Node(BencodedNode),
-}
-
-impl PeerEntry {
-    pub fn addr(&self) -> SocketAddr {
-        match self {
-            PeerEntry::Compact(a) => *a,
-            PeerEntry::Node(n) => n.addr,
-        }
-    }
-}
-
 /// The payload of a `y=r` message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponsePayload {
     /// `ping` and `announce_peer` return just the id.
     Empty,
     Nodes(Vec<BencodedNode>),
-    Peers(Vec<PeerEntry>),
+    GetPeers {
+        token: Vec<u8>,
+        nodes: Vec<BencodedNode>,
+        values: Vec<SocketAddr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,19 +512,14 @@ fn put_node_blob(out: &mut Vec<u8>, key: &str, nodes: &[BencodedNode]) {
     put_bytes(out, key, &blob);
 }
 
-fn put_peer_list(out: &mut Vec<u8>, key: &str, entries: &[PeerEntry]) {
+fn put_peer_list(out: &mut Vec<u8>, key: &str, addrs: &[SocketAddr]) {
     out.extend_from_slice(&bencoded_bytes(key.as_bytes()));
     out.push(b'l');
-    for e in entries {
-        match e {
-            PeerEntry::Compact(a) => {
-                if let Some(c) = socket_to_compact(*a) {
-                    out.extend_from_slice(&bencoded_bytes(&c));
-                } else if let Some(c6) = socket_to_compact6(*a) {
-                    out.extend_from_slice(&bencoded_bytes(&c6));
-                }
-            }
-            PeerEntry::Node(n) => out.extend_from_slice(&bencoded_bytes(&n.to_bytes())),
+    for a in addrs {
+        if let Some(c) = socket_to_compact(*a) {
+            out.extend_from_slice(&bencoded_bytes(&c));
+        } else if let Some(c6) = socket_to_compact6(*a) {
+            out.extend_from_slice(&bencoded_bytes(&c6));
         }
     }
     out.push(b'e');
@@ -598,9 +586,18 @@ pub fn encode_response(tid: TransactionId, id: NodeId, payload: &ResponsePayload
         ResponsePayload::Nodes(nodes) => {
             put_node_blob(&mut out, "nodes", nodes);
         }
-        ResponsePayload::Peers(entries) => {
-            put_bytes(&mut out, "token", &empty_token());
-            put_peer_list(&mut out, "values", entries);
+        ResponsePayload::GetPeers {
+            token,
+            nodes,
+            values,
+        } => {
+            if !nodes.is_empty() {
+                put_node_blob(&mut out, "nodes", nodes);
+            }
+            put_bytes(&mut out, "token", token);
+            if !values.is_empty() {
+                put_peer_list(&mut out, "values", values);
+            }
         }
     }
     out.push(b'e'); // r
@@ -629,10 +626,6 @@ pub fn encode_error(tid: TransactionId, code: i64, message: &str) -> Vec<u8> {
     out.extend_from_slice(&bencoded_bytes(b"e"));
     out.push(b'e');
     out
-}
-
-fn empty_token() -> Vec<u8> {
-    vec![0u8; 8]
 }
 
 // ---- decoding
@@ -746,11 +739,25 @@ pub fn decode_message(bytes: &[u8]) -> Result<Inbound> {
         "r" => {
             let r = v.get("r")?;
             let id = decode_node_id(r.get("id")?.as_bytes()?)?;
-            let payload = match r.get_opt("values") {
-                Some(values) => ResponsePayload::Peers(parse_peer_values(values)?),
-                None => match r.get_opt("nodes") {
+            let token = dict_bytes(r, "token")?;
+            let payload = match (token, r.get_opt("values")) {
+                (None, None) => match r.get_opt("nodes") {
                     Some(nodes) => ResponsePayload::Nodes(parse_nodes(nodes)?),
                     None => ResponsePayload::Empty,
+                },
+                (token, values) => ResponsePayload::GetPeers {
+                    token: token
+                        .filter(|t| t.len() <= MAX_TOKEN_LEN)
+                        .unwrap_or(&[])
+                        .to_vec(),
+                    nodes: r
+                        .get_opt("nodes")
+                        .and_then(|n| parse_nodes(n).ok())
+                        .unwrap_or_default(),
+                    values: match values {
+                        Some(v) => parse_peer_values(v)?,
+                        None => Vec::new(),
+                    },
                 },
             };
             Ok(Inbound::Response(Response { tid, id, payload }))
@@ -794,8 +801,9 @@ pub fn parse_nodes(v: &Value) -> Result<Vec<BencodedNode>> {
     Ok(out)
 }
 
-/// Parse a `values` list: 6-byte peer addresses and/or 26-byte node entries.
-fn parse_peer_values(v: &Value) -> Result<Vec<PeerEntry>> {
+/// Parse a `values` list: 6-byte and 18-byte compact peer addresses only.
+/// Anything else (notably 26-byte node records) is not a peer and is dropped.
+fn parse_peer_values(v: &Value) -> Result<Vec<SocketAddr>> {
     let list = v.as_list()?;
     let mut out = Vec::with_capacity(list.len());
     for item in list {
@@ -808,16 +816,12 @@ fn parse_peer_values(v: &Value) -> Result<Vec<PeerEntry>> {
         };
         match raw.len() {
             6 => match socket_from_compact(raw) {
-                Ok(a) => out.push(PeerEntry::Compact(a)),
+                Ok(a) => out.push(a),
                 Err(e) => tracing::trace!(error = %e, "skipping bad compact peer"),
             },
             18 => match socket_from_compact6(raw) {
-                Ok(a) => out.push(PeerEntry::Compact(a)),
+                Ok(a) => out.push(a),
                 Err(e) => tracing::trace!(error = %e, "skipping bad compact IPv6 peer"),
-            },
-            26 => match BencodedNode::from_bytes(raw) {
-                Ok(n) => out.push(PeerEntry::Node(n)),
-                Err(e) => tracing::trace!(error = %e, "skipping bad node value"),
             },
             n => tracing::trace!(len = n, "skipping peer value of unexpected length"),
         }
@@ -835,6 +839,17 @@ pub struct Contact {
     pub last_seen: Instant,
     /// Consecutive queries that went unanswered; high values get evicted first.
     pub failures: u32,
+    probing: bool,
+}
+
+impl Contact {
+    fn is_bad(&self) -> bool {
+        self.failures >= BAD_FAILURES
+    }
+
+    fn is_questionable(&self) -> bool {
+        self.last_seen.elapsed() > FRESH_FOR
+    }
 }
 
 /// One XOR bucket. Kademlia's tree is flattened to `BUCKET_COUNT` levels, which
@@ -855,29 +870,31 @@ impl Bucket {
         self.contacts.len()
     }
 
-    /// Most-recently-seen node last.
-    fn touch(&mut self, id: NodeId, addr: SocketAddr) {
-        if let Some(c) = self
-            .contacts
-            .iter_mut()
-            .find(|c| c.addr == addr || c.id == id)
-        {
-            c.id = id;
-            c.addr = addr;
-            c.last_seen = Instant::now();
-            c.failures = 0;
-            return;
+    /// Add or refresh a node. A known id is never rebound to another address.
+    /// A full bucket only gives way to a bad node; otherwise the stalest
+    /// questionable node is returned so the caller can ping it.
+    fn touch(&mut self, id: NodeId, addr: SocketAddr) -> Option<SocketAddr> {
+        if let Some(c) = self.contacts.iter_mut().find(|c| c.id == id) {
+            if c.addr == addr {
+                c.last_seen = Instant::now();
+                c.failures = 0;
+                c.probing = false;
+            }
+            return None;
         }
         if self.contacts.len() >= BUCKET_CAP {
-            // LRU-ish: drop whichever node we heard from longest ago.
-            let victim = self
-                .contacts
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, c)| c.last_seen)
-                .map(|(i, _)| i);
-            if let Some(i) = victim {
+            if let Some(i) = self.contacts.iter().position(Contact::is_bad) {
                 self.contacts.remove(i);
+            } else {
+                return self
+                    .contacts
+                    .iter_mut()
+                    .filter(|c| c.is_questionable() && !c.probing)
+                    .min_by_key(|c| c.last_seen)
+                    .map(|c| {
+                        c.probing = true;
+                        c.addr
+                    });
             }
         }
         self.contacts.push(Contact {
@@ -885,7 +902,9 @@ impl Bucket {
             addr,
             last_seen: Instant::now(),
             failures: 0,
+            probing: false,
         });
+        None
     }
 
     fn collect(&self, out: &mut Vec<Contact>) {
@@ -943,21 +962,40 @@ impl RoutingTable {
 
     /// Add or refresh a node. Unknown ids (from a compact address alone) are
     /// stored under the all-zero placeholder and upgraded once we learn the id.
-    pub fn insert(&mut self, id: NodeId, addr: SocketAddr) {
+    /// Returns an address worth pinging when the bucket is full of old nodes.
+    pub fn insert(&mut self, id: NodeId, addr: SocketAddr) -> Option<SocketAddr> {
         if id == self.id {
-            return;
+            return None;
         }
-        if let Some(bucket) = self.bucket_index(&id).map(|i| &mut self.buckets[i]) {
-            bucket.touch(id, addr);
-            return;
+        let known = self.get_by_addr(&addr).map(|c| c.id);
+        match known {
+            Some(old) if old == id => {}
+            Some(old) if old.0 == [0u8; 20] => {
+                for bucket in &mut self.buckets {
+                    bucket.contacts.retain(|c| c.addr != addr);
+                }
+            }
+            Some(_) => return None,
+            None => {}
         }
-        // No bucket index means it *is* us. Fall back to refreshing any existing
-        // entry for that address so a peer that reuses our port does not grow
-        // the table unboundedly.
-        for bucket in &mut self.buckets {
-            if let Some(c) = bucket.contacts.iter_mut().find(|c| c.addr == addr) {
-                c.last_seen = Instant::now();
-                return;
+        let i = self.bucket_index(&id)?;
+        self.buckets[i].touch(id, addr)
+    }
+
+    /// Count an unanswered query against `addr`.
+    pub fn fail(&mut self, addr: &SocketAddr) {
+        for c in self.buckets.iter_mut().flat_map(|b| b.contacts.iter_mut()) {
+            if c.addr == *addr {
+                c.failures = c.failures.saturating_add(1);
+            }
+        }
+    }
+
+    fn mark_dead(&mut self, addr: &SocketAddr) {
+        for c in self.buckets.iter_mut().flat_map(|b| b.contacts.iter_mut()) {
+            if c.addr == *addr {
+                c.failures = BAD_FAILURES;
+                c.probing = false;
             }
         }
     }
@@ -1009,7 +1047,7 @@ impl RoutingTable {
 
 // ---------------------------------------------------------------- DhtNode
 
-type PendingMap = HashMap<[u8; 2], oneshot::Sender<Inbound>>;
+type PendingMap = HashMap<[u8; 2], (SocketAddr, oneshot::Sender<Inbound>)>;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // A panic while holding the lock must not take the whole node down.
@@ -1023,30 +1061,74 @@ struct Shared {
     socket: Arc<UdpSocket>,
     table: Arc<Mutex<RoutingTable>>,
     pending: Arc<Mutex<PendingMap>>,
-    next_tx: Arc<AtomicU16>,
+    secrets: Arc<Mutex<Secrets>>,
     stopped: Arc<AtomicBool>,
 }
 
+struct Secrets {
+    current: [u8; 20],
+    previous: [u8; 20],
+    rotated: Instant,
+}
+
+impl Secrets {
+    fn new() -> Self {
+        Secrets {
+            current: rand::random(),
+            previous: rand::random(),
+            rotated: Instant::now(),
+        }
+    }
+
+    fn rotate_if_due(&mut self) {
+        if self.rotated.elapsed() >= SECRET_ROTATION {
+            self.previous = self.current;
+            self.current = rand::random();
+            self.rotated = Instant::now();
+        }
+    }
+}
+
+fn make_token(secret: &[u8; 20], ip: IpAddr, infohash: InfoHash) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(56);
+    buf.extend_from_slice(secret);
+    match ip {
+        IpAddr::V4(a) => buf.extend_from_slice(&a.octets()),
+        IpAddr::V6(a) => buf.extend_from_slice(&a.octets()),
+    }
+    buf.extend_from_slice(&infohash.0);
+    sha1_bytes(&buf).to_vec()
+}
+
 impl Shared {
-    fn begin(&self) -> (TransactionId, oneshot::Receiver<Inbound>) {
-        let raw = self.next_tx.fetch_add(1, Ordering::Relaxed).to_be_bytes();
+    fn begin(&self, addr: SocketAddr) -> Option<(TransactionId, oneshot::Receiver<Inbound>)> {
         let (tx, rx) = oneshot::channel();
-        lock(&self.pending).insert(raw, tx);
-        (TransactionId(raw), rx)
+        let mut pending = lock(&self.pending);
+        for _ in 0..32 {
+            let tid = TransactionId::random();
+            if let std::collections::hash_map::Entry::Vacant(e) = pending.entry(tid.0) {
+                e.insert((addr, tx));
+                return Some((tid, rx));
+            }
+        }
+        None
     }
 
     fn finish(&self, tid: TransactionId) {
-        // Always drop the entry, whether or not the caller still wants it.
         lock(&self.pending).remove(&tid.0);
     }
 
-    fn deliver(&self, tid: TransactionId, inbound: Inbound) {
-        let sender = lock(&self.pending).remove(&tid.0);
-        match sender {
-            Some(s) => {
-                let _ = s.send(inbound);
-            }
-            None => tracing::trace!(tid = %tid, "response for an unknown transaction"),
+    /// Hand a reply to the query waiting on `tid`, but only if it came from the
+    /// address that query was sent to.
+    fn deliver(&self, from: SocketAddr, tid: TransactionId, inbound: Inbound) -> bool {
+        let mut pending = lock(&self.pending);
+        if pending.get(&tid.0).map(|(a, _)| *a) != Some(from) {
+            tracing::trace!(%from, tid = %tid, "dropping reply that matches no pending query");
+            return false;
+        }
+        match pending.remove(&tid.0) {
+            Some((_, s)) => s.send(inbound).is_ok(),
+            None => false,
         }
     }
 
@@ -1054,16 +1136,41 @@ impl Shared {
         if id == self.id {
             return;
         }
-        lock(&self.table).insert(id, addr);
+        let stale = lock(&self.table).insert(id, addr);
+        if let Some(stale) = stale {
+            tokio::spawn(self.clone().probe(stale));
+        }
     }
 
-    /// Token handed out with `get_peers`, derived from our id and the infohash
-    /// so it is stable for one torrent without needing a state table.
-    fn token_for(&self, infohash: InfoHash) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(40);
-        buf.extend_from_slice(&self.id.0);
-        buf.extend_from_slice(&infohash.0);
-        sha1_bytes(&buf)[..8].to_vec()
+    async fn probe(self, addr: SocketAddr) {
+        let alive = match self.begin(addr) {
+            Some((tid, rx)) => {
+                let msg = encode_query(tid, self.id, &Query::Ping);
+                let sent = self.socket.send_to(&msg, addr).await.is_ok();
+                let got =
+                    sent && matches!(tokio::time::timeout(QUERY_TIMEOUT, rx).await, Ok(Ok(_)));
+                self.finish(tid);
+                got
+            }
+            None => true,
+        };
+        if !alive {
+            lock(&self.table).mark_dead(&addr);
+        }
+    }
+
+    /// Token for `ip` and `infohash`: SHA-1(secret || ip || infohash).
+    fn token_for(&self, ip: IpAddr, infohash: InfoHash) -> Vec<u8> {
+        let mut s = lock(&self.secrets);
+        s.rotate_if_due();
+        make_token(&s.current, ip, infohash)
+    }
+
+    fn token_valid(&self, ip: IpAddr, infohash: InfoHash, token: &[u8]) -> bool {
+        let mut s = lock(&self.secrets);
+        s.rotate_if_due();
+        make_token(&s.current, ip, infohash) == token
+            || make_token(&s.previous, ip, infohash) == token
     }
 }
 
@@ -1087,7 +1194,7 @@ impl DhtNode {
             socket: socket.clone(),
             table: Arc::new(Mutex::new(RoutingTable::new(node_id))),
             pending: Arc::new(Mutex::new(HashMap::new())),
-            next_tx: Arc::new(AtomicU16::new(rand::random())),
+            secrets: Arc::new(Mutex::new(Secrets::new())),
             stopped: Arc::new(AtomicBool::new(false)),
         };
         tracing::debug!(id = %node_id, addr = %socket.local_addr()?, "dht node started");
@@ -1171,7 +1278,10 @@ impl DhtNode {
 
     /// Send one query and wait for the matching response.
     async fn query(&self, addr: SocketAddr, q: Query) -> Result<Inbound> {
-        let (tid, rx) = self.shared.begin();
+        let (tid, rx) = self
+            .shared
+            .begin(addr)
+            .ok_or_else(|| DhtError::Protocol("too many queries in flight".into()))?;
         let msg = encode_query(tid, self.shared.id, &q);
         if msg.len() > MAX_MESSAGE_LEN {
             self.shared.finish(tid);
@@ -1194,6 +1304,7 @@ impl DhtNode {
             Ok(Err(_)) => Err(DhtError::Shutdown),
             Err(_) => {
                 tracing::trace!(%addr, query = q.name(), "dht query timed out");
+                lock(&self.shared.table).fail(&addr);
                 Err(DhtError::Timeout)
             }
         }
@@ -1289,18 +1400,20 @@ impl DhtNode {
     /// Returns whatever we found, which may be empty: an empty routing table or
     /// unresponsive nodes is a normal outcome, not an error.
     pub async fn get_peers(&self, infohash: InfoHash) -> Result<Vec<SocketAddr>> {
-        self.get_peers_rounds(infohash, 3).await
+        Ok(self.get_peers_rounds(infohash, 3).await?.0)
     }
 
+    /// Peers found, plus every node that answered with a token (id, address, token).
     async fn get_peers_rounds(
         &self,
         infohash: InfoHash,
         max_rounds: usize,
-    ) -> Result<Vec<SocketAddr>> {
+    ) -> Result<(Vec<SocketAddr>, Vec<(NodeId, SocketAddr, Vec<u8>)>)> {
         let target_id = NodeId(infohash.0);
         let mut seen_nodes: HashSet<SocketAddr> = HashSet::new();
         let mut peers: Vec<SocketAddr> = Vec::new();
         let mut peer_set: HashSet<SocketAddr> = HashSet::new();
+        let mut tokens: Vec<(NodeId, SocketAddr, Vec<u8>)> = Vec::new();
         let mut frontier = self.candidates(&target_id, &mut seen_nodes, K);
 
         for round in 0..max_rounds.max(1) {
@@ -1319,40 +1432,38 @@ impl DhtNode {
             let mut next: Vec<SocketAddr> = Vec::new();
 
             for (addr, result) in results {
-                let entries = match result {
+                match result {
                     Ok(Inbound::Response(r)) => {
-                        this.shared.add_contact(r.id, addr);
-                        match r.payload {
-                            ResponsePayload::Peers(p) => p,
-                            ResponsePayload::Nodes(n) => {
-                                n.into_iter().map(PeerEntry::Node).collect()
+                        if let ResponsePayload::GetPeers {
+                            token,
+                            nodes,
+                            values,
+                        } = r.payload
+                        {
+                            if !token.is_empty() {
+                                tokens.push((r.id, addr, token));
                             }
-                            ResponsePayload::Empty => Vec::new(),
+                            for p in values {
+                                if peer_set.insert(p) {
+                                    peers.push(p);
+                                }
+                            }
+                            for n in nodes {
+                                if n.id == this.shared.id {
+                                    continue;
+                                }
+                                this.shared.add_contact(n.id, n.addr);
+                                if next.len() < K && seen_nodes.insert(n.addr) {
+                                    next.push(n.addr);
+                                }
+                            }
                         }
                     }
                     Ok(Inbound::Error(e)) => {
                         tracing::debug!(%addr, code = e.code, "get_peers rejected by remote");
-                        Vec::new()
                     }
-                    Ok(_) => Vec::new(),
-                    Err(e) => {
-                        tracing::trace!(%addr, round, error = %e, "get_peers query failed");
-                        Vec::new()
-                    }
-                };
-
-                for entry in entries {
-                    let peer_addr = entry.addr();
-                    match entry {
-                        PeerEntry::Node(n) => this.shared.add_contact(n.id, n.addr),
-                        PeerEntry::Compact(_) => {}
-                    }
-                    if peer_set.insert(peer_addr) {
-                        peers.push(peer_addr);
-                    }
-                    if next.len() < K && seen_nodes.insert(peer_addr) {
-                        next.push(peer_addr);
-                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::trace!(%addr, round, error = %e, "get_peers query failed"),
                 }
             }
 
@@ -1365,26 +1476,28 @@ impl DhtNode {
         }
 
         tracing::debug!(infohash = %infohash, peers = peers.len(), "get_peers finished");
-        Ok(peers)
+        Ok((peers, tokens))
     }
 
-    /// Tell the closest known nodes we are serving `infohash` on `port`.
+    /// Tell the closest nodes that gave us a token we are serving `infohash`
+    /// on `port`, echoing the token each one returned from `get_peers`.
     ///
     /// Announcing is best-effort; failures are logged, not returned.
     pub async fn announce(&self, infohash: InfoHash, port: u16) -> Result<()> {
         let target_id = NodeId(infohash.0);
-        let mut seen = HashSet::new();
-        let targets = self.candidates(&target_id, &mut seen, K * 2);
-        if targets.is_empty() {
-            tracing::warn!(infohash = %infohash, "announce_peer skipped: routing table is empty");
+        let (_, mut tokens) = self.get_peers_rounds(infohash, 3).await?;
+        if tokens.is_empty() {
+            tracing::warn!(infohash = %infohash, "announce_peer skipped: no node gave a token");
             return Ok(());
         }
+        tokens.sort_by_key(|(id, _, _)| id.distance(&target_id));
+        tokens.truncate(K);
         let this = self;
-        let futures = targets.iter().map(move |&addr| {
+        let futures = tokens.into_iter().map(move |(_, addr, token)| {
             let q = Query::AnnouncePeer {
                 infohash,
                 port,
-                token: this.shared.token_for(infohash),
+                token,
                 implied_port: false,
             };
             async move { (addr, this.query(addr, q).await) }
@@ -1523,12 +1636,15 @@ async fn handle_datagram(shared: &Shared, from: SocketAddr, data: &[u8]) {
         Ok(Inbound::Query(q)) => respond_query(shared, from, q).await,
         Ok(Inbound::Response(r)) => {
             tracing::trace!(%from, id = %r.id, "dht response received");
-            shared.add_contact(r.id, from);
-            shared.deliver(r.tid, Inbound::Response(r));
+            let (id, tid) = (r.id, r.tid);
+            if shared.deliver(from, tid, Inbound::Response(r)) {
+                shared.add_contact(id, from);
+            }
         }
         Ok(Inbound::Error(e)) => {
             tracing::trace!(%from, code = e.code, "dht error received");
             shared.deliver(
+                from,
                 e.tid,
                 Inbound::Error(KrpcError {
                     tid: e.tid,
@@ -1544,6 +1660,17 @@ async fn handle_datagram(shared: &Shared, from: SocketAddr, data: &[u8]) {
     }
 }
 
+fn closest_nodes(shared: &Shared, target: &NodeId) -> Vec<BencodedNode> {
+    lock(&shared.table)
+        .find_closest(target, K)
+        .into_iter()
+        .map(|c| BencodedNode {
+            id: c.id,
+            addr: c.addr,
+        })
+        .collect()
+}
+
 async fn respond_query(shared: &Shared, to: SocketAddr, msg: QueryMsg) {
     // Anyone who asks us anything is, by definition, reachable.
     if msg.id != shared.id {
@@ -1554,35 +1681,31 @@ async fn respond_query(shared: &Shared, to: SocketAddr, msg: QueryMsg) {
     let reply: Vec<u8> = match msg.query {
         Query::Ping => encode_response(tid, shared.id, &ResponsePayload::Empty),
         Query::FindNode { target } => {
-            let nodes: Vec<BencodedNode> = lock(&shared.table)
-                .find_closest(&target, K)
-                .into_iter()
-                .map(|c| BencodedNode {
-                    id: c.id,
-                    addr: c.addr,
-                })
-                .collect();
+            let nodes = closest_nodes(shared, &target);
             encode_response(tid, shared.id, &ResponsePayload::Nodes(nodes))
         }
         Query::GetPeers { infohash, .. } => {
-            // We serve no data, so the peer list is always empty; hand back a
-            // token so announce_peer has something to echo back to us.
-            let entries = Vec::new();
-            let mut out = encode_response(tid, shared.id, &ResponsePayload::Peers(entries));
-            // encode_response uses a fixed token for Peers; replace it with one
-            // bound to this infohash.
-            let token = shared.token_for(infohash);
-            let placeholder = bencoded_bytes(&empty_token());
-            let replacement = bencoded_bytes(&token);
-            if let Some(pos) = out
-                .windows(placeholder.len())
-                .position(|w| w == placeholder.as_slice())
-            {
-                out.splice(pos..pos + placeholder.len(), replacement.iter().copied());
-            }
-            out
+            let nodes = closest_nodes(shared, &NodeId(infohash.0));
+            let token = shared.token_for(to.ip(), infohash);
+            encode_response(
+                tid,
+                shared.id,
+                &ResponsePayload::GetPeers {
+                    token,
+                    nodes,
+                    values: Vec::new(),
+                },
+            )
         }
-        Query::AnnouncePeer { .. } => encode_response(tid, shared.id, &ResponsePayload::Empty),
+        Query::AnnouncePeer {
+            infohash, token, ..
+        } => {
+            if shared.token_valid(to.ip(), infohash, &token) {
+                encode_response(tid, shared.id, &ResponsePayload::Empty)
+            } else {
+                encode_error(tid, 203, "Bad token")
+            }
+        }
     };
 
     if let Err(e) = shared.socket.send_to(&reply, to).await {
@@ -2031,7 +2154,10 @@ pub async fn fetch_metadata_from_peers(
         while inflight.len() < METADATA_CONCURRENCY {
             let Some(peer) = queue.next() else { break };
             inflight.push(async move {
-                (peer, fetch_metadata_from_peer(peer, infohash, per_peer).await)
+                (
+                    peer,
+                    fetch_metadata_from_peer(peer, infohash, per_peer).await,
+                )
             });
         }
         match tokio::time::timeout_at(deadline, inflight.next()).await {
@@ -2381,21 +2507,18 @@ mod tests {
     }
 
     #[test]
-    fn krpc_peers_response_round_trips() {
-        let peers = vec![
-            PeerEntry::Compact(SocketAddr::from(([8, 8, 8, 8], 6881))),
-            PeerEntry::Node(BencodedNode {
+    fn krpc_get_peers_response_round_trips() {
+        let payload = ResponsePayload::GetPeers {
+            token: b"tok".to_vec(),
+            nodes: vec![BencodedNode {
                 id: node_id(6),
                 addr: SocketAddr::from(([9, 9, 9, 9], 6882)),
-            }),
-        ];
-        let bytes = encode_response(
-            TransactionId(*b"pp"),
-            node_id(5),
-            &ResponsePayload::Peers(peers.clone()),
-        );
+            }],
+            values: vec![SocketAddr::from(([8, 8, 8, 8], 6881))],
+        };
+        let bytes = encode_response(TransactionId(*b"pp"), node_id(5), &payload);
         match decode_message(&bytes).unwrap() {
-            Inbound::Response(r) => assert_eq!(r.payload, ResponsePayload::Peers(peers)),
+            Inbound::Response(r) => assert_eq!(r.payload, payload),
             other => panic!("expected a response, got {other:?}"),
         }
     }
@@ -2569,6 +2692,426 @@ mod tests {
 
     // ---- live node behaviour
 
+    // ---- hardening
+
+    fn contact_addr(n: u8) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, n], 6881))
+    }
+
+    fn same_bucket_id(n: u8) -> NodeId {
+        let mut id = [0u8; 20];
+        id[0] = 0x80;
+        id[19] = n;
+        NodeId(id)
+    }
+
+    fn full_table() -> RoutingTable {
+        let mut table = RoutingTable::new(node_id(0));
+        for n in 1..=BUCKET_CAP as u8 {
+            table.insert(same_bucket_id(n), contact_addr(n));
+        }
+        assert_eq!(table.len(), BUCKET_CAP);
+        table
+    }
+
+    fn age_all(table: &mut RoutingTable) {
+        for c in table.buckets.iter_mut().flat_map(|b| b.contacts.iter_mut()) {
+            c.last_seen = Instant::now() - FRESH_FOR - Duration::from_secs(1);
+        }
+    }
+
+    #[test]
+    fn known_id_is_not_rebound_to_a_new_address() {
+        let mut table = RoutingTable::new(node_id(0));
+        let id = same_bucket_id(1);
+        table.insert(id, contact_addr(1));
+        table.insert(id, contact_addr(99));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get(&id).unwrap().addr, contact_addr(1));
+        assert!(table.get_by_addr(&contact_addr(99)).is_none());
+    }
+
+    #[test]
+    fn known_address_is_not_taken_over_by_another_id() {
+        let mut table = RoutingTable::new(node_id(0));
+        table.insert(same_bucket_id(1), contact_addr(1));
+        table.insert(same_bucket_id(2), contact_addr(1));
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table.get_by_addr(&contact_addr(1)).unwrap().id,
+            same_bucket_id(1)
+        );
+    }
+
+    #[test]
+    fn full_bucket_keeps_good_nodes() {
+        let mut table = full_table();
+        assert!(table
+            .insert(same_bucket_id(100), contact_addr(100))
+            .is_none());
+        assert_eq!(table.len(), BUCKET_CAP);
+        assert!(table.get(&same_bucket_id(100)).is_none());
+        for n in 1..=BUCKET_CAP as u8 {
+            assert!(table.get(&same_bucket_id(n)).is_some());
+        }
+    }
+
+    #[test]
+    fn full_bucket_pings_the_stalest_node_instead_of_evicting_it() {
+        let mut table = full_table();
+        age_all(&mut table);
+        let target = table.insert(same_bucket_id(100), contact_addr(100));
+        assert!(target.is_some());
+        assert_eq!(table.len(), BUCKET_CAP);
+        assert!(table.get(&same_bucket_id(100)).is_none());
+        let again = table.insert(same_bucket_id(101), contact_addr(101));
+        assert_ne!(
+            again, target,
+            "a node already being probed is not probed twice"
+        );
+        let probed = table.get_by_addr(&target.unwrap()).unwrap().id;
+        table.insert(probed, target.unwrap());
+        assert!(table.get(&probed).is_some());
+        assert_eq!(table.get(&probed).unwrap().failures, 0);
+    }
+
+    #[test]
+    fn full_bucket_replaces_a_bad_node() {
+        let mut table = full_table();
+        table.fail(&contact_addr(3));
+        table.fail(&contact_addr(3));
+        table.insert(same_bucket_id(100), contact_addr(100));
+        assert_eq!(table.len(), BUCKET_CAP);
+        assert!(table.get(&same_bucket_id(3)).is_none());
+        assert!(table.get(&same_bucket_id(100)).is_some());
+    }
+
+    #[test]
+    fn tokens_are_bound_to_ip_and_infohash_and_rotate() {
+        let ip = IpAddr::from([1, 2, 3, 4]);
+        let ih = InfoHash([7; 20]);
+        let a = make_token(&[1; 20], ip, ih);
+        assert_eq!(a.len(), 20);
+        assert_ne!(a, make_token(&[1; 20], IpAddr::from([1, 2, 3, 5]), ih));
+        assert_ne!(a, make_token(&[1; 20], ip, InfoHash([8; 20])));
+        assert_ne!(a, make_token(&[2; 20], ip, ih));
+    }
+
+    async fn raw_socket() -> UdpSocket {
+        UdpSocket::bind("127.0.0.1:0").await.unwrap()
+    }
+
+    async fn recv_msg(sock: &UdpSocket) -> (Inbound, SocketAddr) {
+        let mut buf = vec![0u8; MAX_UDP_PAYLOAD];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut buf))
+            .await
+            .expect("no datagram arrived")
+            .unwrap();
+        (decode_message(&buf[..n]).unwrap(), from)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spoofed_response_from_another_address_is_ignored() {
+        let node = DhtNode::new(None).await.unwrap();
+        let real = raw_socket().await;
+        let spoofer = raw_socket().await;
+        let real_addr = real.local_addr().unwrap();
+        let spoofer_addr = spoofer.local_addr().unwrap();
+
+        let pinger = async { node.ping(compact_127(real_addr.port())).await };
+        let responder = async {
+            let (msg, from) = recv_msg(&real).await;
+            let Inbound::Query(q) = msg else {
+                panic!("expected a query")
+            };
+            let node_addr = SocketAddr::from(([127, 0, 0, 1], node.local_addr().port()));
+            spoofer
+                .send_to(
+                    &encode_response(q.tid, node_id(0xEE), &ResponsePayload::Empty),
+                    node_addr,
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(node.shared.pending.lock().unwrap().contains_key(&q.tid.0));
+            real.send_to(
+                &encode_response(q.tid, node_id(0x11), &ResponsePayload::Empty),
+                from,
+            )
+            .await
+            .unwrap();
+        };
+        let (res, ()) = tokio::join!(pinger, responder);
+        res.unwrap();
+        let contacts = node.good_nodes();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].id, node_id(0x11));
+        assert_eq!(contacts[0].addr, real_addr);
+        assert!(contacts.iter().all(|c| c.addr != spoofer_addr));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unsolicited_response_adds_no_contact() {
+        let node = DhtNode::new(None).await.unwrap();
+        let sock = raw_socket().await;
+        let node_addr = SocketAddr::from(([127, 0, 0, 1], node.local_addr().port()));
+        sock.send_to(
+            &encode_response(
+                TransactionId(*b"zz"),
+                node_id(0x42),
+                &ResponsePayload::Empty,
+            ),
+            node_addr,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(node.node_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transaction_ids_are_not_sequential() {
+        let node = DhtNode::new(None).await.unwrap();
+        let addr = contact_addr(1);
+        let tids: Vec<[u8; 2]> = (0..16)
+            .map(|_| node.shared.begin(addr).unwrap().0 .0)
+            .collect();
+        let sequential = tids
+            .windows(2)
+            .all(|w| u16::from_be_bytes(w[1]) == u16::from_be_bytes(w[0]).wrapping_add(1));
+        assert!(!sequential);
+        assert_eq!(node.shared.pending.lock().unwrap().len(), 16);
+    }
+
+    async fn fake_remote(
+        reply: impl Fn(&QueryMsg) -> ResponsePayload + Send + 'static,
+    ) -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<Query>) {
+        let sock = raw_socket().await;
+        let addr = sock.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_UDP_PAYLOAD];
+            while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                if let Ok(Inbound::Query(q)) = decode_message(&buf[..n]) {
+                    let _ = tx.send(q.query.clone());
+                    let out = encode_response(q.tid, node_id(0x33), &reply(&q));
+                    let _ = sock.send_to(&out, from).await;
+                }
+            }
+        });
+        (addr, rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn announce_echoes_the_token_from_get_peers() {
+        let (remote, mut seen) = fake_remote(|q| match q.query {
+            Query::GetPeers { .. } => ResponsePayload::GetPeers {
+                token: b"remote-token".to_vec(),
+                nodes: Vec::new(),
+                values: Vec::new(),
+            },
+            _ => ResponsePayload::Empty,
+        })
+        .await;
+        let node = DhtNode::new(None).await.unwrap();
+        node.add_node(compact_127(remote.port())).await;
+        node.announce(InfoHash([5; 20]), 51413).await.unwrap();
+        let mut announced = None;
+        while let Ok(q) = seen.try_recv() {
+            if let Query::AnnouncePeer { token, port, .. } = q {
+                announced = Some((token, port));
+            }
+        }
+        assert_eq!(announced, Some((b"remote-token".to_vec(), 51413)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn announce_without_a_token_sends_nothing() {
+        let (remote, mut seen) = fake_remote(|_| ResponsePayload::Empty).await;
+        let node = DhtNode::new(None).await.unwrap();
+        node.add_node(compact_127(remote.port())).await;
+        node.announce(InfoHash([5; 20]), 51413).await.unwrap();
+        while let Ok(q) = seen.try_recv() {
+            assert!(!matches!(q, Query::AnnouncePeer { .. }));
+        }
+    }
+
+    async fn ask(sock: &UdpSocket, node: SocketAddr, tid: &[u8; 2], q: &Query) -> Inbound {
+        let msg = encode_query(TransactionId(*tid), node_id(0x77), q);
+        sock.send_to(&msg, node).await.unwrap();
+        recv_msg(sock).await.0
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inbound_announce_checks_the_token() {
+        let node = DhtNode::new(None).await.unwrap();
+        let node_addr = SocketAddr::from(([127, 0, 0, 1], node.local_addr().port()));
+        let sock = raw_socket().await;
+        let infohash = InfoHash([9; 20]);
+
+        let Inbound::Response(r) = ask(
+            &sock,
+            node_addr,
+            b"g1",
+            &Query::GetPeers {
+                infohash,
+                want: None,
+            },
+        )
+        .await
+        else {
+            panic!("expected a get_peers response")
+        };
+        let ResponsePayload::GetPeers { token, .. } = r.payload else {
+            panic!("expected a token")
+        };
+
+        let announce = |token: Vec<u8>, infohash: InfoHash| Query::AnnouncePeer {
+            infohash,
+            port: 6881,
+            token,
+            implied_port: false,
+        };
+        match ask(
+            &sock,
+            node_addr,
+            b"a1",
+            &announce(b"bogus".to_vec(), infohash),
+        )
+        .await
+        {
+            Inbound::Error(e) => assert_eq!(e.code, 203),
+            other => panic!("expected error 203, got {other:?}"),
+        }
+        match ask(
+            &sock,
+            node_addr,
+            b"a2",
+            &announce(token.clone(), InfoHash([10; 20])),
+        )
+        .await
+        {
+            Inbound::Error(e) => assert_eq!(e.code, 203),
+            other => panic!("expected error 203, got {other:?}"),
+        }
+        match ask(&sock, node_addr, b"a3", &announce(token, infohash)).await {
+            Inbound::Response(r) => assert_eq!(r.payload, ResponsePayload::Empty),
+            other => panic!("expected an ack, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_previous_token_secret_is_still_accepted() {
+        let node = DhtNode::new(None).await.unwrap();
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        let ih = InfoHash([4; 20]);
+        let old = node.shared.token_for(ip, ih);
+        {
+            let mut s = node.shared.secrets.lock().unwrap();
+            s.rotated = Instant::now() - SECRET_ROTATION;
+        }
+        assert!(node.shared.token_valid(ip, ih, &old));
+        assert_ne!(node.shared.token_for(ip, ih), old);
+        {
+            let mut s = node.shared.secrets.lock().unwrap();
+            s.rotated = Instant::now() - SECRET_ROTATION;
+        }
+        assert!(!node.shared.token_valid(ip, ih, &old));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nodes_are_never_returned_as_peers() {
+        let decoy = SocketAddr::from(([203, 0, 113, 9], 4444));
+        let peer = SocketAddr::from(([198, 51, 100, 7], 5555));
+        let (remote, _seen) = fake_remote(move |_| ResponsePayload::GetPeers {
+            token: b"t".to_vec(),
+            nodes: vec![BencodedNode {
+                id: node_id(0x55),
+                addr: decoy,
+            }],
+            values: vec![peer],
+        })
+        .await;
+        let node = DhtNode::new(None).await.unwrap();
+        node.add_node(compact_127(remote.port())).await;
+        let peers = node.get_peers(InfoHash([6; 20])).await.unwrap();
+        assert_eq!(peers, vec![peer]);
+
+        let (nodes_only, _seen2) = fake_remote(move |_| ResponsePayload::GetPeers {
+            token: b"t".to_vec(),
+            nodes: vec![BencodedNode {
+                id: node_id(0x56),
+                addr: decoy,
+            }],
+            values: Vec::new(),
+        })
+        .await;
+        let node2 = DhtNode::new(None).await.unwrap();
+        node2.add_node(compact_127(nodes_only.port())).await;
+        assert!(node2.get_peers(InfoHash([6; 20])).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn values_that_look_like_nodes_are_not_peers() {
+        let node = BencodedNode {
+            id: node_id(1),
+            addr: SocketAddr::from(([1, 2, 3, 4], 5)),
+        };
+        let mut body = b"d1:rd2:id20:".to_vec();
+        body.extend_from_slice(&[5u8; 20]);
+        body.extend_from_slice(b"5:token1:t6:valuesl26:");
+        body.extend_from_slice(&node.to_bytes());
+        body.extend_from_slice(b"6:");
+        body.extend_from_slice(&[8, 8, 8, 8, 0x1a, 0xe1]);
+        body.extend_from_slice(b"ee1:t2:aa1:y1:re");
+        match decode_message(&body).unwrap() {
+            Inbound::Response(r) => match r.payload {
+                ResponsePayload::GetPeers { values, .. } => {
+                    assert_eq!(values, vec![SocketAddr::from(([8, 8, 8, 8], 6881))]);
+                }
+                other => panic!("unexpected payload {other:?}"),
+            },
+            other => panic!("expected a response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn our_get_peers_reply_has_nodes_and_a_token() {
+        let node = DhtNode::new(None).await.unwrap();
+        let node_addr = SocketAddr::from(([127, 0, 0, 1], node.local_addr().port()));
+        let helper = DhtNode::new(None).await.unwrap();
+        helper.ping(compact_127(node_addr.port())).await.unwrap();
+        let known = helper.node_id();
+        assert!(node.good_nodes().iter().any(|c| c.id == known));
+
+        let sock = raw_socket().await;
+        let Inbound::Response(r) = ask(
+            &sock,
+            node_addr,
+            b"g2",
+            &Query::GetPeers {
+                infohash: InfoHash([2; 20]),
+                want: None,
+            },
+        )
+        .await
+        else {
+            panic!("expected a response")
+        };
+        match r.payload {
+            ResponsePayload::GetPeers {
+                token,
+                nodes,
+                values,
+            } => {
+                assert_eq!(token.len(), 20);
+                assert!(nodes.iter().any(|n| n.id == known));
+                assert!(values.is_empty());
+            }
+            other => panic!("unexpected payload {other:?}"),
+        }
+    }
+
     fn compact_127(port: u16) -> Info {
         Info::Compact([127, 0, 0, 1, (port >> 8) as u8, port as u8])
     }
@@ -2669,10 +3212,7 @@ mod tests {
 
     /// A fake peer speaking the real wire format: BT handshake with the
     /// extension bit, noise before its extended handshake, ut_metadata id 3.
-    async fn spawn_fake_peer(
-        info_dict: Vec<u8>,
-        handshake_hash: [u8; 20],
-    ) -> SocketAddr {
+    async fn spawn_fake_peer(info_dict: Vec<u8>, handshake_hash: [u8; 20]) -> SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

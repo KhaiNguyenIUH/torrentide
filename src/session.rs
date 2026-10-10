@@ -288,15 +288,23 @@ impl Session {
                 Ok(l) => {
                     let addr = l.local_addr()?;
                     let msg = match &access {
-                        crate::webui::Access::Password(_) => {
+                        crate::webui::Access::Password(_) if addr.ip().is_unspecified() => {
+                            tracing::warn!("web UI is reachable from your network over plain HTTP; prefer an SSH tunnel");
+                            state.write().await.log(Level::Warn, "web UI is reachable from your network over plain HTTP; prefer an SSH tunnel");
                             format!("web UI on port {} (all interfaces, password required): http://localhost:{}", addr.port(), addr.port())
+                        }
+                        crate::webui::Access::Password(_) => {
+                            format!("web UI on port {} (this machine only, password required; enable LAN access in settings to allow other machines): http://localhost:{}", addr.port(), addr.port())
                         }
                         crate::webui::Access::Token(t) => {
                             let url = format!("http://127.0.0.1:{}/?token={t}", addr.port());
                             webui_url = Some(url.clone());
-                            format!("web UI (this machine only; set a password to allow other machines): open {url}")
+                            format!("web UI (this machine only): open {url}")
                         }
                     };
+                    if settings.webui.lan && !addr.ip().is_unspecified() {
+                        state.write().await.log(Level::Warn, "web UI on LAN needs a password; listening on this machine only");
+                    }
                     accepts.push(tokio::spawn(crate::webui::serve(l, Arc::clone(&state), access)));
                     tracing::info!("{msg}");
                     state.write().await.log(Level::Info, msg);
@@ -802,9 +810,10 @@ impl Core {
     /// Download `url` (at most `max` bytes, `slots` at a time) off the core task.
     fn spawn_fetch(&self, slots: Arc<Semaphore>, url: String, max: usize, done: impl FnOnce(UnboundedSender<Fetched>, Result<Vec<u8>>) + Send + 'static) {
         let tx = self.fetch_tx.clone();
+        let allow_local = self.settings.allow_local_urls;
         tokio::spawn(async move {
             let _slot = slots.acquire_owned().await;
-            let result = match tokio::time::timeout(FETCH_TIMEOUT, crate::webseed::get_capped(&url, max)).await {
+            let result = match tokio::time::timeout(FETCH_TIMEOUT, crate::webseed::get_capped(&url, max, allow_local)).await {
                 Ok(r) => r.map_err(|e| anyhow!("{e}")),
                 Err(_) => Err(anyhow!("timed out")),
             };
@@ -1027,7 +1036,7 @@ impl Core {
             port: self.port,
             file_priorities: e.rec.priorities.clone(),
             extra_peers: match &self.lsd {
-                Some(l) if e.meta.as_ref().is_none_or(|m| !m.private) => Some(l.register(e.ih.0)),
+                Some(l) if lsd_allowed(e.meta.as_deref()) => Some(l.register(e.ih.0)),
                 _ => None,
             },
             sequential: e.rec.sequential,
@@ -1037,15 +1046,16 @@ impl Core {
         };
         let ui = Arc::clone(&e.ui);
         let dir = e.rec.dir.clone();
+        let allow_local = self.settings.allow_local_urls;
         let (handle, info) = match (&e.meta, &e.magnet) {
             (Some(meta), _) => {
                 let engine = Engine::with_options(Arc::clone(meta), ui, cmd_rx, opts);
-                (tokio::spawn(engine.run(dir)), None)
+                (tokio::spawn(crate::webseed::ALLOW_LOCAL.scope(allow_local, engine.run(dir))), None)
             }
             (None, Some(m)) => {
                 let (itx, irx) = oneshot::channel();
                 let fut = engine::run_magnet_with_options(m.clone(), dir, ui, cmd_rx, opts, Some(itx));
-                (tokio::spawn(fut), Some(irx))
+                (tokio::spawn(crate::webseed::ALLOW_LOCAL.scope(allow_local, fut)), Some(irx))
             }
             (None, None) => return,
         };
@@ -1395,11 +1405,6 @@ impl Core {
                     let trackers = e.magnet.as_ref().map(|m| m.trackers.clone()).unwrap_or_default();
                     match store_metadata(&self.store, &e.rec.id, &info, &trackers) {
                         Ok(meta) => {
-                            if meta.private {
-                                if let Some(l) = &self.lsd {
-                                    l.unregister(&e.ih.0);
-                                }
-                            }
                             e.meta = Some(Arc::new(meta));
                             e.rec.magnet = None;
                             dirty = true;
@@ -2089,6 +2094,10 @@ async fn read_source(source: &str) -> Result<Vec<u8>> {
     .await?
 }
 
+fn lsd_allowed(meta: Option<&Metainfo>) -> bool {
+    meta.is_some_and(|m| !m.private)
+}
+
 /// Never keep the web UI password in plaintext once the session has it.
 fn secure_password(settings: &mut Settings) {
     settings.webui.password = settings.webui.password.take().filter(|p| !p.is_empty()).map(|p| crate::store::hashed(&p));
@@ -2144,6 +2153,27 @@ fn summary_line(st: &SessionState) -> String {
 mod tests {
     use super::*;
     use crate::storage::sha1_bytes;
+
+    #[test]
+    fn lsd_needs_known_public_metadata() {
+        let mut m = Metainfo {
+            infohash: InfoHash([9; 20]),
+            name: "t".into(),
+            piece_length: 16384,
+            pieces: vec![[0; 20]],
+            files: crate::metainfo::Files::Single { name: "t".into(), length: 1 },
+            total_length: 1,
+            private: false,
+            announce: None,
+            announce_list: vec![],
+            web_seeds: vec![],
+            info_bytes: vec![],
+        };
+        assert!(!lsd_allowed(None), "a magnet has no metadata yet, it could be private");
+        assert!(lsd_allowed(Some(&m)));
+        m.private = true;
+        assert!(!lsd_allowed(Some(&m)));
+    }
 
     #[test]
     fn applescript_escaping() {

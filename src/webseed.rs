@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
@@ -105,12 +106,13 @@ pub async fn fetch_piece(
     base: &str,
     piece: u32,
     limits: &Limits,
+    allow_local: bool,
 ) -> Result<Vec<u8>, WsError> {
     let mut out = Vec::with_capacity(meta.piece_size(piece as usize) as usize);
     for seg in piece_segments(meta, piece) {
         let url = file_url(base, meta, seg.file).ok_or_else(|| other("no such file"))?;
         let file_len = meta.files.iter().nth(seg.file).map_or(0, |(_, l)| l);
-        let data = get_range(&url, seg.offset, seg.len, file_len, limits)
+        let data = get_range(&url, seg.offset, seg.len, file_len, limits, allow_local)
             .await
             .map_err(|e| match e {
                 WsError::Gone(_) => WsError::Gone(seg.file),
@@ -134,32 +136,111 @@ enum Reply {
     Redirect(String),
 }
 
+tokio::task_local! {
+    pub static ALLOW_LOCAL: bool;
+}
+
+fn local_allowed() -> bool {
+    ALLOW_LOCAL.try_with(|v| *v).unwrap_or(false)
+}
+
+const NOT_ALLOWED: &str = "address not allowed";
+
+/// True when `ip` is a public, globally routable unicast address. Everything
+/// else (loopback, LAN, link-local, CGNAT, multicast, reserved, documentation,
+/// and IPv4 embedded in IPv6 forms of those) is refused for remote URLs.
+pub fn address_allowed(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 198 && (o[1] & 0xfe) == 18)
+                || o[0] >= 240)
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return address_allowed(IpAddr::V4(v4));
+            }
+            let embedded = |a: u16, b: u16| Ipv4Addr::from([(a >> 8) as u8, a as u8, (b >> 8) as u8, b as u8]);
+            if seg[..6] == [0, 0, 0, 0, 0, 0] && !v6.is_loopback() && !v6.is_unspecified() {
+                return address_allowed(IpAddr::V4(embedded(seg[6], seg[7])));
+            }
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return address_allowed(IpAddr::V4(embedded(seg[6], seg[7])));
+            }
+            if seg[0] == 0x2002 {
+                return address_allowed(IpAddr::V4(embedded(seg[1], seg[2])));
+            }
+            !(v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || (seg[0] & 0xfe00) == 0xfc00
+                || (seg[0] & 0xffc0) == 0xfe80
+                || (seg[0] & 0xffc0) == 0xfec0
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8))
+        }
+    }
+}
+
+struct Hop {
+    tcp: TcpStream,
+    tls: bool,
+    host: String,
+    host_header: String,
+    target: String,
+}
+
+async fn dial(current: &Url, allow_local: bool) -> Result<Hop, WsError> {
+    let host = current.host_str().ok_or_else(|| other("url has no host"))?.to_owned();
+    let tls = match current.scheme() {
+        "http" => false,
+        "https" => true,
+        s => return Err(other(format!("unsupported scheme {s}"))),
+    };
+    let port = current.port_or_known_default().unwrap_or(if tls { 443 } else { 80 });
+    let mut target = current.path().to_owned();
+    if let Some(q) = current.query() {
+        target.push('?');
+        target.push_str(q);
+    }
+    let host_header = match current.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.clone(),
+    };
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let resolved: Vec<SocketAddr> = match tokio::time::timeout(REQUEST_TIMEOUT, tokio::net::lookup_host((bare, port))).await {
+        Ok(Ok(it)) => it.collect(),
+        _ => return Err(other("cannot resolve host")),
+    };
+    if !allow_local && resolved.iter().any(|a| !address_allowed(a.ip())) {
+        return Err(other(NOT_ALLOWED));
+    }
+    let addr = resolved.first().ok_or_else(|| other("cannot resolve host"))?;
+    let tcp = within(TcpStream::connect(addr)).await?;
+    Ok(Hop { tcp, tls, host: bare.to_owned(), host_header, target })
+}
+
 async fn get_range(
     url: &str,
     offset: u64,
     len: u64,
     file_len: u64,
     limits: &Limits,
+    allow_local: bool,
 ) -> Result<Vec<u8>, WsError> {
     let mut current = Url::parse(url).map_err(|e| other(format!("bad url: {e}")))?;
     for _ in 0..=MAX_REDIRECTS {
-        let host = current.host_str().ok_or_else(|| other("url has no host"))?.to_owned();
-        let tls = match current.scheme() {
-            "http" => false,
-            "https" => true,
-            s => return Err(other(format!("unsupported scheme {s}"))),
-        };
-        let port = current.port_or_known_default().unwrap_or(if tls { 443 } else { 80 });
-        let mut target = current.path().to_owned();
-        if let Some(q) = current.query() {
-            target.push('?');
-            target.push_str(q);
-        }
-        let host_header = match current.port() {
-            Some(p) => format!("{host}:{p}"),
-            None => host.clone(),
-        };
-        let tcp = within(TcpStream::connect((host.as_str(), port))).await?;
+        let Hop { tcp, tls, host, host_header, target } = dial(&current, allow_local).await?;
         let reply = if tls {
             let name = rustls::pki_types::ServerName::try_from(host.clone())
                 .map_err(|_| other("bad TLS server name"))?;
@@ -179,27 +260,12 @@ async fn get_range(
 }
 
 /// Plain GET following redirects, for small documents such as feeds. The body is
-/// refused once it passes `max_body` bytes rather than buffered.
-pub(crate) async fn get_capped(url: &str, max_body: usize) -> Result<Vec<u8>, WsError> {
+/// refused once it passes `max_body` bytes rather than buffered. Loopback, LAN
+/// and other non-public addresses are refused on every hop unless `allow_local`.
+pub(crate) async fn get_capped(url: &str, max_body: usize, allow_local: bool) -> Result<Vec<u8>, WsError> {
     let mut current = Url::parse(url).map_err(|e| other(format!("bad url: {e}")))?;
     for _ in 0..=MAX_REDIRECTS {
-        let host = current.host_str().ok_or_else(|| other("url has no host"))?.to_owned();
-        let tls = match current.scheme() {
-            "http" => false,
-            "https" => true,
-            s => return Err(other(format!("unsupported scheme {s}"))),
-        };
-        let port = current.port_or_known_default().unwrap_or(if tls { 443 } else { 80 });
-        let mut target = current.path().to_owned();
-        if let Some(q) = current.query() {
-            target.push('?');
-            target.push_str(q);
-        }
-        let host_header = match current.port() {
-            Some(p) => format!("{host}:{p}"),
-            None => host.clone(),
-        };
-        let tcp = within(TcpStream::connect((host.as_str(), port))).await?;
+        let Hop { tcp, tls, host, host_header, target } = dial(&current, allow_local).await?;
         let reply = if tls {
             let name = rustls::pki_types::ServerName::try_from(host.clone())
                 .map_err(|_| other("bad TLS server name"))?;
@@ -472,8 +538,9 @@ pub fn spawn_fetch(
     limits: Limits,
     tx: mpsc::UnboundedSender<Done>,
 ) {
+    let allow_local = local_allowed();
     jobs.spawn(async move {
-        let result = fetch_piece(&meta, &base, piece, &limits).await;
+        let result = fetch_piece(&meta, &base, piece, &limits, allow_local).await;
         let _ = tx.send(Done { seed, piece, result });
     });
 }
@@ -663,6 +730,42 @@ mod tests {
         let long_chunk = b"HTTP/1.1 206 X\r\nContent-Range: bytes 0-3/10\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabcde\r\n0\r\n\r\n";
         assert!(run(long_chunk, 0, 4, 10).await.is_err());
         assert!(run(b"garbage\r\n\r\n", 0, 4, 4).await.is_err());
+    }
+
+    #[test]
+    fn address_policy_blocks_local_and_reserved_ranges() {
+        for bad in [
+            "127.0.0.1", "127.9.9.9", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1",
+            "169.254.169.254", "100.64.0.1", "100.127.255.255", "0.0.0.0", "0.1.2.3", "224.0.0.1",
+            "255.255.255.255", "240.0.0.1", "192.0.2.1", "198.51.100.1", "203.0.113.9", "198.18.0.1",
+            "::", "::1", "fe80::1", "fc00::1", "fd12:3456::1", "ff02::1", "2001:db8::1",
+            "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:192.168.0.1", "::ffff:169.254.1.1",
+            "::ffff:100.64.0.1", "::127.0.0.1", "64:ff9b::7f00:1", "2002:7f00:1::1", "2002:a00:1::1",
+        ] {
+            assert!(!address_allowed(bad.parse().unwrap()), "{bad}");
+        }
+        for ok in ["8.8.8.8", "1.1.1.1", "172.15.0.1", "172.32.0.1", "100.63.0.1", "100.128.0.1", "2606:4700::1", "::ffff:8.8.8.8", "2002:808:808::1"] {
+            assert!(address_allowed(ok.parse().unwrap()), "{ok}");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_capped_refuses_local_targets_with_one_message() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        for url in [
+            format!("http://127.0.0.1:{port}/x"),
+            format!("http://[::1]:{port}/x"),
+            format!("http://localhost:{port}/x"),
+            "http://10.0.0.1:1/x".to_owned(),
+            "http://192.168.0.1:1/x".to_owned(),
+            "http://169.254.169.254/x".to_owned(),
+            "http://[::ffff:127.0.0.1]:1/x".to_owned(),
+            "http://[fd00::1]:1/x".to_owned(),
+        ] {
+            let err = get_capped(&url, 1024, false).await.unwrap_err();
+            assert_eq!(err.to_string(), NOT_ALLOWED, "{url}");
+        }
     }
 
     #[test]

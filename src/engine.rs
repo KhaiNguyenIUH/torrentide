@@ -33,7 +33,7 @@ use crate::state::{
     Command, EncryptionMode, DownloadState, FilePriority, FileSummary, Level, PeerSummary, TorrentSummary, UiState,
 };
 use crate::storage::Storage;
-use crate::tracker::{self, Event};
+use crate::tracker::{self, Event, TrackerSet};
 use crate::webseed::{self, WebSeed};
 
 /// Port we advertise to peers and announce to trackers.
@@ -190,19 +190,16 @@ impl Engine {
         scheduler.set_sequential(sequential);
         let port = self.opts.port;
         let mut inbound = self.opts.inbound.take();
-        let mut extra_peers = self.opts.extra_peers.take();
-        let mut trackers = match self.opts.trackers.take() {
-            Some(list) => {
-                let mut clean: Vec<String> = Vec::new();
-                for u in list.iter().filter_map(|u| clean_tracker(u)) {
-                    if !clean.contains(&u) {
-                        clean.push(u);
-                    }
-                }
-                clean
+        let mut extra_peers = self.opts.extra_peers.take().filter(|_| !self.meta.private);
+        let mut trackers = TrackerSet::new(
+            match self.opts.trackers.take() {
+                Some(list) => list.iter().filter_map(|u| clean_tracker(u)).collect(),
+                None => self.meta.announce_list.clone(),
             }
-            None => self.meta.announce_list.clone(),
-        };
+            .into_iter()
+            .map(|u| vec![u])
+            .collect(),
+        );
         let file_count = self.meta.files.iter().count();
         let mut priorities = initial_priorities(file_count, self.opts.file_priorities.take());
 
@@ -221,7 +218,7 @@ impl Engine {
             piece_count: self.meta.piece_count() as u32,
             state: DownloadState::Checking,
             download_dir: download_dir.display().to_string(),
-            trackers: trackers.clone(),
+            trackers: trackers.urls(),
             uploaded: self.opts.uploaded_so_far,
             sequential,
             files: file_summaries(&self.meta, &scheduler, &priorities),
@@ -271,7 +268,7 @@ impl Engine {
             progress: scheduler.progress(),
             state: DownloadState::Downloading,
             download_dir: download_dir.display().to_string(),
-            trackers: trackers.clone(),
+            trackers: trackers.urls(),
             uploaded: self.opts.uploaded_so_far,
             sequential,
             files: file_summaries(&self.meta, &scheduler, &priorities),
@@ -356,11 +353,12 @@ impl Engine {
         let mut dht_in_flight = false;
         let mut last_dht_lookup: Option<Instant> = None;
 
-        let mut last_announce = Instant::now() - Duration::from_secs(3600);
-        let announce_interval = Duration::from_secs(1800);
-        // Set when we are starved of peers, to re-announce on the next tick
-        // instead of waiting out the full interval.
-        let mut force_announce = true;
+        // Set when we are starved of peers, to re-announce as soon as a
+        // tracker's minimum interval allows instead of waiting out the full one.
+        let mut force_announce = false;
+        // Bytes received from peers and web seeds during this run, for the
+        // trackers' `downloaded`: data resumed from disk is not counted.
+        let mut session_down: u64 = 0;
         let mut last_reap = Instant::now();
         let mut last_stats = Instant::now();
         let mut last_fill = Instant::now() - PIPELINE_INTERVAL;
@@ -404,6 +402,9 @@ impl Engine {
                         dial_addrs(&mut pool, addrs, Source::Pex);
                         continue;
                     }
+                    if let FromPeer::Piece { block, .. } = &ev {
+                        session_down += block.len() as u64;
+                    }
                     handle_peer_event(&mut scheduler, &storage, &self.meta, &ev);
                     pool.on_event(addr, ev).await;
                 }
@@ -422,6 +423,7 @@ impl Engine {
                     web_seeds[seed].busy = false;
                     match result {
                         Ok(data) if !scheduler.block_map().is_verified(piece) => {
+                            session_down += data.len() as u64;
                             for (i, chunk) in data.chunks(BLOCK_SIZE as usize).enumerate() {
                                 let ev = FromPeer::Piece {
                                     index: piece,
@@ -459,7 +461,8 @@ impl Engine {
                     if periodic {
                         announce_in_flight = false;
                     }
-                    let tracker::AnnounceOutcome { peers, errors, seeders, leechers } = outcome;
+                    let tracker::AnnounceOutcome { peers, errors, seeders, leechers, reports } = outcome;
+                    trackers.record(&reports, Instant::now());
                     {
                         let mut st = self.state.write().await;
                         if let Some(t) = &mut st.torrent {
@@ -582,7 +585,7 @@ impl Engine {
                                 }
                                 pool.disconnect_all().await;
                                 self.log(Level::Info, "stopped").await;
-                                self.announce_event(&trackers, Event::Stopped, port, session_up, &scheduler).await;
+                                self.announce_event(&trackers, Event::Stopped, port, session_up, session_down, &scheduler).await;
                                 return Ok(());
                             }
                             Command::SetMaxPeers(n) => pool.set_max_peers(n),
@@ -611,18 +614,18 @@ impl Engine {
                                     self.log(Level::Info, format!("tracker already listed: {}", crate::redact::url(&u))).await;
                                 }
                                 Some(u) => {
-                                    trackers.push(u.clone());
+                                    trackers.add(u.clone());
                                     if let Some(t) = &mut self.state.write().await.torrent {
-                                        t.trackers = trackers.clone();
+                                        t.trackers = trackers.urls();
                                     }
                                     self.log(Level::Info, format!("added tracker {}", crate::redact::url(&u))).await;
-                                    let downloaded = scheduler.block_map().bytes_downloaded(&self.meta);
                                     spawn_announce(
-                                        vec![u],
+                                        vec![vec![u]],
                                         Arc::clone(&self.meta),
                                         port,
                                         pool.total_uploaded().await,
-                                        downloaded,
+                                        session_down,
+                                        left_bytes(&self.meta, &scheduler),
                                         Some(Event::Started),
                                         announce_tx.clone(),
                                         false,
@@ -631,10 +634,10 @@ impl Engine {
                             },
                             Command::RemoveTracker(url) => {
                                 let url = url.trim();
-                                if let Some(i) = trackers.iter().position(|t| t == url) {
-                                    trackers.remove(i);
+                                if trackers.contains(url) {
+                                    trackers.remove(url);
                                     if let Some(t) = &mut self.state.write().await.torrent {
-                                        t.trackers = trackers.clone();
+                                        t.trackers = trackers.urls();
                                     }
                                     self.log(Level::Info, format!("removed tracker {}", crate::redact::url(url))).await;
                                 }
@@ -742,24 +745,23 @@ impl Engine {
                     }
 
                     // ---- announce to trackers periodically ----
-                    if !announce_in_flight
-                        && (force_announce || last_announce.elapsed() >= announce_interval)
-                    {
-                        force_announce = false;
-                        announce_in_flight = true;
-                        last_announce = Instant::now();
-                        let uploaded = pool.total_uploaded().await;
-                        let downloaded = scheduler.block_map().bytes_downloaded(&self.meta);
-                        spawn_announce(
-                            trackers.clone(),
-                            Arc::clone(&self.meta),
-                            port,
-                            uploaded,
-                            downloaded,
-                            next_event.take(),
-                            announce_tx.clone(),
-                            true,
-                        );
+                    if !announce_in_flight {
+                        let tiers = trackers.plan(Instant::now(), force_announce, next_event);
+                        if !tiers.is_empty() {
+                            force_announce = false;
+                            announce_in_flight = true;
+                            spawn_announce(
+                                tiers,
+                                Arc::clone(&self.meta),
+                                port,
+                                pool.total_uploaded().await,
+                                session_down,
+                                left_bytes(&self.meta, &scheduler),
+                                next_event.take(),
+                                announce_tx.clone(),
+                                true,
+                            );
+                        }
                     }
 
                     // ---- DHT peer lookup ----
@@ -782,16 +784,9 @@ impl Engine {
                         if n > 0 {
                             self.log(Level::Debug, format!("reaped {n} dead peers")).await;
                         }
-                        if !seeding
+                        force_announce = !seeding
                             && pool.connected() < crate::peer::MIN_PEERS
-                            && !trackers.is_empty()
-                        {
-                            // Re-announce promptly while we are still short of
-                            // peers. The previous arithmetic here set the
-                            // elapsed time to `interval - 5s`, which is short
-                            // of the trigger and so never fired.
-                            force_announce = true;
-                        }
+                            && !trackers.is_empty();
                     }
 
                     // ---- verify any fully-downloaded pieces ----
@@ -940,7 +935,7 @@ impl Engine {
                         drop(st);
                         if reached {
                             pool.disconnect_all().await;
-                            self.announce_event(&trackers, Event::Stopped, port, uploaded, &scheduler).await;
+                            self.announce_event(&trackers, Event::Stopped, port, uploaded, session_down, &scheduler).await;
                             self.log(
                                 Level::Info,
                                 format!("ratio reached ({:.2}), stopping", self.opts.ratio_target),
@@ -984,14 +979,13 @@ impl Engine {
                         if !self.opts.seed_after_complete {
                             if !completed_sent {
                                 let up = pool.total_uploaded().await;
-                                self.announce_event(&trackers, Event::Completed, port, up, &scheduler).await;
+                                self.announce_event(&trackers, Event::Completed, port, up, session_down, &scheduler).await;
                             }
                             return Ok(());
                         }
                         if !completed_sent {
                             completed_sent = true;
                             next_event = Some(Event::Completed);
-                            force_announce = true;
                         }
                         seeding = true;
                         last_rechoke = Instant::now() - RECHOKE_INTERVAL;
@@ -1015,21 +1009,22 @@ impl Engine {
     /// after [`EVENT_TIMEOUT`] so a dead tracker cannot delay shutdown.
     async fn announce_event(
         &self,
-        trackers: &[String],
+        trackers: &TrackerSet,
         event: Event,
         port: u16,
         uploaded: u64,
+        downloaded: u64,
         scheduler: &Scheduler,
     ) {
-        if trackers.is_empty() {
+        let tiers = trackers.plan(Instant::now(), false, Some(event));
+        if tiers.is_empty() {
             return;
         }
-        let downloaded = scheduler.block_map().bytes_downloaded(&self.meta);
-        let left = self.meta.total_length.saturating_sub(downloaded);
+        let left = left_bytes(&self.meta, scheduler);
         let _ = tokio::time::timeout(
             EVENT_TIMEOUT,
-            tracker::announce_all(
-                trackers,
+            tracker::announce_tiers(
+                &tiers,
                 &self.meta,
                 port,
                 uploaded,
@@ -1179,22 +1174,32 @@ fn clean_tracker(url: &str) -> Option<String> {
     (matches!(parsed.scheme(), "http" | "https" | "udp") && parsed.host().is_some()).then(|| url.to_owned())
 }
 
-/// Announce to `urls` on its own task so a slow tracker never stalls the
+/// Bytes still needed for the wanted files: unverified pieces not excluded by
+/// file priorities.
+fn left_bytes(meta: &Metainfo, scheduler: &Scheduler) -> u64 {
+    (0..meta.piece_count())
+        .filter(|&i| !scheduler.excluded().contains(&(i as u32)) && !scheduler.block_map().is_verified(i as u32))
+        .map(|i| meta.piece_size(i))
+        .sum()
+}
+
+/// Announce to `tiers` on its own task so a slow tracker never stalls the
 /// loop; the outcome comes back on `tx` tagged with whether it was the
 /// periodic announce.
+#[allow(clippy::too_many_arguments)]
 fn spawn_announce(
-    urls: Vec<String>,
+    tiers: Vec<Vec<String>>,
     meta: Arc<Metainfo>,
     port: u16,
     uploaded: u64,
     downloaded: u64,
+    left: u64,
     event: Option<Event>,
     tx: mpsc::UnboundedSender<(tracker::AnnounceOutcome, bool)>,
     periodic: bool,
 ) {
-    let left = meta.total_length.saturating_sub(downloaded);
     tokio::spawn(async move {
-        let res = tracker::announce_all(&urls, &meta, port, uploaded, downloaded, left, event).await;
+        let res = tracker::announce_tiers(&tiers, &meta, port, uploaded, downloaded, left, event).await;
         let _ = tx.send((res, periodic));
     });
 }

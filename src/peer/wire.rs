@@ -75,6 +75,21 @@ impl Message {
     }
 }
 
+/// Azureus-style client prefix: torrust 0.1.0.
+const PEER_ID_PREFIX: &[u8; 8] = b"-TU0100-";
+
+/// The one peer id this process uses in every handshake and tracker announce.
+pub fn local_peer_id() -> &'static [u8; 20] {
+    static ID: std::sync::OnceLock<[u8; 20]> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        use rand::RngCore;
+        let mut id = [0u8; 20];
+        id[..8].copy_from_slice(PEER_ID_PREFIX);
+        rand::thread_rng().fill_bytes(&mut id[8..]);
+        id
+    })
+}
+
 /// Perform the BEP 3 handshake as the initiating side.
 ///
 /// `infohash` is the 20-byte torrent hash. `dht`, `fast` and `extended` set the
@@ -106,10 +121,7 @@ where
     buf[20..28].copy_from_slice(&reserved);
     buf[28..48].copy_from_slice(infohash);
 
-    // A random peer id. Real clients use a fixed vendor prefix plus random
-    // bytes; we use an all-random 20-byte id.
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut buf[48..68]);
+    buf[48..68].copy_from_slice(local_peer_id());
 
     stream.write_all(&buf).await?;
     stream.flush().await?;
@@ -665,6 +677,19 @@ mod tests {
         assert_eq!(plain[20..28], [0, 0, 0, 0, 0, 0, 0, 0x04]);
         let hs = handshake_incoming(&mut plain.as_slice()).await.unwrap();
         assert!(!hs.supports_dht() && !hs.supports_extended());
+    }
+
+    #[tokio::test]
+    async fn every_handshake_carries_the_same_prefixed_peer_id() {
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let mut buf = Vec::new();
+            handshake_outgoing(&mut buf, &[1; 20], true, true, true).await.unwrap();
+            ids.push(handshake_incoming(&mut buf.as_slice()).await.unwrap().peer_id);
+        }
+        assert!(ids.iter().all(|i| *i == ids[0]));
+        assert_eq!(ids[0], *local_peer_id());
+        assert_eq!(&ids[0][..8], b"-TU0100-");
     }
 
     #[test]

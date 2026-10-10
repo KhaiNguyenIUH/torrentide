@@ -125,9 +125,24 @@ pub struct Pex {
     pub dropped: Vec<SocketAddr>,
 }
 
-/// Port 0, unspecified and multicast addresses are never worth dialing.
+/// Loopback, private and link-local addresses (including IPv4-mapped forms).
+/// A remote peer has no business handing these out, so PEX never dials them.
+pub fn is_lan(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_lan(IpAddr::V4(v4)),
+            None => {
+                let first = v6.segments()[0];
+                v6.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+            }
+        },
+    }
+}
+
+/// Port 0, unspecified, multicast and LAN addresses are never worth dialing.
 fn dialable(a: &SocketAddr) -> bool {
-    a.port() != 0 && !a.ip().is_unspecified() && !a.ip().is_multicast()
+    a.port() != 0 && !a.ip().is_unspecified() && !a.ip().is_multicast() && !is_lan(a.ip())
 }
 
 fn compact_v4(buf: &[u8], out: &mut Vec<SocketAddr>) {
@@ -235,7 +250,7 @@ mod tests {
     #[test]
     fn decode_filters_undialable_addresses() {
         let mut v4 = Vec::new();
-        for (ip, port) in [([0, 0, 0, 0], 80u16), ([1, 1, 1, 1], 0), ([224, 0, 0, 1], 80), ([8, 8, 8, 8], 53)] {
+        for (ip, port) in [([0, 0, 0, 0], 80u16), ([1, 1, 1, 1], 0), ([224, 0, 0, 1], 80), ([127, 0, 0, 1], 80), ([10, 1, 2, 3], 80), ([172, 16, 0, 1], 80), ([192, 168, 1, 1], 80), ([169, 254, 1, 1], 80), ([8, 8, 8, 8], 53)] {
             v4.extend_from_slice(&ip);
             v4.extend_from_slice(&port.to_be_bytes());
         }
@@ -243,6 +258,16 @@ mod tests {
         d.insert(b"added".to_vec(), Value::Bytes(v4));
         let p = decode(&bencode::encode(&Value::Dict(d)));
         assert_eq!(p.added, vec![sa("8.8.8.8:53")]);
+    }
+
+    #[test]
+    fn is_lan_covers_v6_and_mapped_forms() {
+        for lan in ["127.0.0.1", "::1", "fc00::1", "fd12::1", "fe80::1", "::ffff:10.0.0.1", "::ffff:127.0.0.1", "::ffff:192.168.0.1"] {
+            assert!(is_lan(lan.parse().unwrap()), "{lan}");
+        }
+        for public in ["8.8.8.8", "2606:4700::1", "::ffff:8.8.8.8", "100.64.0.1"] {
+            assert!(!is_lan(public.parse().unwrap()), "{public}");
+        }
     }
 
     #[test]
@@ -261,7 +286,7 @@ mod tests {
 
         let mut big = Vec::new();
         for i in 0..5000u32 {
-            big.extend_from_slice(&[10, 0, (i >> 8) as u8, i as u8, 0x1a, 0xe1]);
+            big.extend_from_slice(&[11, 0, (i >> 8) as u8, i as u8, 0x1a, 0xe1]);
         }
         let mut d = BTreeMap::new();
         d.insert(b"added".to_vec(), Value::Bytes(big.clone()));
@@ -273,7 +298,7 @@ mod tests {
 
     #[test]
     fn encode_caps_outgoing_lists() {
-        let many: Vec<SocketAddr> = (0..200u16).map(|i| sa(&format!("10.0.0.{}:{}", i % 250, 1000 + i))).collect();
+        let many: Vec<SocketAddr> = (0..200u16).map(|i| sa(&format!("11.0.0.{}:{}", i % 250, 1000 + i))).collect();
         assert_eq!(decode(&encode(&many, &many)).added.len(), MAX_SENT);
     }
 

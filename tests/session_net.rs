@@ -30,6 +30,7 @@ fn settings(dir: &std::path::Path) -> Settings {
         port_forwarding: false,
         lsd: false,
         notifications: false,
+        allow_local_urls: true,
         ..Settings::default()
     }
 }
@@ -379,4 +380,62 @@ async fn pending_downloads_are_bounded_and_feeds_have_their_own_slot() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(logged(&*h.state().read().await, "too many pending downloads"), 8);
     quit(h).await;
+}
+
+#[tokio::test]
+async fn local_urls_are_refused_unless_allowed() {
+    let (addr, routes) = http_server().await;
+    routes.lock().unwrap().insert("/a.torrent".into(), torrent("alpha"));
+    routes.lock().unwrap().insert("/feed".into(), feed_xml(&[("Alpha one", "alpha1.torrent")], addr));
+    let mut s = settings(&temp_dir("dl"));
+    s.allow_local_urls = false;
+    let h = Session::start_in(Store::at(temp_dir("home")), s).await.unwrap();
+    for host in [format!("127.0.0.1:{}", addr.port()), format!("[::1]:{}", addr.port()), "10.0.0.1:80".into(), "169.254.169.254".into()] {
+        h.command().send(SessionCommand::Add { source: format!("http://{host}/a.torrent"), dir: None }).unwrap();
+    }
+    h.command()
+        .send(SessionCommand::AddFeed { url: format!("http://{addr}/feed"), include: vec![], exclude: vec![], dir: None })
+        .unwrap();
+    wait_for(&h, "refusals", |st| {
+        logged(st, "cannot add") == 4 && st.feeds.iter().any(|f| f.last_error.is_some())
+    })
+    .await;
+    {
+        let st = h.state();
+        let st = st.read().await;
+        assert!(st.torrents.is_empty());
+        let adds: Vec<_> = st.log.iter().filter(|l| l.message.contains("cannot add")).collect();
+        assert!(adds.iter().all(|l| l.message.ends_with("address not allowed")), "{adds:?}");
+        let err = st.feeds[0].last_error.as_deref().unwrap();
+        assert!(err.contains("address not allowed"), "{err}");
+        assert!(st.feeds[0].title.is_none());
+    }
+    quit(h).await;
+
+    let mut s = settings(&temp_dir("dl"));
+    s.allow_local_urls = true;
+    let h = Session::start_in(Store::at(temp_dir("home")), s).await.unwrap();
+    h.command().send(SessionCommand::Add { source: format!("http://{addr}/a.torrent"), dir: None }).unwrap();
+    wait_for(&h, "torrent from local url", |st| st.torrents.len() == 1).await;
+    quit(h).await;
+}
+
+#[tokio::test]
+async fn web_ui_listens_on_lan_only_with_lan_and_password() {
+    let case = |password: Option<&str>, lan: bool| {
+        let mut s = settings(&temp_dir("dl"));
+        s.webui = WebUiSettings { enabled: true, port: 0, password: password.map(str::to_owned), lan };
+        s
+    };
+    for (password, lan, open) in [(Some("correct horse battery"), false, false), (None, true, false), (Some("correct horse battery"), true, true)] {
+        let h = Session::start_in(Store::at(temp_dir("home")), case(password, lan)).await.unwrap();
+        let ip = h.webui_addr().expect("web UI bound").ip();
+        assert_eq!(ip.is_unspecified(), open, "password={password:?} lan={lan}");
+        assert_eq!(ip.is_loopback(), !open);
+        if open {
+            let st = h.state();
+            assert!(logged(&*st.read().await, "reachable from your network over plain HTTP") == 1);
+        }
+        quit(h).await;
+    }
 }
