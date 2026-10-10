@@ -1,2 +1,6 @@
 /target
 .DS_Store
+
+# Logs written when the session is run from this directory
+*.log
+*.log.err
