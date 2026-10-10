@@ -261,7 +261,7 @@ async fn request(addr: SocketAddr, method: &str, path: &str, auth: Option<&str>,
 async fn web_ui_with_password_runs_in_a_headless_session() {
     let home = temp_dir("home");
     let mut s = settings(&temp_dir("dl"));
-    s.webui = WebUiSettings { enabled: true, port: 0, password: Some("correct horse battery".into()) };
+    s.webui = WebUiSettings { enabled: true, port: 0, password: Some("correct horse battery".into()), lan: false };
     let h = Session::start_in(Store::at(&home), s).await.unwrap();
     let addr = SocketAddr::from(([127, 0, 0, 1], h.webui_addr().expect("web UI bound").port()));
     assert!(h.state().read().await.settings.webui.password.as_deref().unwrap().starts_with("torrust-sha1$"));
@@ -287,7 +287,7 @@ async fn web_ui_disabled_listens_nowhere() {
     let port = probe.local_addr().unwrap().port();
     drop(probe);
     let mut s = settings(&temp_dir("dl"));
-    s.webui = WebUiSettings { enabled: false, port, password: None };
+    s.webui = WebUiSettings { enabled: false, port, password: None, lan: false };
     let h = Session::start_in(Store::at(temp_dir("home")), s).await.unwrap();
     assert!(h.webui_addr().is_none());
     assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
@@ -299,7 +299,7 @@ async fn web_ui_bind_failure_is_a_warning() {
     let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = taken.local_addr().unwrap().port();
     let mut s = settings(&temp_dir("dl"));
-    s.webui = WebUiSettings { enabled: true, port, password: None };
+    s.webui = WebUiSettings { enabled: true, port, password: None, lan: false };
     let h = Session::start_in(Store::at(temp_dir("home")), s).await.unwrap();
     assert!(h.webui_addr().is_none());
     assert_eq!(logged(&*h.state().read().await, "web UI unavailable"), 1);
@@ -321,7 +321,7 @@ async fn http_get(addr: SocketAddr, path: &str, extra: &str) -> (u16, String) {
 async fn web_ui_without_a_password_needs_the_logged_token() {
     let home = temp_dir("home");
     let mut s = settings(&temp_dir("dl"));
-    s.webui = WebUiSettings { enabled: true, port: 0, password: None };
+    s.webui = WebUiSettings { enabled: true, port: 0, password: None, lan: false };
     let h = Session::start_in(Store::at(&home), s.clone()).await.unwrap();
     let addr = SocketAddr::from(([127, 0, 0, 1], h.webui_addr().expect("web UI bound").port()));
     let url = h.webui_url().expect("token URL").to_owned();

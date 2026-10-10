@@ -269,6 +269,10 @@ pub struct Settings {
     pub schedule: crate::schedule::Schedule,
     /// Desktop notification when a download finishes.
     pub notifications: bool,
+    /// Let torrent links, feeds and web seeds reach loopback and private
+    /// (LAN) addresses. Off by default so a remote link can't probe the
+    /// local network.
+    pub allow_local_urls: bool,
 }
 
 /// Whether peer connections are obfuscated with Message Stream Encryption.
@@ -310,6 +314,9 @@ pub struct WebUiSettings {
     pub port: u16,
     /// Without a password the web UI only listens on 127.0.0.1.
     pub password: Option<String>,
+    /// Listen on every interface instead of loopback. Only honoured with a
+    /// password; the connection is plain HTTP, so prefer an SSH tunnel.
+    pub lan: bool,
 }
 
 impl Default for WebUiSettings {
@@ -318,6 +325,7 @@ impl Default for WebUiSettings {
             enabled: false,
             port: 8080,
             password: None,
+            lan: false,
         }
     }
 }
@@ -370,6 +378,7 @@ impl Default for Settings {
             blocklist: None,
             schedule: crate::schedule::Schedule::default(),
             notifications: true,
+            allow_local_urls: false,
         }
     }
 }

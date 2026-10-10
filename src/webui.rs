@@ -1057,7 +1057,7 @@ mod tests {
 
     #[test]
     fn bind_addr_is_loopback_without_password() {
-        let mut s = WebUiSettings { enabled: true, port: 9000, password: None };
+        let mut s = WebUiSettings { enabled: true, port: 9000, password: None, lan: false };
         assert_eq!(bind_addr(&s), "127.0.0.1:9000".parse().unwrap());
         s.password = Some(String::new());
         assert!(bind_addr(&s).ip().is_loopback());

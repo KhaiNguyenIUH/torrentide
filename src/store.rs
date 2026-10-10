@@ -1027,7 +1027,7 @@ mod tests {
         let s = Settings {
             encryption: EncryptionMode::Require,
             utp: false,
-            webui: crate::state::WebUiSettings { enabled: true, port: 9123, password: Some(hash_password("pw")) },
+            webui: crate::state::WebUiSettings { enabled: true, port: 9123, password: Some(hash_password("pw")), lan: false },
             ..Settings::default()
         };
         store.save_settings(&s).unwrap();
