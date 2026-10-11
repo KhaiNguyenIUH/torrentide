@@ -8,11 +8,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
-use torrust::bencode::{encode, Value};
-use torrust::engine::{Engine, EngineOptions};
-use torrust::state::{DownloadState, UiState};
-use torrust::storage::sha1_bytes;
-use torrust::Metainfo;
+use torrentide::bencode::{encode, Value};
+use torrentide::engine::{Engine, EngineOptions};
+use torrentide::state::{DownloadState, UiState};
+use torrentide::storage::sha1_bytes;
+use torrentide::Metainfo;
 
 const PIECE_LEN: usize = 16 * 1024;
 const FILES: [(&str, usize); 3] = [("a.bin", 100_000), ("sub/b.bin", 40_000), ("sub/c.bin", 131_077)];
@@ -23,7 +23,7 @@ fn temp_dir(tag: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let dir = std::env::temp_dir().join(format!("torrust-{tag}-{}-{nanos}-{n}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("torrentide-{tag}-{}-{nanos}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -159,7 +159,7 @@ async fn run(corrupt_first: bool) -> usize {
         ..Default::default()
     };
     let engine = Engine::with_options(meta, ui.clone(), cmd_rx, opts);
-    match tokio::time::timeout(Duration::from_secs(60), torrust::webseed::ALLOW_LOCAL.scope(true, engine.run(dir.clone()))).await {
+    match tokio::time::timeout(Duration::from_secs(60), torrentide::webseed::ALLOW_LOCAL.scope(true, engine.run(dir.clone()))).await {
         Ok(r) => r.expect("engine failed"),
         Err(_) => {
             let st = ui.read().await;

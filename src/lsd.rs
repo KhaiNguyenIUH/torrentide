@@ -55,7 +55,7 @@ impl Lsd {
         let v6 = socket_v6(group_port)
             .map_err(|e| tracing::debug!(error = %e, "no IPv6 LSD group"))
             .ok();
-        let cookie = format!("torrust-{:016x}", rand::random::<u64>());
+        let cookie = format!("torrentide-{:016x}", rand::random::<u64>());
         let shared = Arc::new(Mutex::new(Shared {
             cookie,
             port,

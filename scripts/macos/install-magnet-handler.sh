@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bin="$(command -v torrust || true)"
+bin="$(command -v torrentide || true)"
 if [ -z "$bin" ]; then
-  echo "torrust not found on PATH; run 'cargo install --path .' first." >&2
+  echo "torrentide not found on PATH; run 'cargo install --path .' first." >&2
   exit 1
 fi
 
-app="$HOME/Applications/Torrust Magnet Handler.app"
+app="$HOME/Applications/Torrentide Magnet Handler.app"
 plist="$app/Contents/Info.plist"
-src="$(mktemp -t torrust-handler).applescript"
+src="$(mktemp -t torrentide-handler).applescript"
 trap 'rm -f "$src"' EXIT
 
 bin_q="${bin//\\/\\\\}"
 bin_q="${bin_q//\"/\\\"}"
 
 cat >"$src" <<APPLESCRIPT
-property torrustBin : "$bin_q"
+property torrentideBin : "$bin_q"
 
 on run
-	display dialog "Torrust Magnet Handler opens magnet: links and .torrent files with torrust." buttons {"OK"} default button "OK"
+	display dialog "Torrentide Magnet Handler opens magnet: links and .torrent files with torrentide." buttons {"OK"} default button "OK"
 end run
 
 on addSource(theSource)
 	try
-		do shell script (quoted form of torrustBin) & " add " & quoted form of theSource
+		do shell script (quoted form of torrentideBin) & " add " & quoted form of theSource
 	on error errMsg
-		display notification errMsg with title "torrust"
+		display notification errMsg with title "torrentide"
 	end try
 end addSource
 
@@ -47,7 +47,7 @@ osacompile -o "$app" "$src"
 
 pb=/usr/libexec/PlistBuddy
 "$pb" -c "Delete :CFBundleIdentifier" "$plist" 2>/dev/null || true
-"$pb" -c "Add :CFBundleIdentifier string org.torrust.MagnetHandler" "$plist"
+"$pb" -c "Add :CFBundleIdentifier string org.torrentide.MagnetHandler" "$plist"
 "$pb" -c "Delete :LSUIElement" "$plist" 2>/dev/null || true
 "$pb" -c "Add :LSUIElement bool true" "$plist"
 "$pb" -c "Delete :CFBundleURLTypes" "$plist" 2>/dev/null || true
@@ -70,6 +70,6 @@ codesign --force --sign - "$app" >/dev/null 2>&1 || true
 lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 "$lsregister" -f "$app"
 
-echo "Installed $app (torrust: $bin)"
-echo "To make it the default: open a magnet: link once and pick 'Torrust Magnet Handler' when asked,"
-echo "or right-click a .torrent file > Get Info > Open with > Torrust Magnet Handler > Change All."
+echo "Installed $app (torrentide: $bin)"
+echo "To make it the default: open a magnet: link once and pick 'Torrentide Magnet Handler' when asked,"
+echo "or right-click a .torrent file > Get Info > Open with > Torrentide Magnet Handler > Change All."

@@ -457,7 +457,7 @@ impl SessionState {
     }
 }
 
-/// Commands the session TUI (and `torrust add` over IPC) send to the session.
+/// Commands the session TUI (and `torrentide add` over IPC) send to the session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SessionCommand {
     /// A `.torrent` path or a `magnet:` URI; `dir` defaults to

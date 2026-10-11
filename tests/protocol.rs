@@ -8,18 +8,18 @@ use std::time::Duration;
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, RwLock};
-use torrust::bencode::{self, encode, Value};
-use torrust::blocklist::BlockList;
-use torrust::engine::{build_seeder, Engine, EngineOptions};
-use torrust::peer::connection::{accept, connect, FromPeer, ToPeer};
-use torrust::peer::wire::{self, handshake_incoming, handshake_outgoing, Message};
-use torrust::peer::PeerStream;
-use torrust::ratelimit::Limits;
-use torrust::session::Session;
-use torrust::state::{Command, DownloadState, EncryptionMode, SessionCommand, Settings, UiState};
-use torrust::store::Store;
-use torrust::storage::{sha1_bytes, Storage};
-use torrust::{InfoHash, Metainfo};
+use torrentide::bencode::{self, encode, Value};
+use torrentide::blocklist::BlockList;
+use torrentide::engine::{build_seeder, Engine, EngineOptions};
+use torrentide::peer::connection::{accept, connect, FromPeer, ToPeer};
+use torrentide::peer::wire::{self, handshake_incoming, handshake_outgoing, Message};
+use torrentide::peer::PeerStream;
+use torrentide::ratelimit::Limits;
+use torrentide::session::Session;
+use torrentide::state::{Command, DownloadState, EncryptionMode, SessionCommand, Settings, UiState};
+use torrentide::store::Store;
+use torrentide::storage::{sha1_bytes, Storage};
+use torrentide::{InfoHash, Metainfo};
 
 const PIECE_LEN: usize = 16 * 1024;
 const WAIT: Duration = Duration::from_secs(10);
@@ -113,11 +113,11 @@ async fn seed_listener(pieces: usize, complete: bool) -> Seed {
     let storage = Arc::new(Storage::prepare(&meta, &dir).unwrap());
     let seeder = complete.then(|| build_seeder(storage, &meta, &vec![true; pieces]).unwrap());
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (addr, _h) = torrust::peer::pool::listen(Arc::clone(&meta), seeder, 0, tx).await.unwrap();
+    let (addr, _h) = torrentide::peer::pool::listen(Arc::clone(&meta), seeder, 0, tx).await.unwrap();
     tokio::spawn(async move {
         let mut live = vec![];
         while let Some((_, ev)) = rx.recv().await {
-            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+            if let torrentide::peer::connection::FromPeer::Connected(h) = ev {
                 live.push(h);
             }
         }
@@ -125,7 +125,7 @@ async fn seed_listener(pieces: usize, complete: bool) -> Seed {
     Seed { addr: loopback(addr), meta, data, _dir: dir }
 }
 
-fn no_seeder() -> Arc<StdRwLock<Option<torrust::peer::connection::Seeder>>> {
+fn no_seeder() -> Arc<StdRwLock<Option<torrentide::peer::connection::Seeder>>> {
     Arc::new(StdRwLock::new(None))
 }
 
@@ -136,17 +136,17 @@ async fn ut_metadata_client_fetches_the_info_dict_from_a_running_peer() {
     let meta = fake_torrent(2000, false);
     assert!(meta.info_bytes.len() > 2 * 16 * 1024 - 1, "needs three metadata pieces");
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (addr, _h) = torrust::peer::pool::listen(Arc::new(meta.clone()), None, 0, tx).await.unwrap();
+    let (addr, _h) = torrentide::peer::pool::listen(Arc::new(meta.clone()), None, 0, tx).await.unwrap();
     tokio::spawn(async move {
         let mut live = vec![];
         while let Some((_, ev)) = rx.recv().await {
-            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+            if let torrentide::peer::connection::FromPeer::Connected(h) = ev {
                 live.push(h);
             }
         }
     });
 
-    let got = torrust::dht::fetch_metadata_from_peer(loopback(addr), meta.infohash, WAIT, EncryptionMode::Disabled, None)
+    let got = torrentide::dht::fetch_metadata_from_peer(loopback(addr), meta.infohash, WAIT, EncryptionMode::Disabled, None)
         .await
         .unwrap();
     assert_eq!(got, meta.info_bytes);
@@ -187,11 +187,11 @@ async fn metadata_reply_type(s: &mut TcpStream, our_id: u8) -> i64 {
 async fn metadata_requests_are_bounded_and_rate_limited() {
     let meta = fake_torrent(400, false);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (addr, _h) = torrust::peer::pool::listen(Arc::new(meta.clone()), None, 0, tx).await.unwrap();
+    let (addr, _h) = torrentide::peer::pool::listen(Arc::new(meta.clone()), None, 0, tx).await.unwrap();
     tokio::spawn(async move {
         let mut live = vec![];
         while let Some((_, ev)) = rx.recv().await {
-            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+            if let torrentide::peer::connection::FromPeer::Connected(h) = ev {
                 live.push(h);
             }
         }
@@ -218,11 +218,11 @@ async fn metadata_requests_are_bounded_and_rate_limited() {
 async fn private_torrents_do_not_offer_the_extension_protocol() {
     let meta = fake_torrent(4, true);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (addr, _h) = torrust::peer::pool::listen(Arc::new(meta.clone()), None, 0, tx).await.unwrap();
+    let (addr, _h) = torrentide::peer::pool::listen(Arc::new(meta.clone()), None, 0, tx).await.unwrap();
     tokio::spawn(async move {
         let mut live = vec![];
         while let Some((_, ev)) = rx.recv().await {
-            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+            if let torrentide::peer::connection::FromPeer::Connected(h) = ev {
                 live.push(h);
             }
         }
@@ -290,7 +290,7 @@ async fn requests_we_cannot_serve_are_rejected_under_fast_and_ignored_otherwise(
 async fn client_to_raw_server(
     fast_server: bool,
 ) -> (
-    torrust::peer::PeerHandle,
+    torrentide::peer::PeerHandle,
     mpsc::UnboundedReceiver<FromPeer>,
     TcpStream,
 ) {
@@ -761,7 +761,7 @@ async fn blocked_inbound_connections_are_dropped() {
 
 // ------------------------------------------------------------ peer flags
 
-async fn flags_of(h: &torrust::session::SessionHandle, id: &str) -> Vec<String> {
+async fn flags_of(h: &torrentide::session::SessionHandle, id: &str) -> Vec<String> {
     for _ in 0..600 {
         let flags: Vec<String> = h
             .state()

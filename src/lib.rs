@@ -1,4 +1,4 @@
-//! torrust — a BitTorrent client written from scratch in Rust.
+//! torrentide — a BitTorrent client written from scratch in Rust.
 //!
 //! Module layout:
 //! - [`bencode`] — the BEncode serialisation format

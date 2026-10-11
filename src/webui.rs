@@ -39,7 +39,7 @@ const FAIL_WINDOW: Duration = Duration::from_secs(60);
 const BLOCK_BASE: Duration = Duration::from_secs(15);
 const BLOCK_MAX: Duration = Duration::from_secs(15 * 60);
 const MAX_TRACKED_IPS: usize = 1024;
-const TOKEN_COOKIE: &str = "torrust_token";
+const TOKEN_COOKIE: &str = "torrentide_token";
 
 /// `script-src 'unsafe-inline'` because the page is one self-contained file;
 /// all dynamic content reaches the DOM through `textContent`, never HTML.
@@ -552,7 +552,7 @@ fn unauthorized() -> Vec<u8> {
     response(
         401,
         "application/json; charset=utf-8",
-        "WWW-Authenticate: Basic realm=\"torrust\", charset=\"UTF-8\"\r\n",
+        "WWW-Authenticate: Basic realm=\"torrentide\", charset=\"UTF-8\"\r\n",
         b"{\"error\":\"authentication required\"}",
     )
 }
@@ -974,7 +974,7 @@ mod tests {
         (Arc::new(RwLock::new(st)), rx)
     }
 
-    const COOKIE: &str = "Cookie: torrust_token=tok123\r\n";
+    const COOKIE: &str = "Cookie: torrentide_token=tok123\r\n";
 
     async fn start(
         state: Arc<RwLock<SessionState>>,
@@ -1121,7 +1121,7 @@ mod tests {
 
         let (status, head, body) = raw(addr, &get(addr, "/", COOKIE)).await;
         assert_eq!(status, 200);
-        assert!(body.contains("<title>torrust</title>"));
+        assert!(body.contains("<title>torrentide</title>"));
         let lower = head.to_ascii_lowercase();
         assert!(lower.contains("cache-control: no-store"));
         assert!(lower.contains("x-content-type-options: nosniff"));
@@ -1143,7 +1143,7 @@ mod tests {
         assert!(body.contains("\"download_rate\":0"));
 
         assert_eq!(raw(addr, &get(addr, "/nope", COOKIE)).await.0, 404);
-        assert_eq!(raw(addr, b"DELETE / HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: torrust_token=tok123\r\n\r\n").await.0, 405);
+        assert_eq!(raw(addr, b"DELETE / HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: torrentide_token=tok123\r\n\r\n").await.0, 405);
     }
 
     #[tokio::test]
@@ -1281,13 +1281,13 @@ mod tests {
         let path = "/api/feeds/7/remove";
 
         let evil = format!(
-            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nCookie: torrust_token=tok123\r\nOrigin: http://evil.example\r\nContent-Length: 0\r\n\r\n"
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nCookie: torrentide_token=tok123\r\nOrigin: http://evil.example\r\nContent-Length: 0\r\n\r\n"
         );
         assert_eq!(raw(addr, evil.as_bytes()).await.0, 403);
-        let none = format!("POST {path} HTTP/1.1\r\nHost: {addr}\r\nCookie: torrust_token=tok123\r\nContent-Length: 0\r\n\r\n");
+        let none = format!("POST {path} HTTP/1.1\r\nHost: {addr}\r\nCookie: torrentide_token=tok123\r\nContent-Length: 0\r\n\r\n");
         assert_eq!(raw(addr, none.as_bytes()).await.0, 403);
         let referer = format!(
-            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nCookie: torrust_token=tok123\r\nReferer: http://{addr}/\r\nContent-Length: 0\r\n\r\n"
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nCookie: torrentide_token=tok123\r\nReferer: http://{addr}/\r\nContent-Length: 0\r\n\r\n"
         );
         assert_eq!(raw(addr, referer.as_bytes()).await.0, 200);
         assert_eq!(rx.try_recv().unwrap(), SessionCommand::RemoveFeed(7));
@@ -1303,7 +1303,7 @@ mod tests {
         assert_eq!(raw(addr, &get(addr, "/", &big)).await.0, 431);
 
         let req = format!(
-            "POST /api/add HTTP/1.1\r\nHost: {addr}\r\nCookie: torrust_token=tok123\r\nOrigin: http://{addr}\r\nContent-Length: {}\r\n\r\n",
+            "POST /api/add HTTP/1.1\r\nHost: {addr}\r\nCookie: torrentide_token=tok123\r\nOrigin: http://{addr}\r\nContent-Length: {}\r\n\r\n",
             MAX_BODY + 1
         );
         assert_eq!(raw(addr, req.as_bytes()).await.0, 413);
@@ -1357,7 +1357,7 @@ mod tests {
 
     /// A scratch download root so the folder tests never touch `$HOME`.
     fn scratch_root(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("torrust-webui-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("torrentide-webui-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::canonicalize(dir).unwrap()
@@ -1421,13 +1421,13 @@ mod tests {
     #[test]
     fn a_refused_folder_is_not_created_on_the_way_out() {
         let root = scratch_root("nocreate");
-        let outside = root.parent().unwrap().join("torrust-webui-should-not-exist");
+        let outside = root.parent().unwrap().join("torrentide-webui-should-not-exist");
         let _ = std::fs::remove_dir_all(&outside);
         let asked = outside.join("nested");
         assert!(save_dir(&root, &[], Some(&asked.display().to_string())).is_err());
         assert!(!outside.exists(), "a refused folder was created anyway");
         // The same for a relative name that tries to climb out.
-        assert!(save_dir(&root, &[], Some("../torrust-webui-should-not-exist")).is_err());
+        assert!(save_dir(&root, &[], Some("../torrentide-webui-should-not-exist")).is_err());
         assert!(!outside.exists(), "a refused folder was created anyway");
     }
 
@@ -1501,7 +1501,7 @@ mod tests {
         assert_eq!(status, 408);
 
         let req = format!(
-            "POST /api/add HTTP/1.1\r\nHost: {addr}\r\nCookie: torrust_token=tok123\r\nOrigin: http://{addr}\r\nContent-Length: 50\r\n\r\nsource=x"
+            "POST /api/add HTTP/1.1\r\nHost: {addr}\r\nCookie: torrentide_token=tok123\r\nOrigin: http://{addr}\r\nContent-Length: 50\r\n\r\nsource=x"
         );
         assert_eq!(raw(addr, req.as_bytes()).await.0, 408);
     }
@@ -1676,7 +1676,7 @@ mod tests {
 
         for path in ["/", "/api/state"] {
             assert_eq!(raw(addr, &get(addr, path, "")).await.0, 401, "{path}");
-            assert_eq!(raw(addr, &get(addr, path, "Cookie: torrust_token=nope\r\n")).await.0, 401);
+            assert_eq!(raw(addr, &get(addr, path, "Cookie: torrentide_token=nope\r\n")).await.0, 401);
             assert_eq!(raw(addr, &get(addr, path, "Authorization: Bearer nope\r\n")).await.0, 401);
         }
         assert_eq!(raw(addr, &get(addr, "/?token=nope", "")).await.0, 401);
@@ -1687,15 +1687,15 @@ mod tests {
         assert_eq!(status, 303);
         assert!(head.contains("Location: /\r\n"));
         let cookie = head.lines().find(|l| l.starts_with("Set-Cookie: ")).unwrap();
-        assert_eq!(cookie, "Set-Cookie: torrust_token=tok123; HttpOnly; SameSite=Strict; Path=/");
+        assert_eq!(cookie, "Set-Cookie: torrentide_token=tok123; HttpOnly; SameSite=Strict; Path=/");
 
         assert_eq!(raw(addr, &get(addr, "/", COOKIE)).await.0, 200);
-        assert_eq!(raw(addr, &get(addr, "/api/state", "Cookie: a=b; torrust_token=tok123\r\n")).await.0, 200);
+        assert_eq!(raw(addr, &get(addr, "/api/state", "Cookie: a=b; torrentide_token=tok123\r\n")).await.0, 200);
         assert_eq!(raw(addr, &get(addr, "/api/state", "Authorization: Bearer tok123\r\n")).await.0, 200);
         assert_eq!(raw(addr, &post(addr, "/api/feeds/7/remove", "", COOKIE)).await.0, 200);
         assert_eq!(rx.try_recv().unwrap(), SessionCommand::RemoveFeed(7));
 
-        let rebound = "GET /api/state HTTP/1.1\r\nHost: evil.example\r\nCookie: torrust_token=tok123\r\n\r\n";
+        let rebound = "GET /api/state HTTP/1.1\r\nHost: evil.example\r\nCookie: torrentide_token=tok123\r\n\r\n";
         assert_eq!(raw(addr, rebound.as_bytes()).await.0, 403);
         let rebound = "GET /?token=tok123 HTTP/1.1\r\nHost: evil.example\r\n\r\n";
         assert_eq!(raw(addr, rebound.as_bytes()).await.0, 403);

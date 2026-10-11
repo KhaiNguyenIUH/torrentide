@@ -1854,7 +1854,7 @@ mod tests {
         };
         let mut s = Scheduler::new(&meta);
 
-        let dir = std::env::temp_dir().join(format!("torrust-engine-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("torrentide-engine-{}", std::process::id()));
         let store = Storage::prepare(&meta, &dir).unwrap();
 
         // begin = 3 * BLOCK_SIZE => block index 3
@@ -1892,7 +1892,7 @@ mod tests {
             info_bytes: vec![],
         };
         let mut s = Scheduler::new(&meta);
-        let dir = std::env::temp_dir().join(format!("torrust-engine4-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("torrentide-engine4-{}", std::process::id()));
         let store = Storage::prepare(&meta, &dir).unwrap();
         store.write_at(0, &vec![0x11; BLOCK_SIZE as usize * 5]).unwrap();
         s.block_map_mut().mark_verified(0);
@@ -1933,7 +1933,7 @@ mod tests {
             info_bytes: vec![],
         };
         let mut s = Scheduler::new(&meta);
-        let dir = std::env::temp_dir().join(format!("torrust-engine3-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("torrentide-engine3-{}", std::process::id()));
         let store = Storage::prepare(&meta, &dir).unwrap();
         let rarity: HashMap<u32, u32> = (0..8).map(|p| (p, 1)).collect();
 
@@ -1983,7 +1983,7 @@ mod tests {
             info_bytes: vec![],
         };
         let mut s = Scheduler::new(&meta);
-        let dir = std::env::temp_dir().join(format!("torrust-engine2-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("torrentide-engine2-{}", std::process::id()));
         let store = Storage::prepare(&meta, &dir).unwrap();
         for b in 0..3u32 {
             handle_peer_event(

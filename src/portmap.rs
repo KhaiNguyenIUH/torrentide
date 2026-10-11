@@ -27,7 +27,7 @@ const SSDP_WINDOW: Duration = Duration::from_secs(2);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(4);
 const HTTP_MAX_BYTES: u64 = 512 * 1024;
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
-const DESCRIPTION: &str = "torrust";
+const DESCRIPTION: &str = "torrentide";
 
 #[derive(Debug, Error)]
 pub enum PortMapError {

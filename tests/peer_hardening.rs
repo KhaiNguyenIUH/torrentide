@@ -7,12 +7,12 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::mpsc;
-use torrust::metainfo::{Files, InfoHash, Metainfo};
-use torrust::peer::connection::{accept, connect, FromPeer, PeerHandle, Seeder, ToPeer};
-use torrust::peer::wire::{self, handshake_incoming, handshake_outgoing, Message};
-use torrust::peer::Bitfield;
-use torrust::ratelimit::Limits;
-use torrust::storage::Storage;
+use torrentide::metainfo::{Files, InfoHash, Metainfo};
+use torrentide::peer::connection::{accept, connect, FromPeer, PeerHandle, Seeder, ToPeer};
+use torrentide::peer::wire::{self, handshake_incoming, handshake_outgoing, Message};
+use torrentide::peer::Bitfield;
+use torrentide::ratelimit::Limits;
+use torrentide::storage::Storage;
 
 const WAIT: Duration = Duration::from_secs(10);
 const PL: u32 = 128 * 1024;

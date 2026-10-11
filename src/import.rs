@@ -388,7 +388,7 @@ mod tests {
     impl TempDir {
         fn new(tag: &str) -> Self {
             let p = std::env::temp_dir().join(format!(
-                "torrust-import-{tag}-{}-{}",
+                "torrentide-import-{tag}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

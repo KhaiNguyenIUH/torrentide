@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use torrust::bencode::{encode, Value};
-use torrust::session::{Session, SessionHandle};
-use torrust::state::{DownloadState, EncryptionMode, SessionCommand, Settings};
-use torrust::storage::sha1_bytes;
-use torrust::store::Store;
-use torrust::Metainfo;
+use torrentide::bencode::{encode, Value};
+use torrentide::session::{Session, SessionHandle};
+use torrentide::state::{DownloadState, EncryptionMode, SessionCommand, Settings};
+use torrentide::storage::sha1_bytes;
+use torrentide::store::Store;
+use torrentide::Metainfo;
 
 use EncryptionMode::{Disabled, Prefer, Require};
 
@@ -121,7 +121,7 @@ fn capture_logs() -> Arc<Mutex<Vec<u8>>> {
         let w = Arc::clone(&buf);
         let _ = tracing::subscriber::set_global_default(
             tracing_subscriber::fmt()
-                .with_env_filter("torrust=debug")
+                .with_env_filter("torrentide=debug")
                 .with_ansi(false)
                 .with_writer(move || LogWriter(Arc::clone(&w)))
                 .finish(),

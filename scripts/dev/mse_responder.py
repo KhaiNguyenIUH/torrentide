@@ -1,5 +1,5 @@
 # Independent MSE (BitTorrent protocol encryption) responder written from the spec,
-# used to check torrust's initiator. Accepts one connection, prints what happened.
+# used to check torrentide's initiator. Accepts one connection, prints what happened.
 import hashlib, os, socket, sys
 P = int("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A63A36210000000000090563", 16)
 def h(*p): return hashlib.sha1(b"".join(p)).digest()

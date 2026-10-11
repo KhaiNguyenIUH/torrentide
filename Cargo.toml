@@ -1,11 +1,11 @@
 [package]
-name = "torrust"
+name = "torrentide"
 version = "0.1.6"
 edition = "2021"
 description = "Lightweight BitTorrent client with a terminal UI and web UI: magnet links, DHT, uTP, encryption and RSS"
 license = "MIT"
-repository = "https://github.com/KhaiNguyenIUH/torrust"
-homepage = "https://github.com/KhaiNguyenIUH/torrust"
+repository = "https://github.com/KhaiNguyenIUH/torrentide"
+homepage = "https://github.com/KhaiNguyenIUH/torrentide"
 readme = "README.md"
 keywords = ["bittorrent", "torrent", "magnet", "tui", "p2p"]
 categories = ["command-line-utilities", "network-programming"]

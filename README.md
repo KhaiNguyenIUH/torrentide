@@ -1,15 +1,17 @@
-<h1 align="center">torrust</h1>
+<h1 align="center">torrentide</h1>
 
 <p align="center">A free, open-source BitTorrent client written from scratch in Rust, with a terminal UI and a web UI.</p>
 
 <p align="center">
-  <a href="https://github.com/KhaiNguyenIUH/torrust/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/KhaiNguyenIUH/torrust"></a>
-  <a href="https://github.com/KhaiNguyenIUH/torrust/actions/workflows/release.yml"><img alt="Release build" src="https://github.com/KhaiNguyenIUH/torrust/actions/workflows/release.yml/badge.svg"></a>
+  <a href="https://github.com/KhaiNguyenIUH/torrentide/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/KhaiNguyenIUH/torrentide"></a>
+  <a href="https://github.com/KhaiNguyenIUH/torrentide/actions/workflows/release.yml"><img alt="Release build" src="https://github.com/KhaiNguyenIUH/torrentide/actions/workflows/release.yml/badge.svg"></a>
   <img alt="Platforms" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey">
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/KhaiNguyenIUH/torrust"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/KhaiNguyenIUH/torrentide"></a>
 </p>
 
-torrust runs as a background session that you drive from a terminal UI or a small web UI. Closing either one leaves your downloads running. It speaks the parts of BitTorrent you would expect from a desktop client (trackers, DHT, peer exchange, uTP, encryption, magnet links, RSS) without depending on libtorrent or any other BitTorrent library. The crate is both a library (`torrust`) and a binary.
+Formerly named torrust.
+
+torrentide runs as a background session that you drive from a terminal UI or a small web UI. Closing either one leaves your downloads running. It speaks the parts of BitTorrent you would expect from a desktop client (trackers, DHT, peer exchange, uTP, encryption, magnet links, RSS) without depending on libtorrent or any other BitTorrent library. The crate is both a library (`torrentide`) and a binary.
 
 If you want a lightweight torrent client you can run in a terminal, over SSH or headless on a server, and still open in a browser, it is a free alternative to qBittorrent, Transmission or uTorrent. It runs on macOS and Windows, and on Linux when built from source.
 
@@ -24,33 +26,33 @@ The project is MIT licensed. Bug reports, ideas and pull requests are welcome; s
 
 ### Prebuilt binaries
 
-Grab the file for your system from the [latest release](https://github.com/KhaiNguyenIUH/torrust/releases/latest), unpack it and run `torrust`. No Rust toolchain needed.
+Grab the file for your system from the [latest release](https://github.com/KhaiNguyenIUH/torrentide/releases/latest), unpack it and run `torrentide`. No Rust toolchain needed.
 
 | System | File | First run |
 | --- | --- | --- |
-| macOS, Apple Silicon | `torrust-vX.Y.Z-aarch64-apple-darwin.tar.gz` | `xattr -d com.apple.quarantine torrust`, or allow it in System Settings |
-| macOS, Intel | `torrust-vX.Y.Z-x86_64-apple-darwin.tar.gz` | same as above |
-| Windows 64-bit | `torrust-vX.Y.Z-x86_64-pc-windows-msvc.zip` | SmartScreen warns: "More info", then "Run anyway" |
+| macOS, Apple Silicon | `torrentide-vX.Y.Z-aarch64-apple-darwin.tar.gz` | `xattr -d com.apple.quarantine torrentide`, or allow it in System Settings |
+| macOS, Intel | `torrentide-vX.Y.Z-x86_64-apple-darwin.tar.gz` | same as above |
+| Windows 64-bit | `torrentide-vX.Y.Z-x86_64-pc-windows-msvc.zip` | SmartScreen warns: "More info", then "Run anyway" |
 
 The binaries are not signed, which is why each system asks once. The Windows build has had less testing than the macOS one, and on Windows the session runs inside the TUI instead of as a background service.
 
 ### From source
 
-You need a recent stable Rust toolchain. This is also the way to run torrust on Linux, which has no prebuilt binary yet.
+You need a recent stable Rust toolchain. This is also the way to run torrentide on Linux, which has no prebuilt binary yet.
 
-    cargo install --git https://github.com/KhaiNguyenIUH/torrust
+    cargo install --git https://github.com/KhaiNguyenIUH/torrentide
 
 or, from a clone:
 
-    cargo build --release      # binary at target/release/torrust
+    cargo build --release      # binary at target/release/torrentide
 
 ## Quick start
 
 ```sh
-torrust                                  # open the TUI (starts the background session)
-torrust add "magnet:?xt=urn:btih:..."    # add a magnet link or .torrent
-torrust webui-password                   # turn on the web UI at http://127.0.0.1:8080
-torrust stop                             # stop the session
+torrentide                                  # open the TUI (starts the background session)
+torrentide add "magnet:?xt=urn:btih:..."    # add a magnet link or .torrent
+torrentide webui-password                   # turn on the web UI at http://127.0.0.1:8080
+torrentide stop                             # stop the session
 ```
 
 ## Features
@@ -71,7 +73,7 @@ torrust stop                             # stop the session
 ```mermaid
 flowchart LR
     TUI[Terminal UI] -- Unix socket --> S
-    CLI[torrust add] -- Unix socket --> S
+    CLI[torrentide add] -- Unix socket --> S
     Web[Browser] -- HTTP --> S
     S[Background session] --> E[Torrent engines]
     E <--> P[Peers<br/>TCP · uTP · encrypted]
@@ -82,10 +84,10 @@ flowchart LR
 
 ## Usage
 
-    torrust download <file.torrent|magnet:?...> [-o DIR] [--exit-when-done] [--no-tui]
-    torrust inspect <file.torrent>
-    torrust magnet <uri>            # alias: m
-    torrust import <file.torrent> --from DIR [-o DIR] [--mode copy|move|link] [--no-verify] [--start] [--exit-when-done] [--no-tui]
+    torrentide download <file.torrent|magnet:?...> [-o DIR] [--exit-when-done] [--no-tui]
+    torrentide inspect <file.torrent>
+    torrentide magnet <uri>            # alias: m
+    torrentide import <file.torrent> --from DIR [-o DIR] [--mode copy|move|link] [--no-verify] [--start] [--exit-when-done] [--no-tui]
 
 - `download` fetches one torrent. `-o/--output` sets the save directory (default `.`) and `--no-tui` prints progress to stdout. With `--exit-when-done` it quits when the download completes; without it the finished state stays on screen until you press `q`. It stops, and stops seeding, once the download is complete.
 - `inspect` prints the parsed torrent without downloading anything.
@@ -94,34 +96,34 @@ flowchart LR
 
 ## Creating torrents
 
-    torrust create <file|dir> [-o out.torrent] [-t URL]... [--web-seed URL]... [--private] \
+    torrentide create <file|dir> [-o out.torrent] [-t URL]... [--web-seed URL]... [--private] \
         [--piece-size KiB] [--comment TEXT] [--source TEXT] [--no-date] [--force] [--seed]
 
 `create` builds a v1 `.torrent` from a file or directory and hashes the pieces on all CPU cores. Files are sorted by path and symlinks are skipped; a symlink given as the input itself is refused. Unless you pass `--piece-size`, the piece size is picked to give about 1000 to 2000 pieces. The output defaults to `<name>.torrent` in the current directory and an existing file is only overwritten with `--force`. The command prints the infohash and a magnet link. With `--seed` the torrent goes to the running session (or is queued) with the parent of `<path>` as its download directory, so seeding starts at once.
 
 ## Session mode
 
-    torrust                      # multi-torrent TUI (starts the background service if needed)
-    torrust stop                 # stop the background service
-    torrust session --no-tui     # headless, prints a summary every few seconds; Ctrl-C quits
-    torrust add <file.torrent|magnet:?...> [-o DIR]
-    torrust webui-password       # enable the web UI and set its password from stdin
+    torrentide                      # multi-torrent TUI (starts the background service if needed)
+    torrentide stop                 # stop the background service
+    torrentide session --no-tui     # headless, prints a summary every few seconds; Ctrl-C quits
+    torrentide add <file.torrent|magnet:?...> [-o DIR]
+    torrentide webui-password       # enable the web UI and set its password from stdin
 
-Running `torrust` with no subcommand attaches the TUI to the background session and starts the session first if it isn't running (Unix; the service logs to `torrust.log` in the data directory). `q` or Ctrl-C closes the TUI and leaves downloads and the web UI running. `Q` or `torrust stop` stops the session. On Windows the session runs inside the TUI process instead.
+Running `torrentide` with no subcommand attaches the TUI to the background session and starts the session first if it isn't running (Unix; the service logs to `torrentide.log` in the data directory). `q` or Ctrl-C closes the TUI and leaves downloads and the web UI running. `Q` or `torrentide stop` stops the session. On Windows the session runs inside the TUI process instead.
 
 One session runs many torrents behind a single listening port and DHT node. Finished torrents seed until they reach the ratio target (default 2.0, and 0 means seed forever), then stop. The ratio adds up across restarts, and a changed target applies to torrents started after the change.
 
-- `torrust add` hands a torrent to the running session over a Unix socket (`torrust.sock` in the data directory) and starts the background session if none is running. On Windows the torrent is queued and starts the next time `torrust` runs.
+- `torrentide add` hands a torrent to the running session over a Unix socket (`torrentide.sock` in the data directory) and starts the background session if none is running. On Windows the torrent is queued and starts the next time `torrentide` runs.
 - Dropping `.torrent` files onto the TUI, or pasting a magnet link, adds them right away. Inside the add prompt (`a`) a dropped path fills the field instead.
-- Settings, torrents and their state live in the data directory: `~/Library/Application Support/torrust` on macOS, `$XDG_DATA_HOME/torrust` (or `~/.local/share/torrust`) on Linux and `%APPDATA%\torrust` on Windows. Set `TORRUST_HOME` to use a different directory.
+- Settings, torrents and their state live in the data directory: `~/Library/Application Support/torrentide` on macOS, `$XDG_DATA_HOME/torrentide` (or `~/.local/share/torrentide`) on Linux and `%APPDATA%\torrentide` on Windows. Set `TORRENTIDE_HOME` to use a different directory (`TORRUST_HOME` still works). An old `torrust` data folder is moved automatically on first start.
 - Speed limits are in bytes per second (0 means unlimited) and can be set globally or per torrent. Uploads use tit-for-tat choking with 4 unchoke slots plus one optimistic slot, re-evaluated every 10 s.
 - The listen port defaults to 6881 and falls back to a free port when that one is busy. With port forwarding on, the session asks the router for it over NAT-PMP, then UPnP. Port, DHT and forwarding changes apply after a restart.
 - A magnet link keeps looking for its metadata until it arrives or you stop it. Every tracker in the link, the DHT and peers that connect to you are all used at once, over uTP and TCP. The torrent's status shows how long it has waited and how many trackers and peers it has heard from.
-- `scripts/macos` and `scripts/linux` install handlers that open `magnet:` links and `.torrent` files with `torrust add`.
+- `scripts/macos` and `scripts/linux` install handlers that open `magnet:` links and `.torrent` files with `torrentide add`.
 
 ## Encryption and uTP
 
-Session mode prefers encrypted peer connections (Message Stream Encryption) and tries uTP (BEP 29) before TCP, using the same port number over UDP. Both are settings. Encryption is `disabled`, `prefer` (the default, which encrypts when the peer supports it and falls back to plaintext) or `require` (encrypted peers only). The same setting covers fetching magnet metadata. Single-torrent `torrust download` uses plaintext TCP. Changes apply after a restart.
+Session mode prefers encrypted peer connections (Message Stream Encryption) and tries uTP (BEP 29) before TCP, using the same port number over UDP. Both are settings. Encryption is `disabled`, `prefer` (the default, which encrypts when the peer supports it and falls back to plaintext) or `require` (encrypted peers only). The same setting covers fetching magnet metadata. Single-torrent `torrentide download` uses plaintext TCP. Changes apply after a restart.
 
 ## RSS feeds
 
@@ -129,7 +131,7 @@ You can subscribe to RSS or Atom feeds over `http(s)`. Items whose title matches
 
 - Items already in the feed when you subscribe are skipped, and only later items are downloaded. The session logs `watching N existing items`.
 - Feeds and the items already seen are stored in `feeds.bencode` in the data directory, so a restart never adds anything twice.
-- A session also accepts an `http(s)` link to a `.torrent` (up to 10 MiB). Feed items and the web UI's add box deliver torrents this way, and `torrust add` takes them too. Links, feeds, redirects and web seeds that resolve to loopback, private (LAN), link-local, CGNAT or other non-public addresses are refused with "address not allowed" unless you turn on "Allow local network URLs" in settings (`allow_local_urls`). Peers on those addresses learned through peer exchange are skipped too, and local peer discovery only accepts announces from your own network.
+- A session also accepts an `http(s)` link to a `.torrent` (up to 10 MiB). Feed items and the web UI's add box deliver torrents this way, and `torrentide add` takes them too. Links, feeds, redirects and web seeds that resolve to loopback, private (LAN), link-local, CGNAT or other non-public addresses are refused with "address not allowed" unless you turn on "Allow local network URLs" in settings (`allow_local_urls`). Peers on those addresses learned through peer exchange are skipped too, and local peer discovery only accepts announces from your own network.
 
 ## Block list, schedule and notifications
 
@@ -144,17 +146,17 @@ You can subscribe to RSS or Atom feeds over `http(s)`. Items whose title matches
 
 The session has a small browser interface, off by default.
 
-- Without a password it listens on `127.0.0.1` only and needs an access token. The session creates a random 128-bit token, keeps it in `webui.token` in the data directory (readable only by you), and logs the one-time URL `http://127.0.0.1:PORT/?token=...`, which `torrust session` also prints at startup. Opening that URL stores the token in an HttpOnly cookie and redirects to `/`. Scripts can send `Authorization: Bearer <token>` instead.
+- Without a password it listens on `127.0.0.1` only and needs an access token. The session creates a random 128-bit token, keeps it in `webui.token` in the data directory (readable only by you), and logs the one-time URL `http://127.0.0.1:PORT/?token=...`, which `torrentide session` also prints at startup. Opening that URL stores the token in an HttpOnly cookie and redirects to `/`. Scripts can send `Authorization: Bearer <token>` instead.
 - With a password it still listens on `127.0.0.1` only and asks for the password (HTTP Basic, any user name) on every request. The `Host` header must be an IP address or `localhost`, which blocks DNS rebinding. After five wrong passwords from one address it answers 429 for a growing time, up to 15 minutes.
 - The settings screen has "Web UI on LAN (needs password)" (`webui_lan`). Only with that on and a password set does it listen on all interfaces, and the session logs a warning when it does, because the connection is plain HTTP. To reach it from another machine, an SSH tunnel is safer than LAN mode: `ssh -L 8080:127.0.0.1:8080 host`, then open `http://127.0.0.1:8080/` locally. If you need to expose it further, put a reverse proxy with TLS in front.
 - Besides links and magnets it takes a `.torrent` file from the "Choose .torrent" button or dropped anywhere on the page (up to 10 MiB, sent as raw bytes to `POST /api/upload`).
 - The optional folder box sets where an add, upload or drop is saved. A plain name such as `Movies/2024` is a subfolder of the download folder and is created if missing. A full path is accepted only inside the download folder or inside one of the "Web UI extra save folders" from the TUI settings (`webui_save_roots`, separated by `;`, e.g. `/Volumes/Media`). That lets the browser reach another drive without reaching an arbitrary place. `..`, backslashes and links that point outside an allowed folder are refused, and a refused folder is never created.
 - To enable it and set the password without leaving it in shell history:
 
-      torrust webui-password        # type the password and press Enter
-      torrust session --no-tui      # daemon mode: runs headless, serves the web UI, Ctrl-C quits
+      torrentide webui-password        # type the password and press Enter
+      torrentide session --no-tui      # daemon mode: runs headless, serves the web UI, Ctrl-C quits
 
-  The password is stored only as a salted, iterated SHA-1 hash (`torrust-sha1$100000$salt$hash`) in `settings.bencode`, which only you can read. The default port is 8080 (`webui.port` in the settings), and the session logs the URL it listens on. `webui-password` refuses to run while a session is running, because the session writes its own settings when it quits.
+  The password is stored only as a salted, iterated SHA-1 hash (`torrentide-sha1$100000$salt$hash`) in `settings.bencode`, which only you can read. The default port is 8080 (`webui.port` in the settings), and the session logs the URL it listens on. `webui-password` refuses to run while a session is running, because the session writes its own settings when it quits.
 - Settings, feeds and web UI changes made while the session runs are saved immediately and take effect after a restart.
 
 ## TUI keys
@@ -174,7 +176,7 @@ In the multi-torrent session UI, mouse clicks (torrent rows, tabs, footer key hi
 
 ## Logging
 
-Logging uses `tracing`. Set the level with `RUST_LOG` (default `torrust=info,warn`), e.g. `RUST_LOG=torrust=debug`. In TUI mode the logs go to `torrust.log` in the data directory so they don't garble the display. The file is owner-only (mode 0600), and a symlink in its place is refused. With `--no-tui` they go to stderr.
+Logging uses `tracing`. Set the level with `RUST_LOG` (default `torrentide=info,warn`), e.g. `RUST_LOG=torrentide=debug`. In TUI mode the logs go to `torrentide.log` in the data directory so they don't garble the display. The file is owner-only (mode 0600), and a symlink in its place is refused. With `--no-tui` they go to stderr.
 
 ## Project layout
 
@@ -197,7 +199,7 @@ Logging uses `tracing`. Set the level with `RUST_LOG` (default `torrust=info,war
 
 Contributions of any size are welcome, from typo fixes to protocol work.
 
-- **Bugs and ideas**: open an [issue](https://github.com/KhaiNguyenIUH/torrust/issues). For a bug, include your OS, the torrust version (`torrust --version`), what you did and what you expected. A log helps a lot: run with `RUST_LOG=torrust=debug` and attach `torrust.log` from the data directory, after removing anything private.
+- **Bugs and ideas**: open an [issue](https://github.com/KhaiNguyenIUH/torrentide/issues). For a bug, include your OS, the torrentide version (`torrentide --version`), what you did and what you expected. A log helps a lot: run with `RUST_LOG=torrentide=debug` and attach `torrentide.log` from the data directory, after removing anything private.
 - **Pull requests**: keep each one to a single change, add or update a test when you change behaviour, and run the checks below before you push. For larger changes, open an issue first so we can agree on the approach.
 - **Style**: follow the code around you. Format with `cargo fmt` on the lines you touch and keep `cargo clippy` free of new warnings.
 
@@ -210,4 +212,4 @@ The integration tests in `tests/` run the real engine against local seeders and 
 
 ## License
 
-torrust is released under the [MIT License](LICENSE).
+torrentide is released under the [MIT License](LICENSE).

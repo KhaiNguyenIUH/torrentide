@@ -8,13 +8,13 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
-use torrust::bencode::{encode, Value};
-use torrust::engine::{build_seeder, Engine};
-use torrust::session::{Session, SessionHandle};
-use torrust::state::{Command, DownloadState, FilePriority, SessionCommand, SessionState, Settings, UiState};
-use torrust::storage::{sha1_bytes, Storage};
-use torrust::store::Store;
-use torrust::Metainfo;
+use torrentide::bencode::{encode, Value};
+use torrentide::engine::{build_seeder, Engine};
+use torrentide::session::{Session, SessionHandle};
+use torrentide::state::{Command, DownloadState, FilePriority, SessionCommand, SessionState, Settings, UiState};
+use torrentide::storage::{sha1_bytes, Storage};
+use torrentide::store::Store;
+use torrentide::Metainfo;
 
 const PIECE_LEN: usize = 16 * 1024;
 const FILES: [(&str, usize); 3] = [("a.bin", 100_000), ("sub/b.bin", 40_000), ("sub/c.bin", 131_077)];
@@ -156,11 +156,11 @@ async fn seeder_for(fx: &Fixture) -> SocketAddr {
     let storage = Arc::new(Storage::prepare(&meta, &seed_dir).unwrap());
     let seeder = build_seeder(storage, &meta, &vec![true; meta.piece_count()]);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (addr, _h) = torrust::peer::pool::listen(Arc::new(meta), seeder, 0, tx).await.unwrap();
+    let (addr, _h) = torrentide::peer::pool::listen(Arc::new(meta), seeder, 0, tx).await.unwrap();
     tokio::spawn(async move {
         let mut live = vec![];
         while let Some((_, ev)) = rx.recv().await {
-            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+            if let torrentide::peer::connection::FromPeer::Connected(h) = ev {
                 live.push(h);
             }
         }
@@ -403,7 +403,7 @@ async fn remove_with_delete_data_touches_only_that_torrent() {
 #[cfg(unix)]
 #[tokio::test]
 async fn ipc_add_delivers_to_running_session_and_queues_otherwise() {
-    use torrust::ipc::{send_add_to, Delivery};
+    use torrentide::ipc::{send_add_to, Delivery};
 
     let fx = Fixture::new("one", 8);
     let dl = temp_dir("dl");
@@ -761,7 +761,7 @@ async fn missing_blocklist_file_logs_an_error() {
         let st = h.state();
         let st = st.read().await;
         assert_eq!(st.blocklist_ranges, 0);
-        assert!(st.log.iter().any(|l| l.level == torrust::state::Level::Error && l.message.contains("block list")));
+        assert!(st.log.iter().any(|l| l.level == torrentide::state::Level::Error && l.message.contains("block list")));
     }
     quit(h).await;
 }
@@ -773,7 +773,7 @@ async fn schedule_off_stops_running_torrents_and_disabling_restarts_them() {
     let (h, _home, id) = seeding_session(&fx, &dl).await;
     let mut s = h.state().read().await.settings.clone();
     s.schedule.enabled = true;
-    s.schedule.grid = torrust::schedule::Schedule::parse_grid(&"O".repeat(168)).unwrap();
+    s.schedule.grid = torrentide::schedule::Schedule::parse_grid(&"O".repeat(168)).unwrap();
     h.command().send(SessionCommand::SetSettings(s.clone())).unwrap();
     wait_for(&h, "stopped by schedule", 15, |st| torrent_state(st, &id) == Some(DownloadState::Queued)).await;
     assert!(h.state().read().await.log.iter().any(|l| l.message.contains("schedule: all transfers off")));

@@ -2,9 +2,9 @@
 //! Run `python3 -I scripts/dev/mse_responder.py <port> <infohash-hex>` first, then
 //! `MSE_PEER=127.0.0.1:<port> cargo test --test mse_interop -- --ignored`.
 
-use torrust::metainfo::InfoHash;
-use torrust::peer::{mse, wire};
-use torrust::state::EncryptionMode;
+use torrentide::metainfo::InfoHash;
+use torrentide::peer::{mse, wire};
+use torrentide::state::EncryptionMode;
 
 #[tokio::test]
 #[ignore]

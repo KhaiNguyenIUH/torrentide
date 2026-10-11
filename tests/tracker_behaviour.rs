@@ -7,13 +7,13 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
-use torrust::bencode::{encode, Value};
-use torrust::engine::{Engine, EngineOptions};
-use torrust::peer::connection::connect;
-use torrust::peer::wire::{handshake_incoming, local_peer_id};
-use torrust::state::{Command, UiState};
-use torrust::storage::sha1_bytes;
-use torrust::Metainfo;
+use torrentide::bencode::{encode, Value};
+use torrentide::engine::{Engine, EngineOptions};
+use torrentide::peer::connection::connect;
+use torrentide::peer::wire::{handshake_incoming, local_peer_id};
+use torrentide::state::{Command, UiState};
+use torrentide::storage::sha1_bytes;
+use torrentide::Metainfo;
 
 const PIECE_LEN: usize = 16 * 1024;
 const PIECES: usize = 4;
@@ -21,7 +21,7 @@ const PIECES: usize = 4;
 fn temp_dir(tag: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("torrust-tb-{tag}-{}-{n}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("torrentide-tb-{tag}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -173,7 +173,7 @@ async fn one_peer_id_for_every_announce_and_the_handshake() {
     let addr = listener.local_addr().unwrap();
     for _ in 0..2 {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let client = tokio::spawn(connect(addr, torrust::metainfo::InfoHash([5; 20]), 2, Arc::new(std::sync::RwLock::new(None)), tx, Default::default(), true, Some(1)));
+        let client = tokio::spawn(connect(addr, torrentide::metainfo::InfoHash([5; 20]), 2, Arc::new(std::sync::RwLock::new(None)), tx, Default::default(), true, Some(1)));
         let (mut s, _) = listener.accept().await.unwrap();
         let hs = handshake_incoming(&mut s).await.unwrap();
         assert_eq!(&hs.peer_id, local_peer_id());
@@ -199,7 +199,7 @@ async fn handshakes_on_private_torrents_never_set_the_dht_bit() {
     let addr = listener.local_addr().unwrap();
     for (ext, dht) in [(None, false), (Some(1u16), true)] {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let client = tokio::spawn(connect(addr, torrust::metainfo::InfoHash([5; 20]), 2, Arc::new(std::sync::RwLock::new(None)), tx, Default::default(), true, ext));
+        let client = tokio::spawn(connect(addr, torrentide::metainfo::InfoHash([5; 20]), 2, Arc::new(std::sync::RwLock::new(None)), tx, Default::default(), true, ext));
         let (mut s, _) = listener.accept().await.unwrap();
         let hs = handshake_incoming(&mut s).await.unwrap();
         assert_eq!(hs.supports_dht(), dht, "ext {ext:?}");

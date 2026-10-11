@@ -204,7 +204,7 @@ pub fn build(opts: &CreateOptions) -> Result<CreatedTorrent> {
     let info = Value::Dict(info);
     let infohash = InfoHash(Sha1::digest(encode(&info)).into());
 
-    let mut root = BTreeMap::from([(key("info"), info), (key("created by"), text(concat!("torrust ", env!("CARGO_PKG_VERSION"))))]);
+    let mut root = BTreeMap::from([(key("info"), info), (key("created by"), text(concat!("torrentide ", env!("CARGO_PKG_VERSION"))))]);
     if let Some(first) = opts.trackers.first() {
         root.insert(key("announce"), text(first));
         let tiers = opts.trackers.iter().map(|t| Value::List(vec![text(t)])).collect();
@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn symlink_input_is_refused() {
-        let dir = std::env::temp_dir().join(format!("torrust-create-link-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("torrentide-create-link-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("real.bin");
         std::fs::write(&target, vec![7u8; 40_000]).unwrap();

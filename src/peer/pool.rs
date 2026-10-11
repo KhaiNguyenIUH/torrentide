@@ -1661,7 +1661,7 @@ mod tests {
     async fn set_seeder_reaches_connected_peers() {
         use crate::peer::connection::connect;
         let meta = small_meta(2);
-        let dir = std::env::temp_dir().join(format!("torrust-pool-seed-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("torrentide-pool-seed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let storage = Arc::new(crate::storage::Storage::prepare(&meta, &dir).unwrap());
@@ -1736,7 +1736,7 @@ mod tests {
     #[tokio::test]
     async fn super_seed_reveals_on_timeout_and_never_before() {
         let meta = small_meta(4);
-        let dir = std::env::temp_dir().join(format!("torrust-pool-super-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("torrentide-pool-super-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let storage = Arc::new(crate::storage::Storage::prepare(&meta, &dir).unwrap());

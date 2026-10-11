@@ -9,13 +9,13 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use torrust::bencode::{encode, Value};
-use torrust::engine::build_seeder;
-use torrust::session::{Session, SessionHandle};
-use torrust::state::{DownloadState, SessionCommand, SessionState, Settings};
-use torrust::storage::{sha1_bytes, Storage};
-use torrust::store::Store;
-use torrust::Metainfo;
+use torrentide::bencode::{encode, Value};
+use torrentide::engine::build_seeder;
+use torrentide::session::{Session, SessionHandle};
+use torrentide::state::{DownloadState, SessionCommand, SessionState, Settings};
+use torrentide::storage::{sha1_bytes, Storage};
+use torrentide::store::Store;
+use torrentide::Metainfo;
 
 const PIECE_LEN: usize = 16 * 1024;
 const FILES: [(&str, usize); 3] = [("a.bin", 100_000), ("sub/b.bin", 40_000), ("sub/c.bin", 131_077)];
@@ -157,11 +157,11 @@ async fn seeder_for(fx: &Fixture) -> SocketAddr {
     let storage = Arc::new(Storage::prepare(&meta, &seed_dir).unwrap());
     let seeder = build_seeder(storage, &meta, &vec![true; meta.piece_count()]);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (addr, _h) = torrust::peer::pool::listen(Arc::new(meta), seeder, 0, tx).await.unwrap();
+    let (addr, _h) = torrentide::peer::pool::listen(Arc::new(meta), seeder, 0, tx).await.unwrap();
     tokio::spawn(async move {
         let mut live = vec![];
         while let Some((_, ev)) = rx.recv().await {
-            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+            if let torrentide::peer::connection::FromPeer::Connected(h) = ev {
                 live.push(h);
             }
         }

@@ -75,7 +75,7 @@ impl Message {
     }
 }
 
-/// Azureus-style client prefix: torrust 0.1.0.
+/// Azureus-style client prefix: torrentide 0.1.0.
 const PEER_ID_PREFIX: &[u8; 8] = b"-TU0100-";
 
 /// The one peer id this process uses in every handshake and tracker announce.

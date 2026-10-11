@@ -8,15 +8,15 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, RwLock};
-use torrust::bencode::{encode, Value};
-use torrust::engine::{build_seeder, Engine, EngineOptions};
-use torrust::peer::connection::FromPeer;
-use torrust::peer::pool::{listen, listen_with};
-use torrust::peer::wire::{self, handshake_incoming, handshake_outgoing, Message};
-use torrust::ratelimit::Limits;
-use torrust::state::{Command, UiState};
-use torrust::storage::{sha1_bytes, Storage};
-use torrust::Metainfo;
+use torrentide::bencode::{encode, Value};
+use torrentide::engine::{build_seeder, Engine, EngineOptions};
+use torrentide::peer::connection::FromPeer;
+use torrentide::peer::pool::{listen, listen_with};
+use torrentide::peer::wire::{self, handshake_incoming, handshake_outgoing, Message};
+use torrentide::ratelimit::Limits;
+use torrentide::state::{Command, UiState};
+use torrentide::storage::{sha1_bytes, Storage};
+use torrentide::Metainfo;
 
 const PIECE_LEN: usize = 16 * 1024;
 const FLOODERS: usize = 4;
@@ -101,7 +101,7 @@ async fn closed_within(s: &mut TcpStream, wait: Duration) -> bool {
 
 struct Drained {
     rx: mpsc::UnboundedReceiver<(SocketAddr, FromPeer)>,
-    live: Vec<Box<torrust::peer::connection::PeerHandle>>,
+    live: Vec<Box<torrentide::peer::connection::PeerHandle>>,
 }
 
 impl Drained {
@@ -264,7 +264,7 @@ async fn cli_inbound_peer_sees_pieces_verified_after_it_connected() {
     task.abort();
 }
 
-async fn adopted_peer(meta: &Metainfo) -> (TcpStream, (torrust::peer::PeerStream, SocketAddr, wire::Handshake)) {
+async fn adopted_peer(meta: &Metainfo) -> (TcpStream, (torrentide::peer::PeerStream, SocketAddr, wire::Handshake)) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let client = tokio::spawn({
@@ -278,7 +278,7 @@ async fn adopted_peer(meta: &Metainfo) -> (TcpStream, (torrust::peer::PeerStream
     let (mut server, from) = listener.accept().await.unwrap();
     let hs = handshake_incoming(&mut server).await.unwrap();
     let c = client.await.unwrap();
-    let boxed: torrust::peer::PeerStream = Box::new(server);
+    let boxed: torrentide::peer::PeerStream = Box::new(server);
     let item = (boxed, from, hs);
     (c, item)
 }

@@ -7,12 +7,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
-use torrust::bencode::{self, encode, Value};
-use torrust::create::{auto_piece_len, build, CreateOptions, MAX_PIECE_LEN, MIN_PIECE_LEN};
-use torrust::engine::{build_seeder, Engine};
-use torrust::state::{DownloadState, UiState};
-use torrust::storage::{sha1_bytes, Storage};
-use torrust::Metainfo;
+use torrentide::bencode::{self, encode, Value};
+use torrentide::create::{auto_piece_len, build, CreateOptions, MAX_PIECE_LEN, MIN_PIECE_LEN};
+use torrentide::engine::{build_seeder, Engine};
+use torrentide::state::{DownloadState, UiState};
+use torrentide::storage::{sha1_bytes, Storage};
+use torrentide::Metainfo;
 
 const PIECE: u32 = 16 * 1024;
 
@@ -22,7 +22,7 @@ fn temp_dir(tag: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let dir = std::env::temp_dir().join(format!("torrust-{tag}-{}-{nanos}-{n}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("torrentide-{tag}-{}-{nanos}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -90,7 +90,7 @@ fn single_file() {
     assert_eq!(meta.name, "one.bin");
     assert_eq!(t.total, 50_001);
     assert_eq!(t.pieces, 4);
-    assert!(matches!(meta.files, torrust::metainfo::Files::Single { length: 50_001, .. }));
+    assert!(matches!(meta.files, torrentide::metainfo::Files::Single { length: 50_001, .. }));
     verify_pieces(&meta, &data);
     assert!(!meta.private);
     assert!(t.magnet.starts_with(&format!("magnet:?xt=urn:btih:{}&dn=one%2Ebin", t.infohash.to_hex())));
@@ -98,7 +98,7 @@ fn single_file() {
     let root = bencode::decode(&t.bytes).unwrap();
     assert_eq!(root.get("comment").unwrap().as_str().unwrap(), "hello");
     assert!(root.get_opt("creation date").is_some());
-    assert!(root.get("created by").unwrap().as_str().unwrap().starts_with("torrust "));
+    assert!(root.get("created by").unwrap().as_str().unwrap().starts_with("torrentide "));
     assert!(root.get_opt("announce").is_none());
 }
 
@@ -176,7 +176,7 @@ fn rejects_bad_input() {
 fn cli_refuses_overwrite_without_force() {
     let dir = temp_dir("create-cli");
     std::fs::write(dir.join("f.bin"), payload(1, 1000)).unwrap();
-    let exe = env!("CARGO_BIN_EXE_torrust");
+    let exe = env!("CARGO_BIN_EXE_torrentide");
     let run = |force: bool| {
         let mut c = std::process::Command::new(exe);
         c.current_dir(&dir).args(["create", "f.bin", "--no-date"]);
@@ -236,13 +236,13 @@ async fn created_torrent_downloads_identically() {
     let storage = Arc::new(Storage::prepare(&placeholder, &seed_dir).unwrap());
     let seeder = build_seeder(storage, &placeholder, &vec![true; placeholder.piece_count()]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (seed_addr, _h) = torrust::peer::pool::listen(Arc::new(placeholder), seeder, 0, events_tx)
+    let (seed_addr, _h) = torrentide::peer::pool::listen(Arc::new(placeholder), seeder, 0, events_tx)
         .await
         .unwrap();
     tokio::spawn(async move {
         let mut live = vec![];
         while let Some((_, ev)) = events_rx.recv().await {
-            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+            if let torrentide::peer::connection::FromPeer::Connected(h) = ev {
                 live.push(h);
             }
         }

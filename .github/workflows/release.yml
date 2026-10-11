@@ -23,13 +23,13 @@ jobs:
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - if: runner.os != 'Windows'
-        run: tar -czf torrust-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release torrust
+        run: tar -czf torrentide-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release torrentide
       - if: runner.os == 'Windows'
-        run: 7z a torrust-${{ github.ref_name }}-${{ matrix.target }}.zip ./target/${{ matrix.target }}/release/torrust.exe
+        run: 7z a torrentide-${{ github.ref_name }}-${{ matrix.target }}.zip ./target/${{ matrix.target }}/release/torrentide.exe
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: torrust-*
+          path: torrentide-*
   publish:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
@@ -40,5 +40,5 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: torrust-*
+          files: torrentide-*
           generate_release_notes: true

@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=Torrust
+Name=Torrentide
 Comment=BitTorrent client
-Exec=torrust add %u
+Exec=torrentide add %u
 Terminal=false
 NoDisplay=true
 MimeType=x-scheme-handler/magnet;application/x-bittorrent;

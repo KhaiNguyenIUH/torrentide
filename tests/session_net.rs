@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use torrust::bencode::{encode, Value};
-use torrust::session::{Session, SessionHandle};
-use torrust::state::{SessionCommand, SessionState, Settings, WebUiSettings};
-use torrust::storage::sha1_bytes;
-use torrust::store::Store;
+use torrentide::bencode::{encode, Value};
+use torrentide::session::{Session, SessionHandle};
+use torrentide::state::{SessionCommand, SessionState, Settings, WebUiSettings};
+use torrentide::storage::sha1_bytes;
+use torrentide::store::Store;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -265,7 +265,7 @@ async fn web_ui_with_password_runs_in_a_headless_session() {
     s.webui = WebUiSettings { enabled: true, port: 0, password: Some("correct horse battery".into()), lan: false, save_roots: Vec::new() };
     let h = Session::start_in(Store::at(&home), s).await.unwrap();
     let addr = SocketAddr::from(([127, 0, 0, 1], h.webui_addr().expect("web UI bound").port()));
-    assert!(h.state().read().await.settings.webui.password.as_deref().unwrap().starts_with("torrust-sha1$"));
+    assert!(h.state().read().await.settings.webui.password.as_deref().unwrap().starts_with("torrentide-sha1$"));
 
     assert_eq!(request(addr, "GET", "/api/state", None, "").await, 401);
     assert_eq!(request(addr, "GET", "/api/state", Some("wrong"), "").await, 401);
@@ -279,7 +279,7 @@ async fn web_ui_with_password_runs_in_a_headless_session() {
     quit(h).await;
     let raw = std::fs::read(home.join("settings.bencode")).unwrap();
     assert!(!String::from_utf8_lossy(&raw).contains("correct horse"));
-    assert!(Store::at(&home).load_settings().webui.password.unwrap().starts_with("torrust-sha1$100000$"));
+    assert!(Store::at(&home).load_settings().webui.password.unwrap().starts_with("torrentide-sha1$100000$"));
 }
 
 #[tokio::test]
@@ -332,13 +332,13 @@ async fn web_ui_without_a_password_needs_the_logged_token() {
     assert_eq!(std::fs::read_to_string(home.join("webui.token")).unwrap().trim(), token);
 
     assert_eq!(http_get(addr, "/api/state", "").await.0, 401);
-    assert_eq!(http_get(addr, "/api/state", "Cookie: torrust_token=0000\r\n").await.0, 401);
+    assert_eq!(http_get(addr, "/api/state", "Cookie: torrentide_token=0000\r\n").await.0, 401);
     assert_eq!(http_get(addr, "/?token=0000", "").await.0, 401);
     let (status, head) = http_get(addr, &format!("/?token={token}"), "").await;
     assert_eq!(status, 303);
-    assert!(head.contains(&format!("Set-Cookie: torrust_token={token}; HttpOnly; SameSite=Strict; Path=/")), "{head}");
+    assert!(head.contains(&format!("Set-Cookie: torrentide_token={token}; HttpOnly; SameSite=Strict; Path=/")), "{head}");
     assert!(head.contains("Location: /\r\n"));
-    let cookie = format!("Cookie: torrust_token={token}\r\n");
+    let cookie = format!("Cookie: torrentide_token={token}\r\n");
     assert_eq!(http_get(addr, "/", &cookie).await.0, 200);
     assert_eq!(http_get(addr, "/api/state", &cookie).await.0, 200);
     assert_eq!(http_get(addr, "/api/state", &format!("Authorization: Bearer {token}\r\n")).await.0, 200);

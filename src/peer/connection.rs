@@ -1160,7 +1160,7 @@ mod tests {
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "torrust-conn-{tag}-{}",
+            "torrentide-conn-{tag}-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&p);

@@ -1719,7 +1719,7 @@ fn applescript_escape(s: &str) -> String {
 }
 
 fn notify_complete(name: &str) {
-    const TITLE: &str = "torrust: download complete";
+    const TITLE: &str = "torrentide: download complete";
     let mut cmd = if cfg!(target_os = "macos") {
         let mut c = std::process::Command::new("osascript");
         c.arg("-e").arg(format!(
@@ -1863,7 +1863,7 @@ fn store_metadata(store: &Store, id: &str, info: &[u8], trackers: &[String]) -> 
     Ok(meta)
 }
 
-/// Delete the files the torrent describes under `dir` that torrust created
+/// Delete the files the torrent describes under `dir` that torrentide created
 /// (or has fully verified), then any directories that leave empty. Nothing
 /// else is touched, and nothing behind a symlink.
 fn delete_files(meta: &Metainfo, dir: &Path, created: &BTreeSet<PathBuf>) {
@@ -1965,7 +1965,7 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
         return Ok(());
     }
     let mut part = dst.as_os_str().to_owned();
-    part.push(".torrust-part");
+    part.push(".torrentide-part");
     let part = PathBuf::from(part);
     let copied = std::fs::copy(src, &part)
         .and_then(|_| std::fs::File::open(&part)?.sync_all())
@@ -2096,7 +2096,7 @@ fn read_move_intent(store: &Store, id: &str) -> Option<PathBuf> {
     Some(bytes_path(v.as_bytes().ok()?))
 }
 
-/// Torrent-relative paths of the files torrust made, or adopted and fully verified.
+/// Torrent-relative paths of the files torrentide made, or adopted and fully verified.
 fn read_created(store: &Store, id: &str) -> BTreeSet<PathBuf> {
     let Ok(raw) = std::fs::read(created_path(store, id)) else { return BTreeSet::new() };
     let Ok(v) = bencode::decode(&raw) else { return BTreeSet::new() };
@@ -2117,7 +2117,7 @@ fn note_created<'a>(store: &Store, id: &str, paths: impl Iterator<Item = &'a Pat
     }
 }
 
-/// Add files `torrust add` left in the queue, as (queue file, source, dir).
+/// Add files `torrentide add` left in the queue, as (queue file, source, dir).
 /// A file is deleted only once its torrent has been saved.
 fn queued_adds(store: &Store) -> Vec<(PathBuf, String, Option<PathBuf>)> {
     let Ok(rd) = std::fs::read_dir(store.root().join("queue")) else { return Vec::new() };

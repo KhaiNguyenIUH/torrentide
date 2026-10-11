@@ -15,10 +15,11 @@ use crate::bencode::{self, Value};
 use crate::schedule::Schedule;
 use crate::state::{EncryptionMode, FilePriority, Settings, TorrentId};
 
-/// Where the session keeps its files. `TORRUST_HOME` overrides the platform
-/// default.
+/// Where the session keeps its files. `TORRENTIDE_HOME` overrides the
+/// platform default; the old `TORRUST_HOME` is honoured when it is unset. A
+/// data directory left by the project's former name is moved on first use.
 pub fn data_dir() -> PathBuf {
-    if let Some(p) = std::env::var_os("TORRUST_HOME") {
+    if let Some(p) = std::env::var_os("TORRENTIDE_HOME").or_else(|| std::env::var_os("TORRUST_HOME")) {
         return PathBuf::from(p);
     }
     let home = || {
@@ -27,19 +28,45 @@ pub fn data_dir() -> PathBuf {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."))
     };
-    if cfg!(target_os = "macos") {
-        home().join("Library/Application Support/torrust")
-    } else if cfg!(windows) {
-        std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home().join("AppData/Roaming"))
-            .join("torrust")
-    } else {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .unwrap_or_else(|| home().join(".local/share"))
-            .join("torrust")
+    let platform = |name: &str| {
+        if cfg!(target_os = "macos") {
+            home().join("Library/Application Support").join(name)
+        } else if cfg!(windows) {
+            std::env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join("AppData/Roaming"))
+                .join(name)
+        } else {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| home().join(".local/share"))
+                .join(name)
+        }
+    };
+    migrate_legacy_dir(&platform("torrust"), &platform("torrentide"))
+}
+
+fn migrate_legacy_dir(old: &Path, new: &Path) -> PathBuf {
+    if new.symlink_metadata().is_ok() || old.symlink_metadata().is_err() {
+        return new.to_path_buf();
+    }
+    // An old session still running owns that directory; move it next time.
+    #[cfg(unix)]
+    if std::os::unix::net::UnixStream::connect(old.join("torrust.sock")).is_ok() {
+        return old.to_path_buf();
+    }
+    match fs::rename(old, new) {
+        Ok(()) => {
+            let _ = fs::rename(new.join("torrust.log"), new.join("torrentide.log"));
+            let _ = fs::remove_file(new.join("torrust.sock"));
+            tracing::info!(from = %old.display(), to = %new.display(), "moved the old data directory");
+            new.to_path_buf()
+        }
+        Err(e) => {
+            tracing::warn!(from = %old.display(), to = %new.display(), error = %e, "could not move the old data directory; using it as is");
+            old.to_path_buf()
+        }
     }
 }
 
@@ -98,7 +125,7 @@ pub struct StoredFeed {
     pub seen: Vec<String>,
 }
 
-/// A `torrust add` left for the next session to pick up.
+/// A `torrentide add` left for the next session to pick up.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Queued {
     pub source: String,
@@ -167,7 +194,7 @@ impl Store {
     }
 
     pub fn socket_path(&self) -> PathBuf {
-        self.root.join("torrust.sock")
+        self.root.join("torrentide.sock")
     }
 
     fn torrents_dir(&self) -> PathBuf {
@@ -415,7 +442,7 @@ fn secure_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-const HASH_SCHEME: &str = "torrust-sha1";
+const HASH_SCHEME: &str = "torrentide-sha1";
 const LEGACY_HASH_SCHEME: &str = "sha1";
 const HASH_ITERATIONS: u32 = 100_000;
 const MAX_HASH_ITERATIONS: u32 = 1_000_000;
@@ -425,7 +452,7 @@ pub fn is_password_hash(stored: &str) -> bool {
     parse_hash(stored).is_some()
 }
 
-/// `torrust-sha1$<iterations>$<salt hex>$<hash hex>`: SHA-1 over salt and
+/// `torrentide-sha1$<iterations>$<salt hex>$<hash hex>`: SHA-1 over salt and
 /// password, then iterated so each guess costs 100 000 rounds. The plaintext is
 /// never stored. The older `sha1$...` spelling is still read.
 pub fn hash_password(password: &str) -> String {
@@ -819,7 +846,7 @@ mod tests {
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
-            "torrust-store-{tag}-{}-{}",
+            "torrentide-store-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -847,6 +874,33 @@ mod tests {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
+    #[test]
+    fn legacy_dir_is_moved_only_when_new_is_missing() {
+        let base = tmp("migrate");
+        let old = base.join("torrust");
+        let new = base.join("torrentide");
+
+        assert_eq!(migrate_legacy_dir(&old, &new), new);
+        assert!(!new.exists());
+
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("settings.bencode"), b"s").unwrap();
+        fs::write(old.join("torrust.log"), b"l").unwrap();
+        fs::write(old.join("torrust.sock"), b"").unwrap();
+        assert_eq!(migrate_legacy_dir(&old, &new), new);
+        assert!(!old.exists());
+        assert_eq!(fs::read(new.join("settings.bencode")).unwrap(), b"s");
+        assert_eq!(fs::read(new.join("torrentide.log")).unwrap(), b"l");
+        assert!(!new.join("torrust.log").exists());
+        assert!(!new.join("torrust.sock").exists());
+
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("keep"), b"k").unwrap();
+        assert_eq!(migrate_legacy_dir(&old, &new), new);
+        assert!(old.join("keep").exists());
+        assert!(!new.join("keep").exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn data_dir_is_0700_and_every_file_0600() {
@@ -872,7 +926,7 @@ mod tests {
     fn log_file_is_0600_and_symlinks_are_refused() {
         use std::os::unix::fs::PermissionsExt;
         let d = tmp("log");
-        let log = d.join("torrust.log");
+        let log = d.join("torrentide.log");
         fs::write(&log, b"old\n").unwrap();
         fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
         drop(open_log(&log).unwrap());
@@ -1103,12 +1157,12 @@ mod tests {
         let salt = "00112233";
         let hash = hex::encode(derive(&hex::decode(salt).unwrap(), b"pw", 3));
         let legacy = format!("sha1$3${salt}${hash}");
-        let current = format!("torrust-sha1$3${salt}${hash}");
+        let current = format!("torrentide-sha1$3${salt}${hash}");
         for h in [&legacy, &current] {
             assert!(is_password_hash(h));
             assert!(verify_password(h, b"pw") && !verify_password(h, b"px"));
         }
-        let too_many = format!("torrust-sha1${}${salt}${hash}", MAX_HASH_ITERATIONS + 1);
+        let too_many = format!("torrentide-sha1${}${salt}${hash}", MAX_HASH_ITERATIONS + 1);
         let legacy_too_many = format!("sha1$99999999${salt}${hash}");
         for bad in [too_many, legacy_too_many, format!("sha1$0${salt}${hash}"), format!("sha1$3$${hash}")] {
             assert!(!is_password_hash(&bad), "{bad}");
@@ -1146,7 +1200,7 @@ mod tests {
         let raw = fs::read(root.join("settings.bencode")).unwrap();
         assert!(!String::from_utf8_lossy(&raw).contains("correct horse"));
         let stored = store.load_settings().webui.password.unwrap();
-        assert!(is_password_hash(&stored) && stored.starts_with("torrust-sha1$100000$"));
+        assert!(is_password_hash(&stored) && stored.starts_with("torrentide-sha1$100000$"));
         assert!(verify_password(&stored, b"correct horse battery"));
         assert!(!verify_password(&stored, b"correct horse batterz"));
         assert!(!verify_password(&stored, b""));

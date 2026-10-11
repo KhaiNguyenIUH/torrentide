@@ -295,7 +295,7 @@ where
 {
     let mut r = BufReader::new(stream);
     let req = format!(
-        "GET {target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: torrust/0.1\r\n\
+        "GET {target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: torrentide/0.1\r\n\
          Accept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
     );
     within(r.get_mut().write_all(req.as_bytes())).await?;
@@ -432,7 +432,7 @@ where
     let last = offset + len - 1;
     let mut r = BufReader::new(stream);
     let req = format!(
-        "GET {target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: torrust/0.1\r\n\
+        "GET {target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: torrentide/0.1\r\n\
          Range: bytes={offset}-{last}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
     );
     within(r.get_mut().write_all(req.as_bytes())).await?;

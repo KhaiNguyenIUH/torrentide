@@ -1907,7 +1907,7 @@ pub struct MetadataClient {
 impl Default for MetadataClient {
     fn default() -> Self {
         MetadataClient {
-            client: "torrust",
+            client: "torrentide",
             reqq: 250,
         }
     }
@@ -2712,27 +2712,27 @@ mod tests {
 
     #[test]
     fn extended_handshake_round_trips() {
-        let hs = ExtendedHandshake::new(Some(1), "torrust", 250, Some(1234));
+        let hs = ExtendedHandshake::new(Some(1), "torrentide", 250, Some(1234));
         let bytes = hs.encode();
         assert_eq!(ExtendedHandshake::decode(&bytes).unwrap(), hs);
     }
 
     #[test]
     fn extended_handshake_encodes_m_as_a_dictionary() {
-        let hs = ExtendedHandshake::new(Some(1), "torrust", 100, Some(42));
+        let hs = ExtendedHandshake::new(Some(1), "torrentide", 100, Some(42));
         assert_eq!(
             hs.encode(),
-            b"d1:md11:ut_metadatai1ee13:metadata_sizei42e4:reqqi100e1:v7:torruste".to_vec()
+            b"d1:md11:ut_metadatai1ee13:metadata_sizei42e4:reqqi100e1:v10:torrentidee".to_vec()
         );
     }
 
     #[test]
     fn handshake_without_metadata_size_omits_the_key() {
-        let hs = ExtendedHandshake::new(Some(1), "torrust", 250, None);
+        let hs = ExtendedHandshake::new(Some(1), "torrentide", 250, None);
         let bytes = hs.encode();
         assert_eq!(
             bytes,
-            b"d1:md11:ut_metadatai1ee4:reqqi250e1:v7:torruste".to_vec()
+            b"d1:md11:ut_metadatai1ee4:reqqi250e1:v10:torrentidee".to_vec()
         );
         let back = ExtendedHandshake::decode(&bytes).unwrap();
         assert_eq!(back.metadata_size, None);
@@ -2741,12 +2741,12 @@ mod tests {
 
     #[test]
     fn handshake_decodes_a_real_client_message() {
-        let raw = b"d1:md11:ut_metadatai3e6:ut_pexi2ee13:metadata_sizei42e4:porti6881e4:reqqi100e1:v7:torrust6:yourip4:\x7f\x00\x00\x01e";
+        let raw = b"d1:md11:ut_metadatai3e6:ut_pexi2ee13:metadata_sizei42e4:porti6881e4:reqqi100e1:v10:torrentide6:yourip4:\x7f\x00\x00\x01e";
         let hs = ExtendedHandshake::decode(raw).unwrap();
         assert_eq!(hs.ut_metadata, Some(3));
         assert_eq!(hs.metadata_size, Some(42));
         assert_eq!(hs.reqq, 100);
-        assert_eq!(hs.v, "torrust");
+        assert_eq!(hs.v, "torrentide");
     }
 
     #[test]

@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn load_gzip_and_size_and_ok() {
-        let dir = std::env::temp_dir().join(format!("torrust-bl-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("torrentide-bl-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let gz = dir.join("l.gz");
         std::fs::write(&gz, [0x1f, 0x8b, 8, 0, 0]).unwrap();
@@ -349,7 +349,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fifo_is_rejected_without_hanging() {
-        let dir = std::env::temp_dir().join(format!("torrust-bl-fifo-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("torrentide-bl-fifo-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fifo = dir.join("pipe");
         assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());

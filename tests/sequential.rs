@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, RwLock};
-use torrust::bencode::{encode, Value};
-use torrust::engine::{build_seeder, Engine, EngineOptions};
-use torrust::state::{Command, DownloadState, UiState};
-use torrust::storage::{sha1_bytes, Storage};
-use torrust::Metainfo;
+use torrentide::bencode::{encode, Value};
+use torrentide::engine::{build_seeder, Engine, EngineOptions};
+use torrentide::state::{Command, DownloadState, UiState};
+use torrentide::storage::{sha1_bytes, Storage};
+use torrentide::Metainfo;
 
 const PIECE_LEN: usize = 16 * 1024;
 
@@ -22,7 +22,7 @@ fn temp_dir(tag: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let dir = std::env::temp_dir().join(format!("torrust-{tag}-{}-{nanos}-{n}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("torrentide-{tag}-{}-{nanos}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -48,13 +48,13 @@ async fn sequential_mode_is_published_and_toggles_live() {
     let storage = Arc::new(Storage::prepare(&meta, &seed_dir).unwrap());
     let seeder = build_seeder(storage, &meta, &vec![true; meta.piece_count()]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (seed_addr, _h) = torrust::peer::pool::listen(Arc::clone(&meta), seeder, 0, events_tx)
+    let (seed_addr, _h) = torrentide::peer::pool::listen(Arc::clone(&meta), seeder, 0, events_tx)
         .await
         .unwrap();
     tokio::spawn(async move {
         let mut live = vec![];
         while let Some((_, ev)) = events_rx.recv().await {
-            if let torrust::peer::connection::FromPeer::Connected(h) = ev {
+            if let torrentide::peer::connection::FromPeer::Connected(h) = ev {
                 live.push(h);
             }
         }

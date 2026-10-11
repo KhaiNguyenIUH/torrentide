@@ -313,7 +313,7 @@ mod tests {
     impl TempDir {
         fn new(tag: &str) -> Self {
             let p = std::env::temp_dir().join(format!(
-                "torrust-test-{tag}-{}",
+                "torrentide-test-{tag}-{}",
                 std::process::id()
             ));
             let _ = fs::remove_dir_all(&p);
@@ -474,8 +474,8 @@ mod tests {
         meta.files = Files::Single { name: "../evil.bin".into(), length: 10 };
         assert!(Storage::prepare(&meta, &root).is_err());
         assert!(!dir.path().join("evil.bin").exists());
-        meta.files = Files::Single { name: "/tmp/torrust-abs-evil".into(), length: 10 };
+        meta.files = Files::Single { name: "/tmp/torrentide-abs-evil".into(), length: 10 };
         assert!(Storage::prepare(&meta, &root).is_err());
-        assert!(!Path::new("/tmp/torrust-abs-evil").exists());
+        assert!(!Path::new("/tmp/torrentide-abs-evil").exists());
     }
 }

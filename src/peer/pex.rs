@@ -67,7 +67,7 @@ pub fn encode_handshake(port: u16, metadata_size: Option<usize>) -> Vec<u8> {
         d.insert(b"p".to_vec(), Value::Int(port as i64));
     }
     d.insert(b"reqq".to_vec(), Value::Int(250));
-    d.insert(b"v".to_vec(), Value::Bytes(b"torrust".to_vec()));
+    d.insert(b"v".to_vec(), Value::Bytes(b"torrentide".to_vec()));
     bencode::encode(&Value::Dict(d))
 }
 

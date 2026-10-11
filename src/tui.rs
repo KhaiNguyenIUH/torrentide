@@ -1147,7 +1147,7 @@ fn run_loop(state: Arc<RwLock<UiState>>) -> Result<()> {
 /// both the normal path and on error.
 pub fn run_tui(state: Arc<RwLock<UiState>>) -> Result<()> {
     std::thread::Builder::new()
-        .name("torrust-tui".to_string())
+        .name("torrentide-tui".to_string())
         .spawn(move || run_loop(state))
         .context("failed to spawn the TUI thread")?
         .join()
@@ -1183,7 +1183,7 @@ const SESSION_KEYS: [(&str, &str); 26] = [
     ("PgUp/PgDn", "log"),
     ("?", "keys"),
     ("q", "close (downloads keep running)"),
-    ("Q", "stop torrust"),
+    ("Q", "stop torrentide"),
     ("Enter/Esc", "confirm/cancel"),
     ("mouse", "click rows, tabs and hints; wheel scrolls"),
     ("select text", "hold Shift (macOS: Option/Fn) and drag"),
@@ -2934,7 +2934,7 @@ fn render_session_header(frame: &mut Frame, area: Rect, state: &SessionState, fi
         .borders(Borders::ALL)
         .border_style(border_style())
         .style(base_style())
-        .title(Span::styled(" torrust ", heading_style()));
+        .title(Span::styled(" torrentide ", heading_style()));
     let mut summary = header_summary(state);
     if *filter != LabelFilter::All {
         summary.push_str(&format!("  label: {}", filter.text()));
@@ -3379,7 +3379,7 @@ fn run_session_loop(state: Arc<RwLock<SessionState>>) -> Result<()> {
 /// `q` only closes the UI; `Q` sends [`SessionCommand::Quit`] to stop the session.
 pub fn run_session_tui(state: Arc<RwLock<SessionState>>) -> Result<()> {
     std::thread::Builder::new()
-        .name("torrust-session-tui".to_string())
+        .name("torrentide-session-tui".to_string())
         .spawn(move || run_session_loop(state))
         .context("failed to spawn the TUI thread")?
         .join()

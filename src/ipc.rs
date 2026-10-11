@@ -1,4 +1,4 @@
-//! Hand-off of `torrust add` to a running session over a Unix socket in the
+//! Hand-off of `torrentide add` to a running session over a Unix socket in the
 //! data directory. One request per connection: `ADD\t<source>\t<dir>\n`
 //! answered by `OK\n` or `ERR <message>\n`, or `STOP\n` answered by `OK\n`.
 //! Where there is no session, or on platforms without Unix sockets, the add is
@@ -167,12 +167,12 @@ mod unix {
         let path = store.socket_path();
         let mut stream = UnixStream::connect(&path)
             .await
-            .with_context(|| format!("connecting to the torrust session at {}", path.display()))?;
+            .with_context(|| format!("connecting to the torrentide session at {}", path.display()))?;
         stream.write_all(b"ATTACH\n").await?;
         let (mut reader, mut writer) = tokio::io::split(stream);
         let first = tokio::time::timeout(IO_TIMEOUT, read_frame(&mut reader, MAX_STATE_FRAME))
             .await
-            .context("the torrust session did not answer")??;
+            .context("the torrentide session did not answer")??;
         let (tx, mut rx) = unbounded_channel::<SessionCommand>();
         let mut snapshot: SessionState = postcard::from_bytes(&first).context("decoding the session state")?;
         snapshot.command_tx = Some(tx);
@@ -217,20 +217,20 @@ mod unix {
         let bound = match UnixListener::bind(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 if std::os::unix::net::UnixStream::connect(&path).is_ok() {
-                    bail!("another torrust session is already running ({})", path.display());
+                    bail!("another torrentide session is already running ({})", path.display());
                 }
                 let _ = std::fs::remove_file(&path);
                 UnixListener::bind(&path)
             }
             other => other,
         };
-        // Without the socket `torrust add` still works by queueing, so a bind
+        // Without the socket `torrentide add` still works by queueing, so a bind
         // failure (e.g. a data dir path longer than SUN_LEN) must not stop the
         // session.
         let listener = match bound {
             Ok(l) => l,
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "cannot open the add socket; `torrust add` will queue instead");
+                tracing::warn!(path = %path.display(), error = %e, "cannot open the add socket; `torrentide add` will queue instead");
                 return Ok(None);
             }
         };
@@ -355,7 +355,7 @@ mod unix {
             assert!(crate::ipc::session_running(&store));
 
             let err = listen(&store, tx, state).unwrap_err().to_string();
-            assert!(err.contains("another torrust session is already running"), "{err}");
+            assert!(err.contains("another torrentide session is already running"), "{err}");
             h.abort();
         }
 

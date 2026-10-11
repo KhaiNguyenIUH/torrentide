@@ -7,13 +7,13 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::sync::RwLock;
 
-use torrust::engine::{self, Engine};
-use torrust::metainfo::{Magnet, Metainfo};
-use torrust::state::{Level, UiState};
+use torrentide::engine::{self, Engine};
+use torrentide::metainfo::{Magnet, Metainfo};
+use torrentide::state::{Level, UiState};
 
 #[derive(Parser)]
 #[command(
-    name = "torrust",
+    name = "torrentide",
     version,
     about = "A BitTorrent client with a TUI",
     long_about = "Download torrents over the BitTorrent protocol.\n\n\
@@ -37,7 +37,7 @@ enum Command {
         background: bool,
     },
 
-    /// Stop the background torrust session
+    /// Stop the background torrentide session
     Stop,
 
     /// Set the web UI password (read from stdin) and enable the web UI
@@ -201,55 +201,55 @@ async fn run(cli: Cli) -> Result<()> {
 
     match command {
         Command::Session { no_tui, background } => {
-            let store = torrust::store::Store::open();
+            let store = torrentide::store::Store::open();
             if background {
-                return torrust::session::Session::run_background(store.load_settings()).await;
+                return torrentide::session::Session::run_background(store.load_settings()).await;
             }
             #[cfg(unix)]
             if !no_tui {
                 return attach_tui(&store).await;
             }
-            torrust::session::Session::run(store.load_settings(), !no_tui).await
+            torrentide::session::Session::run(store.load_settings(), !no_tui).await
         }
         #[cfg(windows)]
         Command::Stop => {
             println!(
-                "torrust stop is not available on Windows: the session runs in the window that started it (torrust or torrust session); close it there with Q or Ctrl-C"
+                "torrentide stop is not available on Windows: the session runs in the window that started it (torrentide or torrentide session); close it there with Q or Ctrl-C"
             );
             Ok(())
         }
         #[cfg(not(windows))]
         Command::Stop => {
-            if torrust::ipc::stop(&torrust::store::Store::open()).await {
-                println!("stopping torrust");
+            if torrentide::ipc::stop(&torrentide::store::Store::open()).await {
+                println!("stopping torrentide");
             } else {
-                println!("no torrust session is running");
+                println!("no torrentide session is running");
             }
             Ok(())
         }
         Command::WebuiPassword => set_webui_password().await,
         Command::Add { source, output } => {
-            use torrust::ipc::Delivery;
+            use torrentide::ipc::Delivery;
             #[cfg(unix)]
             let watch = {
-                let store = torrust::store::Store::open();
-                if !torrust::ipc::session_running(&store) {
+                let store = torrentide::store::Store::open();
+                if !torrentide::ipc::session_running(&store) {
                     start_service(&store).await?;
                 }
-                torrust::ipc::attach(&store).await.ok().map(|(state, _)| state)
+                torrentide::ipc::attach(&store).await.ok().map(|(state, _)| state)
             };
             #[cfg(not(unix))]
-            let watch: Option<Arc<RwLock<torrust::state::SessionState>>> = None;
+            let watch: Option<Arc<RwLock<torrentide::state::SessionState>>> = None;
             let before = match &watch {
                 Some(state) => state.read().await.log_total,
                 None => 0,
             };
-            match torrust::ipc::send_add(&source, output.as_deref()).await? {
+            match torrentide::ipc::send_add(&source, output.as_deref()).await? {
                 Delivery::Delivered => match watch {
                     Some(state) => println!("{}", add_outcome(&state, before).await?),
                     None => println!("sent to the running session"),
                 },
-                Delivery::Queued => println!("queued; it will start next time torrust runs"),
+                Delivery::Queued => println!("queued; it will start next time torrentide runs"),
             }
             Ok(())
         }
@@ -272,7 +272,7 @@ async fn run(cli: Cli) -> Result<()> {
             force,
             seed,
         } => {
-            let opts = torrust::create::CreateOptions {
+            let opts = torrentide::create::CreateOptions {
                 path,
                 trackers: tracker,
                 web_seeds: web_seed,
@@ -344,13 +344,13 @@ impl Drop for EchoOff {
 }
 
 #[cfg(unix)]
-async fn attach_tui(store: &torrust::store::Store) -> Result<()> {
-    if !torrust::ipc::session_running(store) {
+async fn attach_tui(store: &torrentide::store::Store) -> Result<()> {
+    if !torrentide::ipc::session_running(store) {
         start_service(store).await?;
     }
-    let (state, sender) = torrust::ipc::attach(store).await?;
+    let (state, sender) = torrentide::ipc::attach(store).await?;
     let ui = Arc::clone(&state);
-    let result = tokio::task::spawn_blocking(move || torrust::tui::run_session_tui(ui))
+    let result = tokio::task::spawn_blocking(move || torrentide::tui::run_session_tui(ui))
         .await
         .context("the TUI task panicked")?;
     // Let a final command (`Q` sends Quit) reach the session before exiting.
@@ -359,13 +359,13 @@ async fn attach_tui(store: &torrust::store::Store) -> Result<()> {
     result
 }
 
-/// Start `torrust session --background`, detached from this terminal, and
+/// Start `torrentide session --background`, detached from this terminal, and
 /// wait for it to answer on the socket.
 #[cfg(unix)]
-async fn start_service(store: &torrust::store::Store) -> Result<()> {
+async fn start_service(store: &torrentide::store::Store) -> Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
-    let mut child = std::process::Command::new(std::env::current_exe().context("locating the torrust binary")?)
+    let mut child = std::process::Command::new(std::env::current_exe().context("locating the torrentide binary")?)
         .args(["session", "--background"])
         .process_group(0)
         .stdin(Stdio::null())
@@ -374,7 +374,7 @@ async fn start_service(store: &torrust::store::Store) -> Result<()> {
         .spawn()
         .context("starting the background session")?;
     for _ in 0..100 {
-        if torrust::ipc::session_running(store) {
+        if torrentide::ipc::session_running(store) {
             return Ok(());
         }
         if let Some(status) = child.try_wait()? {
@@ -387,7 +387,7 @@ async fn start_service(store: &torrust::store::Store) -> Result<()> {
 
 /// Wait briefly for the session to log the result of an add sent after
 /// `before` log lines, so the caller sees "added X" or why it was refused.
-async fn add_outcome(state: &RwLock<torrust::state::SessionState>, before: u64) -> Result<String> {
+async fn add_outcome(state: &RwLock<torrentide::state::SessionState>, before: u64) -> Result<String> {
     for _ in 0..50 {
         {
             let st = state.read().await;
@@ -407,9 +407,9 @@ async fn add_outcome(state: &RwLock<torrust::state::SessionState>, before: u64) 
 }
 
 async fn set_webui_password() -> Result<()> {
-    let store = torrust::store::Store::open();
-    if torrust::ipc::session_running(&store) {
-        bail!("a torrust session is running and would overwrite these settings when it quits; stop it, then run this command again");
+    let store = torrentide::store::Store::open();
+    if torrentide::ipc::session_running(&store) {
+        bail!("a torrentide session is running and would overwrite these settings when it quits; stop it, then run this command again");
     }
     eprintln!("New web UI password (one line):");
     let echo = EchoOff::new();
@@ -435,7 +435,7 @@ async fn set_webui_password() -> Result<()> {
     }
     let mut settings = store.load_settings();
     settings.webui.enabled = true;
-    settings.webui.password = Some(torrust::store::hash_password(password));
+    settings.webui.password = Some(torrentide::store::hash_password(password));
     store.save_settings(&settings)?;
     println!("web UI enabled with the new password (stored as a salted hash)");
     println!("open http://localhost:{}/ (any user name) after the session restarts", settings.webui.port);
@@ -504,8 +504,8 @@ async fn run_import(
     exit_when_done: bool,
     no_tui: bool,
 ) -> Result<()> {
-    use torrust::import;
-    use torrust::state::human_bytes;
+    use torrentide::import;
+    use torrentide::state::human_bytes;
 
     if !from.is_dir() {
         bail!("--from {} is not a directory", from.display());
@@ -593,7 +593,7 @@ async fn run_import(
     } else {
         println!();
         println!(
-            "  now run: torrust download {} --output {}",
+            "  now run: torrentide download {} --output {}",
             torrent.display(),
             output.display()
         );
@@ -606,13 +606,13 @@ async fn start_download(
     meta: Arc<Metainfo>,
     output: PathBuf,
     state: &Arc<RwLock<UiState>>,
-    command_rx: tokio::sync::mpsc::UnboundedReceiver<torrust::state::Command>,
+    command_rx: tokio::sync::mpsc::UnboundedReceiver<torrentide::state::Command>,
     exit_when_done: bool,
     no_tui: bool,
 ) -> Result<()> {
     {
         let mut st = state.write().await;
-        st.torrent = Some(torrust::state::TorrentSummary {
+        st.torrent = Some(torrentide::state::TorrentSummary {
             name: meta.name.clone(),
             infohash: meta.infohash.to_hex(),
             total_length: meta.total_length,
@@ -658,7 +658,7 @@ fn spawn_ui_if_needed(state: &Arc<RwLock<UiState>>, skip: bool) -> Option<std::t
     }
     let ui_state = Arc::clone(state);
     Some(std::thread::spawn(move || {
-        if let Err(e) = torrust::tui::run_tui(ui_state) {
+        if let Err(e) = torrentide::tui::run_tui(ui_state) {
             tracing::error!("TUI exited with an error: {e}");
         }
     }))
@@ -684,7 +684,7 @@ async fn finish(
         let mut st = state.write().await;
         st.log(Level::Error, format!("{e}"));
         if let Some(t) = &mut st.torrent {
-            t.state = torrust::state::DownloadState::Error;
+            t.state = torrentide::state::DownloadState::Error;
         }
     }
 
@@ -726,7 +726,7 @@ async fn log_to(state: &Arc<RwLock<UiState>>, level: Level, msg: String) {
 }
 
 async fn run_create(
-    opts: torrust::create::CreateOptions,
+    opts: torrentide::create::CreateOptions,
     output: Option<PathBuf>,
     force: bool,
     seed: bool,
@@ -735,12 +735,12 @@ async fn run_create(
 
     let output = match output {
         Some(o) => o,
-        None => PathBuf::from(format!("{}.torrent", torrust::create::torrent_name(&opts.path)?)),
+        None => PathBuf::from(format!("{}.torrent", torrentide::create::torrent_name(&opts.path)?)),
     };
     if !force && output.exists() {
         bail!("{} already exists (use --force to overwrite)", output.display());
     }
-    let created = torrust::create::build(&opts)?;
+    let created = torrentide::create::build(&opts)?;
     let mut file = std::fs::OpenOptions::new();
     file.write(true);
     if force {
@@ -753,21 +753,21 @@ async fn run_create(
         .with_context(|| format!("writing {}", output.display()))?;
 
     println!("name        {}", created.name);
-    println!("size        {}", torrust::state::human_bytes(created.total));
+    println!("size        {}", torrentide::state::human_bytes(created.total));
     println!("pieces      {} x {} KiB", created.pieces, created.piece_len / 1024);
     println!("infohash    {}", created.infohash);
     println!("magnet      {}", created.magnet);
     println!("saved to    {}", output.display());
 
     if seed {
-        use torrust::ipc::Delivery;
+        use torrentide::ipc::Delivery;
         let parent = std::fs::canonicalize(&opts.path)?
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("/"));
-        match torrust::ipc::send_add(&output.to_string_lossy(), Some(&parent)).await? {
+        match torrentide::ipc::send_add(&output.to_string_lossy(), Some(&parent)).await? {
             Delivery::Delivered => println!("seeding: added to running session"),
-            Delivery::Queued => println!("seeding: queued; it will start next time torrust runs"),
+            Delivery::Queued => println!("seeding: queued; it will start next time torrentide runs"),
         }
     }
     Ok(())
@@ -783,7 +783,7 @@ fn inspect(path: &std::path::Path) -> Result<()> {
     println!("private     {}", m.private);
     println!(
         "total size  {} ({} bytes)",
-        torrust::state::human_bytes(m.total_length),
+        torrentide::state::human_bytes(m.total_length),
         m.total_length
     );
     println!("pieces      {} x {}", m.piece_count(), m.piece_length);
@@ -802,7 +802,7 @@ fn inspect(path: &std::path::Path) -> Result<()> {
     for (p, len) in m.files.iter() {
         println!(
             "  {:>12}  {}",
-            torrust::state::human_bytes(len),
+            torrentide::state::human_bytes(len),
             p.display()
         );
     }
@@ -830,7 +830,7 @@ fn inspect_magnet(uri: &str) -> Result<()> {
 }
 
 fn log_path() -> PathBuf {
-    torrust::store::data_dir().join("torrust.log")
+    torrentide::store::data_dir().join("torrentide.log")
 }
 
 /// With the TUI running, logs go to a file so they cannot corrupt the screen
@@ -839,9 +839,9 @@ fn log_path() -> PathBuf {
 fn init_tracing(to_file: bool) {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
     let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("torrust=info,warn"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("torrentide=info,warn"));
     let file_layer = to_file.then(|| {
-        let file = torrust::store::open_log(&log_path()).ok();
+        let file = torrentide::store::open_log(&log_path()).ok();
         fmt::layer()
             .with_writer(file.map(std::sync::Mutex::new).map_or_else(
                 || tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::sink),
@@ -867,7 +867,7 @@ fn validate_source(source: &str) -> Result<()> {
     if !p.exists() {
         bail!(
             "{source} is neither a magnet: URI nor an existing file.\n\
-             Usage: torrust download <file.torrent|magnet:?xt=...>"
+             Usage: torrentide download <file.torrent|magnet:?xt=...>"
         );
     }
     Ok(())
