@@ -1,6 +1,6 @@
 [package]
 name = "torrust"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "A BitTorrent client with a terminal UI"
 license = "MIT"
