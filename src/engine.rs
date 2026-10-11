@@ -41,7 +41,8 @@ use crate::webseed::{self, WebSeed};
 /// Port we advertise to peers and announce to trackers.
 pub const LOCAL_PORT: u16 = 6881;
 
-/// How often we ask the peer pool to fill the request pipeline.
+/// Fallback period for refilling the request pipeline. Arriving blocks also
+/// trigger a refill, so this mostly covers timeouts and newly usable peers.
 const PIPELINE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How often to prune dead peers.
@@ -53,9 +54,10 @@ const STATS_INTERVAL: Duration = Duration::from_millis(500);
 /// Minimum gap between DHT peer lookups; each one fans out many UDP queries.
 const DHT_LOOKUP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Cap on outstanding requests across all peers. Each in-flight block holds up
-/// to 16 KiB in memory, so this bounds our worst-case buffering.
-const MAX_IN_FLIGHT: usize = 200;
+/// Ceiling on outstanding requests across all peers. The real cap is the sum
+/// of the per-peer queue depths; this only bounds the worst case. Each
+/// in-flight block holds up to 16 KiB in memory, so 4096 blocks is 64 MiB.
+const MAX_IN_FLIGHT: usize = 4096;
 
 /// How often a session engine re-runs tit-for-tat choking.
 const RECHOKE_INTERVAL: Duration = Duration::from_secs(10);
@@ -364,6 +366,12 @@ impl Engine {
         let mut last_reap = Instant::now();
         let mut last_stats = Instant::now();
         let mut last_fill = Instant::now() - PIPELINE_INTERVAL;
+        // Set when a block lands or is rejected, so the pipeline is topped up
+        // right away. `fill_stalled` holds that back after a fill that found
+        // no taker for some block, leaving the retry to the timer.
+        let mut refill_now = false;
+        let mut fill_stalled = false;
+        let mut rarity: HashMap<u32, u32> = HashMap::new();
         let mut last_down: u64 = 0;
         let mut last_up: u64 = 0;
         let mut upload_rate = 0.0f64;
@@ -406,6 +414,9 @@ impl Engine {
                     }
                     if let FromPeer::Piece { block, .. } = &ev {
                         session_down += block.len() as u64;
+                    }
+                    if matches!(ev, FromPeer::Piece { .. } | FromPeer::Rejected { .. }) {
+                        refill_now = true;
                     }
                     handle_peer_event(&mut scheduler, &storage, &self.meta, &ev);
                     pool.on_event(addr, ev).await;
@@ -696,22 +707,35 @@ impl Engine {
                     // ---- periodically refill the request pipeline ----
                     // A pause stops new requests. Blocks already on the wire
                     // still land and verify, so resuming never loses data.
-                    if !paused && !seeding && check_rx.is_none() && last_fill.elapsed() >= PIPELINE_INTERVAL {
-                        last_fill = Instant::now();
-                        let mut rarity: HashMap<u32, u32> = HashMap::new();
-                        for p in 0..self.meta.piece_count() as u32 {
-                            rarity.insert(p, pool.seeders_for(p));
+                    let timer_fill = last_fill.elapsed() >= PIPELINE_INTERVAL;
+                    if !paused
+                        && !seeding
+                        && check_rx.is_none()
+                        && (timer_fill || (refill_now && !fill_stalled))
+                    {
+                        if timer_fill {
+                            last_fill = Instant::now();
+                            fill_stalled = false;
+                            rarity.clear();
+                            for p in 0..self.meta.piece_count() as u32 {
+                                rarity.insert(p, pool.seeders_for(p));
+                            }
                         }
 
-                        let budget = MAX_IN_FLIGHT.saturating_sub(scheduler.in_flight_count());
+                        let budget = pool
+                            .free_slots()
+                            .await
+                            .min(MAX_IN_FLIGHT.saturating_sub(scheduler.in_flight_count()));
                         let batch = scheduler.fill_batch(&rarity, budget);
                         for req in batch {
                             if !pool.request_block(req.piece, req.begin, req.length).await {
                                 // Nobody could take it; make it available again.
                                 scheduler.on_timeout(req.key());
+                                fill_stalled = true;
                             }
                         }
                     }
+                    refill_now = false;
 
                     // ---- web seeds: one whole piece in flight per seed ----
                     while ws_jobs.try_join_next().is_some() {}

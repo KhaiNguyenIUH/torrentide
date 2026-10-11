@@ -27,10 +27,35 @@ use crate::storage::Storage;
 /// per-request overhead small relative to the payload.
 pub const BLOCK_SIZE: u32 = 16 * 1024;
 
-/// How many blocks to keep in flight toward a single peer. Too few wastes
-/// bandwidth on high-latency links; too many wastes memory and causes peers to
-/// throttle us.
-pub const PIPELINE_DEPTH: usize = 16;
+/// Seconds of a peer's measured download rate we keep queued toward it. Enough
+/// to cover its round trip and keep the pipe full without hoarding blocks.
+const TARGET_QUEUE_SECS: f64 = 3.0;
+
+/// Fewest blocks we queue toward a peer, so a new or slow peer still gets work.
+const MIN_QUEUE_DEPTH: usize = 4;
+
+/// Most blocks we queue toward one peer, however fast it is.
+pub const MAX_QUEUE_DEPTH: usize = 500;
+
+/// Request queue length assumed for a peer that did not advertise `reqq`.
+const DEFAULT_REQQ: usize = 250;
+
+/// Minimum span over which the download rate is sampled.
+const RATE_SAMPLE: Duration = Duration::from_millis(500);
+
+/// How many blocks to keep in flight toward a peer downloading at `rate`
+/// bytes per second: [`TARGET_QUEUE_SECS`] worth of data, within the min/max
+/// depth and never above the peer's own advertised `reqq`.
+pub fn queue_depth(rate: f64, reqq: Option<usize>) -> usize {
+    let want = (rate * TARGET_QUEUE_SECS / BLOCK_SIZE as f64) as usize;
+    want.clamp(MIN_QUEUE_DEPTH, MAX_QUEUE_DEPTH).min(reqq.unwrap_or(DEFAULT_REQQ).max(1))
+}
+
+/// The `reqq` a peer advertised in its extended handshake.
+fn handshake_reqq(payload: &[u8]) -> Option<usize> {
+    let v = crate::bencode::decode(payload).ok()?;
+    usize::try_from(v.get_int_opt("reqq")?).ok().filter(|&q| q > 0)
+}
 
 /// Idle timeout before we drop a peer that has sent nothing.
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -141,6 +166,12 @@ pub struct PeerState {
     pub outstanding: HashMap<(u32, u32), (Instant, u32)>,
     pub downloaded: u64,
     pub uploaded: u64,
+    /// Smoothed download rate in bytes per second, for sizing the request queue.
+    pub rate_down: f64,
+    rate_bytes: u64,
+    rate_at: Instant,
+    /// The request queue length the peer advertised in its extended handshake.
+    pub reqq: Option<usize>,
     pub connected_at: Instant,
     pub last_activity: Instant,
     /// The id this peer wants `ut_pex` messages under, once its extended
@@ -179,6 +210,10 @@ impl PeerState {
             outstanding: HashMap::new(),
             downloaded: 0,
             uploaded: 0,
+            rate_down: 0.0,
+            rate_bytes: 0,
+            rate_at: Instant::now(),
+            reqq: None,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
             pex_id: None,
@@ -191,6 +226,23 @@ impl PeerState {
             metadata_window: (Instant::now(), 0),
             serve_queue: VecDeque::new(),
         }
+    }
+
+    /// Fold `n` received bytes into the smoothed download rate.
+    fn record_down(&mut self, n: usize) {
+        self.rate_bytes += n as u64;
+        let dt = self.rate_at.elapsed();
+        if dt >= RATE_SAMPLE {
+            let inst = self.rate_bytes as f64 / dt.as_secs_f64();
+            self.rate_down = if self.rate_down == 0.0 { inst } else { (self.rate_down + inst) / 2.0 };
+            self.rate_bytes = 0;
+            self.rate_at = Instant::now();
+        }
+    }
+
+    /// How many requests this peer may have outstanding.
+    pub fn queue_depth(&self) -> usize {
+        queue_depth(self.rate_down, self.reqq)
     }
 
     pub fn idle_for(&self) -> Duration {
@@ -747,6 +799,7 @@ where
                                 st.outstanding.remove(&(index, begin));
                                 st.downloaded += block.len() as u64;
                                 st.window_down += block.len() as u64;
+                                st.record_down(block.len());
                                 charge_down = block.len();
                                 forward = Some(FromPeer::Piece {
                                     index,
@@ -822,6 +875,7 @@ where
                                         st.pex_id = h.pex_id;
                                         st.listen_port = h.port;
                                         st.metadata_id = h.metadata_id;
+                                        st.reqq = handshake_reqq(&payload);
                                     }
                                 } else if ext_id == pex::OUR_METADATA_ID {
                                     if let (Some(info), Some(reply_id), Some(piece)) =
@@ -1175,6 +1229,21 @@ mod tests {
         assert!(s.they_choke, "peers start choked");
         assert!(s.am_choking, "we start choked");
         assert!(!s.interested);
+    }
+
+    #[test]
+    fn queue_depth_scales_with_rate_and_respects_reqq() {
+        let mbps = |m: f64| m * 1024.0 * 1024.0;
+        assert_eq!(queue_depth(0.0, None), MIN_QUEUE_DEPTH);
+        assert_eq!(queue_depth(20_000.0, None), MIN_QUEUE_DEPTH);
+        assert_eq!(queue_depth(mbps(1.0), None), 192);
+        assert_eq!(queue_depth(mbps(100.0), None), MAX_QUEUE_DEPTH.min(DEFAULT_REQQ));
+        assert_eq!(queue_depth(mbps(1.0), Some(100)), 100);
+        assert_eq!(queue_depth(mbps(100.0), Some(1000)), MAX_QUEUE_DEPTH);
+        assert_eq!(queue_depth(0.0, Some(2)), 2);
+        assert_eq!(handshake_reqq(b"d4:reqqi128ee"), Some(128));
+        assert_eq!(handshake_reqq(b"d4:reqqi0ee"), None);
+        assert_eq!(handshake_reqq(b"de"), None);
     }
 
     #[test]

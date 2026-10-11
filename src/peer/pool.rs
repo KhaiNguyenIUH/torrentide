@@ -827,21 +827,22 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
         }
     }
 
-    /// Request one block of `index` from the least-loaded peer that has it.
+    /// Request one block of `index` from the peer with the most free queue
+    /// slots that has it, skipping peers already at their depth.
     ///
-    /// Spreading requests across peers avoids hammering a single fast peer and
-    /// is required for the swarm to stay healthy.
+    /// Each peer's depth follows its measured rate, so fast peers take most of
+    /// the work while slow ones still get a few blocks.
     pub async fn request_block(&mut self, index: u32, begin: u32, length: u32) -> bool {
         if self.peers.is_empty() {
             return false;
         }
 
-        // Count how many of this piece each candidate already has queued.
         let mut candidates: Vec<(usize, SocketAddr)> = Vec::new();
         for (addr, p) in &self.peers {
             let st = p.state.lock().await;
-            if (!st.they_choke || st.allowed_fast.contains(&index)) && st.bitfield.has(index) {
-                candidates.push((st.outstanding.len(), *addr));
+            let free = st.queue_depth().saturating_sub(st.outstanding.len());
+            if free > 0 && (!st.they_choke || st.allowed_fast.contains(&index)) && st.bitfield.has(index) {
+                candidates.push((free, *addr));
             }
         }
 
@@ -862,10 +863,13 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
             tracing::trace!(index, have_piece, choked, peers = self.peers.len(), "no candidate for piece");
             return false;
         }
-        candidates.sort_by_key(|(n, _)| *n);
+        candidates.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
         let (_, chosen) = candidates[0];
 
         if let Some(p) = self.peers.get(&chosen) {
+            // Count the slot now: the writer task only records the request
+            // once it sends it, and the next call in this batch must see it.
+            p.state.lock().await.outstanding.insert((index, begin), (Instant::now(), length));
             let _ = p
                 .tx
                 .send(ToPeer::Request {
@@ -878,9 +882,17 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
         false
     }
 
-    /// How many requests a peer can absorb before we consider it saturated.
-    pub fn pipeline_depth(&self) -> usize {
-        super::connection::PIPELINE_DEPTH
+    /// Free request slots across every peer that will serve us right now,
+    /// which is how many more blocks the engine can usefully put in flight.
+    pub async fn free_slots(&self) -> usize {
+        let mut total = 0;
+        for p in self.peers.values() {
+            let st = p.state.lock().await;
+            if !st.they_choke || !st.allowed_fast.is_empty() {
+                total += st.queue_depth().saturating_sub(st.outstanding.len());
+            }
+        }
+        total
     }
 
     /// Drop peers that have gone quiet, returning how many were removed.
@@ -1229,6 +1241,47 @@ mod tests {
             busy_rx.try_recv().is_err() && idle_rx.try_recv().is_err(),
             "only one request should be issued"
         );
+    }
+
+    #[tokio::test]
+    async fn request_block_respects_depth_and_prefers_free_slots() {
+        let meta = Arc::new(crate::metainfo::Metainfo {
+            infohash: InfoHash([0; 20]),
+            name: "t".into(),
+            piece_length: 16384,
+            pieces: vec![[0; 20]; 16],
+            files: crate::metainfo::Files::Single {
+                name: "t".into(),
+                length: 16 * 16384,
+            },
+            total_length: 16 * 16384,
+            private: false,
+            announce: None,
+            announce_list: vec![],
+            web_seeds: vec![],
+            info_bytes: vec![],
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = PeerPool::new(meta, None, 6881, tx, Limits::default(), MAX_PEERS, true);
+
+        let mut bf = Bitfield::with_pieces(16);
+        bf.set(0);
+        let slow = fake_handle(bf.clone(), false, 3);
+        let fast = fake_handle(bf, false, 0);
+        fast.state.lock().await.rate_down = 100.0 * 1024.0 * 1024.0;
+        fast.state.lock().await.reqq = Some(10);
+        let (slow_st, fast_st) = (slow.state.clone(), fast.state.clone());
+        pool.peers.insert("127.0.0.1:1".parse().unwrap(), slow);
+        pool.peers.insert("127.0.0.1:2".parse().unwrap(), fast);
+        assert_eq!(pool.free_slots().await, 1 + 10);
+
+        for i in 0..11u32 {
+            assert!(pool.request_block(0, i * BLOCK_SIZE, BLOCK_SIZE).await);
+        }
+        assert_eq!(fast_st.lock().await.outstanding.len(), 10);
+        assert_eq!(slow_st.lock().await.outstanding.len(), 4);
+        assert!(!pool.request_block(0, 11 * BLOCK_SIZE, BLOCK_SIZE).await);
+        assert_eq!(pool.free_slots().await, 0);
     }
 
     #[tokio::test]
