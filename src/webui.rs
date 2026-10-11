@@ -21,7 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, Semaphore};
 
 use crate::session::MAX_TORRENT_BYTES;
-use crate::state::{Command, Level, SessionCommand, SessionState, WebUiSettings};
+use crate::state::{Command, DownloadState, Level, SessionCommand, SessionState, WebUiSettings};
 
 const INDEX_HTML: &str = include_str!("webui/index.html");
 const MAX_HEAD: usize = 8 * 1024;
@@ -625,11 +625,18 @@ fn state_json(st: &SessionState) -> String {
             let name = sum.map_or(t.id.as_str(), |s| s.name.as_str());
             let name = if name.is_empty() { t.id.as_str() } else { name };
             let state = sum.map_or("connecting", |s| s.state.label());
+            let size = sum
+                .filter(|s| s.state != DownloadState::FetchingMetadata)
+                .map_or("null".to_string(), |s| s.total_length.to_string());
+            let peers = t.ui.peers.iter().filter(|p| !p.addr.starts_with("web: ")).count();
+            let swarm = sum.filter(|s| s.seeders_known > 0 || s.leecher_known > 0);
+            let seeds = swarm.map_or("null".to_string(), |s| s.seeders_known.to_string());
+            let leechers = swarm.map_or("null".to_string(), |s| s.leecher_known.to_string());
             let queue = t.queue_position.map_or("null".to_string(), |q| q.to_string());
             format!(
                 "{{\"id\":{},\"name\":{},\"state\":{},\"progress\":{},\"download_rate\":{},\
-                 \"upload_rate\":{},\"eta_secs\":{},\"ratio\":{},\"size\":{},\"downloaded\":{},\
-                 \"uploaded\":{},\"label\":{},\"queue_position\":{},\"warning\":{}}}",
+                 \"upload_rate\":{},\"eta_secs\":{},\"ratio\":{},\"size\":{},\"peers\":{},\"seeds\":{},\"leechers\":{},\
+                 \"downloaded\":{},\"uploaded\":{},\"label\":{},\"queue_position\":{},\"warning\":{}}}",
                 json_str(&t.id),
                 json_str(name),
                 json_str(state),
@@ -638,7 +645,10 @@ fn state_json(st: &SessionState) -> String {
                 json_num(sum.map_or(0.0, |s| s.upload_rate)),
                 json_num(sum.and_then(|s| s.eta_secs).unwrap_or(f64::NAN)),
                 json_num(t.ratio),
-                sum.map_or(0, |s| s.total_length),
+                size,
+                peers,
+                seeds,
+                leechers,
                 sum.map_or(0, |s| s.downloaded),
                 t.uploaded,
                 json_opt(t.label.as_deref()),
@@ -908,7 +918,7 @@ async fn route(req: &Request, body: &[u8], state: &RwLock<SessionState>) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{DownloadState, FeedView, TorrentSummary, TorrentView, UiState};
+    use crate::state::{DownloadState, FeedView, PeerSummary, TorrentSummary, TorrentView, UiState};
     use tokio::sync::mpsc;
 
     const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1048,6 +1058,36 @@ mod tests {
         assert!(json.contains("{\"level\":\"error\",\"message\":\"cannot add x.torrent: already in the torrent list\"}"));
         assert!(!json.contains("\"line 5\"") && json.contains("\"line 6\""));
         assert!(json.contains("\"warning\":\"tracker: \\\"down\\\"\""), "{json}");
+    }
+
+    #[test]
+    fn state_carries_unknown_size_and_peer_counts() {
+        let (state, _rx) = fake_state(false);
+        let mut st = state.try_write().unwrap();
+        let peer = |addr: &str| PeerSummary {
+            addr: addr.into(),
+            downloaded: 0,
+            uploaded: 0,
+            progress: 0.0,
+            choked_by_us: false,
+            choking_us: false,
+            outstanding: 0,
+            flags: String::new(),
+        };
+        st.torrents[0].ui.peers = vec![peer("1.2.3.4:5"), peer("6.7.8.9:1"), peer("web: example.com")];
+        {
+            let s = st.torrents[0].ui.torrent.as_mut().unwrap();
+            s.seeders_known = 40;
+            s.leecher_known = 7;
+        }
+        st.torrents[1].ui.torrent.as_mut().unwrap().state = DownloadState::FetchingMetadata;
+        let json = state_json(&st);
+        assert_valid_json(&json);
+        assert!(json.contains("\"size\":1000,\"peers\":2,\"seeds\":40,\"leechers\":7,"), "{json}");
+        assert!(json.contains("\"size\":null,\"peers\":0,\"seeds\":null,\"leechers\":null,"), "{json}");
+        st.torrents[1].ui.torrent = None;
+        let json = state_json(&st);
+        assert!(json.contains("\"size\":null,\"peers\":0,\"seeds\":null,\"leechers\":null,"), "{json}");
     }
 
     #[test]
