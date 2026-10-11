@@ -1,6 +1,6 @@
 [package]
 name = "torrentide"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2021"
 description = "Lightweight BitTorrent client with a terminal UI and web UI: magnet links, DHT, uTP, encryption and RSS"
 license = "MIT"
