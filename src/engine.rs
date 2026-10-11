@@ -51,6 +51,10 @@ const REAP_INTERVAL: Duration = Duration::from_secs(15);
 /// How often to compute the speed/ETA figures for the TUI.
 const STATS_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Span the shown speeds average over. Blocks arrive in bursts, so a single
+/// stats interval often sees none and the speed would flicker to zero.
+const RATE_WINDOW: Duration = Duration::from_secs(5);
+
 /// Minimum gap between DHT peer lookups; each one fans out many UDP queries.
 const DHT_LOOKUP_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -372,10 +376,8 @@ impl Engine {
         let mut refill_now = false;
         let mut fill_stalled = false;
         let mut rarity: HashMap<u32, u32> = HashMap::new();
-        let mut last_down: u64 = 0;
-        let mut last_up: u64 = 0;
+        let mut rate_samples: VecDeque<(Instant, u64, u64)> = VecDeque::new();
         let mut upload_rate = 0.0f64;
-        let mut last_rate_sample = Instant::now();
         let mut current_rate = 0.0f64;
 
         // TUI-controllable state. `wanted[i]` mirrors the file list; every
@@ -907,18 +909,11 @@ impl Engine {
                         last_stats = Instant::now();
                         let downloaded = scheduler.block_map().bytes_downloaded(&self.meta);
 
-                        let dt = last_rate_sample.elapsed().as_secs_f64();
-                        if dt > 0.0 {
-                            let delta = downloaded.saturating_sub(last_down) as f64;
-                            current_rate = delta / dt;
-                        }
-                        last_down = downloaded;
                         let uploaded = pool.total_uploaded().await;
-                        if dt > 0.0 {
-                            upload_rate = uploaded.saturating_sub(last_up) as f64 / dt;
+                        if let Some((down, up)) = windowed_rates(&mut rate_samples, Instant::now(), downloaded, uploaded) {
+                            current_rate = down;
+                            upload_rate = up;
                         }
-                        last_up = uploaded;
-                        last_rate_sample = Instant::now();
 
                         let left = self.meta.total_length.saturating_sub(downloaded);
                         let eta = if current_rate > 1.0 {
@@ -1429,6 +1424,18 @@ pub fn build_seeder(
     })
 }
 
+/// Record a byte-counter sample and return the down/up rates over the last
+/// [`RATE_WINDOW`], or `None` until there are two samples to compare.
+fn windowed_rates(samples: &mut VecDeque<(Instant, u64, u64)>, now: Instant, down: u64, up: u64) -> Option<(f64, f64)> {
+    samples.push_back((now, down, up));
+    while samples.len() > 2 && now.duration_since(samples[1].0) >= RATE_WINDOW {
+        samples.pop_front();
+    }
+    let (since, down_then, up_then) = samples[0];
+    let dt = now.duration_since(since).as_secs_f64();
+    (dt > 0.0).then(|| (down.saturating_sub(down_then) as f64 / dt, up.saturating_sub(up_then) as f64 / dt))
+}
+
 /// Resolve a magnet link's `info` dict with one continuous pipeline that
 /// runs until some peer supplies it (the caller stops it with `Stop`).
 ///
@@ -1769,6 +1776,23 @@ fn bencode_dict_with_info(info: Vec<u8>) -> crate::bencode::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rates_average_over_the_window_instead_of_one_tick() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut samples = VecDeque::new();
+        assert_eq!(windowed_rates(&mut samples, t0, 0, 0), None);
+        assert_eq!(windowed_rates(&mut samples, ms(500), 1000, 0), Some((2000.0, 0.0)));
+        let (down, _) = windowed_rates(&mut samples, ms(1000), 1000, 0).unwrap();
+        assert_eq!(down, 1000.0, "an empty tick does not drop the speed to zero");
+        for n in 3..=20 {
+            windowed_rates(&mut samples, ms(n * 500), 1000 + 500 * (n - 2), 0);
+        }
+        let (down, _) = windowed_rates(&mut samples, ms(10_500), 10_500, 0).unwrap();
+        assert!((down - 1000.0).abs() < 1.0, "{down}");
+        assert!(samples.len() <= 12, "old samples are dropped");
+    }
     use std::fs;
 
     #[test]
