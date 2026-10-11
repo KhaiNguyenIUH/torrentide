@@ -416,7 +416,13 @@ impl Engine {
                     if let FromPeer::Piece { block, .. } = &ev {
                         session_down += block.len() as u64;
                     }
-                    if matches!(ev, FromPeer::Piece { .. } | FromPeer::Rejected { .. }) {
+                    if matches!(
+                        ev,
+                        FromPeer::Piece { .. }
+                            | FromPeer::Rejected { .. }
+                            | FromPeer::Choking(true)
+                            | FromPeer::Disconnected(_)
+                    ) {
                         refill_now = true;
                     }
                     handle_peer_event(&mut scheduler, &storage, &self.meta, &ev);
@@ -709,6 +715,16 @@ impl Engine {
                     // A pause stops new requests. Blocks already on the wire
                     // still land and verify, so resuming never loses data.
                     let timer_fill = last_fill.elapsed() >= PIPELINE_INTERVAL;
+                    if timer_fill || refill_now {
+                        let released = pool.take_released().await;
+                        if !released.is_empty() {
+                            for (piece, begin) in released {
+                                scheduler.on_timeout((piece, (begin / BLOCK_SIZE) as usize));
+                            }
+                            refill_now = true;
+                            fill_stalled = false;
+                        }
+                    }
                     if !paused
                         && !seeding
                         && check_rx.is_none()
@@ -808,6 +824,7 @@ impl Engine {
                     if last_reap.elapsed() >= REAP_INTERVAL {
                         last_reap = Instant::now();
                         let n = pool.reap().await;
+                        refill_now |= n > 0;
                         if n > 0 {
                             self.log(Level::Debug, format!("reaped {n} dead peers")).await;
                         }

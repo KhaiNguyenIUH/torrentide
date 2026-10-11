@@ -167,6 +167,9 @@ pub struct PeerState {
     pub window_up: u64,
     /// Blocks requested but not yet received.
     pub outstanding: HashMap<(u32, u32), (Instant, u32)>,
+    /// Requests this connection dropped itself (choke, not interested) that
+    /// the scheduler has not been told about yet.
+    pub released: Vec<(u32, u32)>,
     pub downloaded: u64,
     pub uploaded: u64,
     /// Smoothed download rate in bytes per second, for sizing the request queue.
@@ -215,6 +218,7 @@ impl PeerState {
             window_down: 0,
             window_up: 0,
             outstanding: HashMap::new(),
+            released: Vec::new(),
             downloaded: 0,
             uploaded: 0,
             rate_down: 0.0,
@@ -247,6 +251,11 @@ impl PeerState {
             self.rate_bytes = 0;
             self.rate_at = Instant::now();
         }
+    }
+
+    fn drop_outstanding(&mut self) {
+        let dropped: Vec<_> = self.outstanding.drain().map(|(k, _)| k).collect();
+        self.released.extend(dropped);
     }
 
     /// How many requests this peer may have outstanding.
@@ -765,7 +774,7 @@ where
                         Message::Choke => {
                             st.they_choke = true;
                             if !st.fast {
-                                st.outstanding.clear();
+                                st.drop_outstanding();
                             }
                             forward = Some(FromPeer::Choking(true));
                         }
@@ -1041,7 +1050,7 @@ where
                         continue;
                     }
                     st.interested = false;
-                    st.outstanding.clear();
+                    st.drop_outstanding();
                     Message::NotInterested
                 }
                 ToPeer::SetChoking(false) => {

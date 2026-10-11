@@ -102,6 +102,8 @@ pub struct PeerPool {
     /// counters die with the peer, so without this the cumulative total we
     /// report to trackers would shrink every time a peer is reaped.
     retired_uploaded: u64,
+    /// Requests of departed peers that the scheduler has not been told about.
+    released: Vec<(u32, u32)>,
     /// Bumped by every `set_seeder`; a dial remembers the value it started at
     /// so a peer that connected across a change gets the Haves its initial
     /// bitfield may have missed.
@@ -163,6 +165,7 @@ impl PeerPool {
             events,
             connecting: 0,
             retired_uploaded: 0,
+            released: Vec::new(),
             seeder_gen: 0,
             dial_gen: HashMap::new(),
             pex_known: HashMap::new(),
@@ -740,11 +743,32 @@ fn dial_via(&mut self, addrs: &[SocketAddr], transport: Transport) {
         }
     }
 
+    async fn retire_state(&mut self, p: &PeerHandle) {
+        let st = p.state.lock().await;
+        self.retired_uploaded += st.uploaded;
+        self.released.extend(st.outstanding.keys().copied());
+    }
+
+    /// Requests dropped since the last call, as `(piece, begin)`, for the
+    /// scheduler to hand out again. A block another live peer still has
+    /// outstanding (endgame duplicate) is left alone.
+    pub async fn take_released(&mut self) -> Vec<(u32, u32)> {
+        let mut keys = std::mem::take(&mut self.released);
+        let mut held = HashSet::new();
+        for p in self.peers.values() {
+            let mut st = p.state.lock().await;
+            keys.append(&mut st.released);
+            held.extend(st.outstanding.keys().copied());
+        }
+        keys.retain(|k| !held.contains(k));
+        keys
+    }
+
     /// Close the connection a duplicate is about to replace, without treating
     /// the peer as gone.
     async fn retire_duplicate(&mut self, addr: SocketAddr) {
         if let Some(old) = self.peers.remove(&addr) {
-            self.retired_uploaded += old.state.lock().await.uploaded;
+            self.retire_state(&old).await;
             let _ = old.tx.send(ToPeer::Close);
             *self.stray.entry(addr).or_default() += 1;
         }
@@ -937,7 +961,7 @@ fn dial_via(&mut self, addrs: &[SocketAddr], transport: Transport) {
                 }
                 self.reveal.remove(&addr);
                 if let Some(p) = self.peers.remove(&addr) {
-                    self.retired_uploaded += p.state.lock().await.uploaded;
+                    self.retire_state(&p).await;
                     self.mark_gone(addr, p.inbound);
                     // Recompute availability from the survivors only.
                     self.availability = Bitfield::with_pieces(self.piece_count);
@@ -1031,7 +1055,7 @@ fn dial_via(&mut self, addrs: &[SocketAddr], transport: Transport) {
         for addr in list_dead(&self.peers).await {
             self.reveal.remove(&addr);
             if let Some(p) = self.peers.remove(&addr) {
-                self.retired_uploaded += p.state.lock().await.uploaded;
+                self.retire_state(&p).await;
                 self.mark_gone(addr, p.inbound);
             }
             removed += 1;
@@ -2106,5 +2130,97 @@ mod tests {
         let hs2 = crate::peer::wire::handshake_incoming(&mut s2).await.unwrap();
         assert!(hs2.supports_extended());
         drop(c2);
+    }
+
+    async fn pool_with_requests(
+        fast_server: bool,
+    ) -> (PeerPool, SocketAddr, tokio::net::TcpStream, mpsc::UnboundedReceiver<FromPeer>) {
+        let meta = small_meta(2);
+        let ih = meta.infohash;
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let mut pool = PeerPool::new(meta, None, 0, ev_tx, Limits::default(), MAX_PEERS, true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (c_tx, c_rx) = mpsc::unbounded_channel();
+        let client = tokio::spawn(connect(
+            listener.local_addr().unwrap(),
+            ih,
+            2,
+            Arc::new(RwLock::new(None)),
+            c_tx,
+            Limits::default(),
+            true,
+            None,
+        ));
+        let (mut stream, _) = listener.accept().await.unwrap();
+        crate::peer::wire::handshake_incoming(&mut stream).await.unwrap();
+        crate::peer::wire::handshake_outgoing(&mut stream, &ih.0, false, fast_server, false).await.unwrap();
+        let handle = client.await.unwrap().unwrap();
+        assert_eq!(handle.state.lock().await.fast, fast_server);
+        {
+            let mut st = handle.state.lock().await;
+            st.outstanding.insert((0, 0), (Instant::now(), BLOCK_SIZE));
+            st.outstanding.insert((1, 0), (Instant::now(), BLOCK_SIZE));
+        }
+        let addr = handle.addr;
+        pool.peers.insert(addr, handle);
+        (pool, addr, stream, c_rx)
+    }
+
+    async fn choked(stream: &mut tokio::net::TcpStream, rx: &mut mpsc::UnboundedReceiver<FromPeer>) {
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(&crate::peer::wire::encode_framed(&crate::peer::wire::Message::Choke)).await.unwrap();
+        while !matches!(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap(),
+            FromPeer::Choking(true)
+        ) {}
+    }
+
+    fn requestable(meta: &Metainfo) -> (crate::scheduler::Scheduler, HashMap<u32, u32>) {
+        let mut s = crate::scheduler::Scheduler::new(meta);
+        let rarity = (0..2).map(|p| (p, 1)).collect();
+        assert_eq!(s.fill_batch(&rarity, 10).len(), 2);
+        assert!(s.fill_batch(&rarity, 10).is_empty());
+        (s, rarity)
+    }
+
+    #[tokio::test]
+    async fn choke_without_fast_releases_its_blocks_at_once() {
+        let (mut pool, _, mut stream, mut rx) = pool_with_requests(false).await;
+        let (mut sched, rarity) = requestable(&small_meta(2));
+        choked(&mut stream, &mut rx).await;
+        let mut released = pool.take_released().await;
+        released.sort();
+        assert_eq!(released, vec![(0, 0), (1, 0)]);
+        for (piece, begin) in released {
+            sched.on_timeout((piece, (begin / BLOCK_SIZE) as usize));
+        }
+        assert_eq!(sched.fill_batch(&rarity, 10).len(), 2);
+        assert!(pool.take_released().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn choke_under_fast_keeps_its_blocks() {
+        let (mut pool, _, mut stream, mut rx) = pool_with_requests(true).await;
+        choked(&mut stream, &mut rx).await;
+        assert!(pool.take_released().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_releases_its_blocks_except_those_another_peer_holds() {
+        let (mut pool, addr, _stream, _rx) = pool_with_requests(false).await;
+        let (mut sched, rarity) = requestable(&small_meta(2));
+        let (other, _orx) = fake_handle_with_rx(Bitfield::all(16), false, 0);
+        other.state.try_lock().unwrap().outstanding.insert((1, 0), (Instant::now(), BLOCK_SIZE));
+        pool.peers.insert("127.0.0.1:2".parse().unwrap(), other);
+
+        pool.on_event(addr, FromPeer::Disconnected("gone".into())).await;
+        let released = pool.take_released().await;
+        assert_eq!(released, vec![(0, 0)]);
+        for (piece, begin) in released {
+            sched.on_timeout((piece, (begin / BLOCK_SIZE) as usize));
+        }
+        let again = sched.fill_batch(&rarity, 10);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].key(), (0, 0));
     }
 }
