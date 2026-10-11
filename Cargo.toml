@@ -2,8 +2,13 @@
 name = "torrust"
 version = "0.1.6"
 edition = "2021"
-description = "A BitTorrent client with a terminal UI"
+description = "Lightweight BitTorrent client with a terminal UI and web UI: magnet links, DHT, uTP, encryption and RSS"
 license = "MIT"
+repository = "https://github.com/KhaiNguyenIUH/torrust"
+homepage = "https://github.com/KhaiNguyenIUH/torrust"
+readme = "README.md"
+keywords = ["bittorrent", "torrent", "magnet", "tui", "p2p"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow = "1.0.104"

@@ -11,6 +11,8 @@
 
 torrust runs as a background session that you drive from a terminal UI or a small web UI. Closing either one leaves your downloads running. It speaks the parts of BitTorrent you would expect from a desktop client (trackers, DHT, peer exchange, uTP, encryption, magnet links, RSS) without depending on libtorrent or any other BitTorrent library. The crate is both a library (`torrust`) and a binary.
 
+If you want a lightweight torrent client you can run in a terminal, over SSH or headless on a server, and still open in a browser, it is a free alternative to qBittorrent, Transmission or uTorrent. It runs on macOS and Windows, and on Linux when built from source.
+
 The project is MIT licensed. Bug reports, ideas and pull requests are welcome; see [Contributing](#contributing).
 
 <p align="center">
