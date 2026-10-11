@@ -1,6 +1,7 @@
 //! Peer wire protocol and peer connection management.
 
 pub mod connection;
+pub mod holepunch;
 pub mod mse;
 pub mod pex;
 pub mod pool;

@@ -401,6 +401,7 @@ impl Engine {
                 Some((addr, ev)) = peer_rx.recv() => {
                     if let FromPeer::PexPeers(addrs) = &ev {
                         tracing::debug!(peer = %addr, count = addrs.len(), "pex peers");
+                        pool.note_pex_source(addr, addrs);
                         dial_addrs(&mut pool, addrs, Source::Pex);
                         continue;
                     }

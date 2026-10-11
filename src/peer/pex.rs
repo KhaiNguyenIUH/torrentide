@@ -47,6 +47,8 @@ pub struct ExtHandshake {
     pub port: Option<u16>,
     /// The id the peer wants `ut_metadata` replies sent under.
     pub metadata_id: Option<u8>,
+    /// The id the peer wants `ut_holepunch` messages sent under (BEP 55).
+    pub holepunch_id: Option<u8>,
 }
 
 /// Our extended handshake. `port` is our listen port; 0 omits it. A
@@ -54,6 +56,7 @@ pub struct ExtHandshake {
 pub fn encode_handshake(port: u16, metadata_size: Option<usize>) -> Vec<u8> {
     let mut m = BTreeMap::new();
     m.insert(b"ut_pex".to_vec(), Value::Int(OUR_PEX_ID as i64));
+    m.insert(b"ut_holepunch".to_vec(), Value::Int(super::holepunch::OUR_HOLEPUNCH_ID as i64));
     let mut d = BTreeMap::new();
     if let Some(size) = metadata_size {
         m.insert(b"ut_metadata".to_vec(), Value::Int(OUR_METADATA_ID as i64));
@@ -84,10 +87,16 @@ pub fn decode_handshake(payload: &[u8]) -> Option<ExtHandshake> {
         .and_then(|m| m.get_int_opt("ut_metadata"))
         .and_then(|i| u8::try_from(i).ok())
         .filter(|&i| i != 0);
+    let holepunch_id = v
+        .get_opt("m")
+        .and_then(|m| m.get_int_opt("ut_holepunch"))
+        .and_then(|i| u8::try_from(i).ok())
+        .filter(|&i| i != 0);
     Some(ExtHandshake {
         pex_id,
         port,
         metadata_id,
+        holepunch_id,
     })
 }
 
@@ -141,7 +150,7 @@ pub fn is_lan(ip: IpAddr) -> bool {
 }
 
 /// Port 0, unspecified, multicast and LAN addresses are never worth dialing.
-fn dialable(a: &SocketAddr) -> bool {
+pub fn dialable(a: &SocketAddr) -> bool {
     a.port() != 0 && !a.ip().is_unspecified() && !a.ip().is_multicast() && !is_lan(a.ip())
 }
 
@@ -307,7 +316,12 @@ mod tests {
         let hs = decode_handshake(&encode_handshake(51413, None)).unwrap();
         assert_eq!(
             hs,
-            ExtHandshake { pex_id: Some(OUR_PEX_ID), port: Some(51413), metadata_id: None }
+            ExtHandshake {
+                pex_id: Some(OUR_PEX_ID),
+                port: Some(51413),
+                metadata_id: None,
+                holepunch_id: Some(crate::peer::holepunch::OUR_HOLEPUNCH_ID)
+            }
         );
         let hs = decode_handshake(&encode_handshake(0, Some(40_000))).unwrap();
         assert_eq!(hs.port, None);

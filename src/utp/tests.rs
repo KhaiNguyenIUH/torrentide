@@ -400,3 +400,25 @@ async fn out_of_order_fin_then_hole_fill_keeps_connection_alive() {
     stream.read_to_end(&mut got).await.unwrap();
     assert_eq!(got, b"a");
 }
+
+#[tokio::test]
+async fn simultaneous_open_yields_working_streams() {
+    let (a, b) = pair().await;
+    let (aa, ba) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+    let (ca, cb) = tokio::join!(a.connect(ba), b.connect(aa));
+    let (mut ca, mut cb) = (ca.unwrap(), cb.unwrap());
+    let ((mut ia, _), (mut ib, _)) = tokio::join!(
+        async { a.accept().await.unwrap() },
+        async { b.accept().await.unwrap() }
+    );
+    for (tx, rx, msg) in [(&mut ca, &mut ib, b"a-out"), (&mut cb, &mut ia, b"b-out")] {
+        tx.write_all(msg).await.unwrap();
+        let mut got = [0u8; 5];
+        rx.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, msg);
+    }
+    ia.write_all(b"in-a").await.unwrap();
+    let mut got = [0u8; 4];
+    cb.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"in-a");
+}

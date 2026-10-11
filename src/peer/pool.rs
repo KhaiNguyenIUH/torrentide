@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use super::connection::{Ext, FromPeer, PeerHandle, PeerState, SharedSeeder, ToPeer, Transport, BLOCK_SIZE};
-use super::{pex, PeerStream};
+use super::{holepunch, pex, PeerStream};
 use super::wire::{Bitfield, Handshake};
 use crate::blocklist::BlockList;
 use crate::metainfo::{InfoHash, Metainfo, SocketAddrLite};
@@ -121,6 +121,11 @@ pub struct PeerPool {
     /// Per address, `Disconnected` events still due from connections that a
     /// duplicate replaced: they must not evict the connection that won.
     stray: HashMap<SocketAddr, u32>,
+    /// The peer that told us about each PEX-learned address, so it can relay
+    /// a hole punch to it. Bounded by [`MAX_KNOWN`].
+    pex_source: HashMap<SocketAddr, SocketAddr>,
+    /// When we last asked a relay to connect us to each address.
+    punch_tried: HashMap<SocketAddr, Instant>,
 }
 
 fn ext_for(meta: &Metainfo, port: u16) -> Ext {
@@ -170,6 +175,8 @@ impl PeerPool {
             reveal: HashMap::new(),
             super_seed_timeout: SUPER_SEED_TIMEOUT,
             stray: HashMap::new(),
+            pex_source: HashMap::new(),
+            punch_tried: HashMap::new(),
         }
     }
 
@@ -545,6 +552,10 @@ impl PeerPool {
 /// minutes, and with it every UI update. Results come back over the event
 /// channel as `FromPeer::Connected` / `FromPeer::ConnectFailed`.
 pub fn dial(&mut self, addrs: &[SocketAddr]) {
+    self.dial_via(addrs, self.transport.clone());
+}
+
+fn dial_via(&mut self, addrs: &[SocketAddr], transport: Transport) {
     let infohash = self.meta.infohash;
     let piece_count = self.piece_count;
     let seeder = Arc::clone(&self.shared);
@@ -564,7 +575,7 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
         let limits = self.limits.clone();
         let auto_unchoke = self.auto_unchoke;
         let ext = self.ext.clone();
-        let transport = self.transport.clone();
+        let transport = transport.clone();
         tokio::spawn(async move {
             let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<FromPeer>();
             let tagged = events.clone();
@@ -599,6 +610,120 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
         });
     }
 }
+
+    /// Remember that `from` told us about `addrs`, for [`PeerPool::request_punch`].
+    pub fn note_pex_source(&mut self, from: SocketAddr, addrs: &[SocketAddr]) {
+        for a in addrs {
+            if self.pex_source.len() >= MAX_KNOWN {
+                self.pex_source.clear();
+            }
+            self.pex_source.insert(*a, from);
+        }
+    }
+
+    /// The key of the live connection that `target` names: the connection
+    /// address itself, or for an inbound peer its advertised listen address.
+    async fn find_peer(&self, target: SocketAddr) -> Option<SocketAddr> {
+        if self.peers.contains_key(&target) {
+            return Some(target);
+        }
+        for (addr, p) in &self.peers {
+            if p.inbound && addr.ip() == target.ip() && p.state.lock().await.listen_port == Some(target.port()) {
+                return Some(*addr);
+            }
+        }
+        None
+    }
+
+    /// The UDP address to hand out for a connection: its own address when it
+    /// is uTP, else its listen port, which is the same port our uTP socket
+    /// shares with TCP on a typical peer.
+    async fn punch_addr(&self, key: SocketAddr) -> SocketAddr {
+        let Some(p) = self.peers.get(&key) else { return key };
+        if p.utp {
+            return key;
+        }
+        match p.state.lock().await.listen_port {
+            Some(port) => SocketAddr::new(key.ip(), port),
+            None => key,
+        }
+    }
+
+    async fn holepunch_id(&self, key: SocketAddr) -> Option<u8> {
+        self.peers.get(&key)?.state.lock().await.holepunch_id
+    }
+
+    fn send_holepunch(&self, to: SocketAddr, id: u8, msg: holepunch::Msg) {
+        if let Some(p) = self.peers.get(&to) {
+            let _ = p.tx.send(ToPeer::Extended { ext_id: id, payload: msg.encode() });
+        }
+    }
+
+    /// A dial to `target` failed: if the peer that told us about it is still
+    /// connected and supports `ut_holepunch`, ask it to arrange a connection.
+    async fn request_punch(&mut self, target: SocketAddr) {
+        if self.transport.utp.is_none() || self.ext.port.is_none() {
+            return;
+        }
+        let Some(&relay) = self.pex_source.get(&target) else { return };
+        let Some(id) = self.holepunch_id(relay).await else { return };
+        let now = Instant::now();
+        if self.punch_tried.get(&target).is_some_and(|t| now.duration_since(*t) < holepunch::RENDEZVOUS_COOLDOWN) {
+            return;
+        }
+        if self.punch_tried.len() >= MAX_KNOWN {
+            self.punch_tried.clear();
+        }
+        self.punch_tried.insert(target, now);
+        tracing::debug!(peer = %target, relay = %relay, "asking relay for a hole punch");
+        self.send_holepunch(relay, id, holepunch::Msg::new(holepunch::Kind::Rendezvous, target));
+    }
+
+    async fn on_holepunch(&mut self, from: SocketAddr, msg: holepunch::Msg) {
+        match msg.kind {
+            holepunch::Kind::Rendezvous => self.relay_rendezvous(from, msg.addr).await,
+            holepunch::Kind::Connect => self.punch_connect(from, msg.addr),
+            holepunch::Kind::Error => {
+                tracing::debug!(peer = %from, target = %msg.addr, code = msg.err, "relay refused hole punch");
+            }
+        }
+    }
+
+    async fn relay_rendezvous(&mut self, from: SocketAddr, target: SocketAddr) {
+        let Some(from_id) = self.holepunch_id(from).await else { return };
+        let key = self.find_peer(target).await;
+        let supports = match key {
+            Some(k) => Some(self.holepunch_id(k).await.is_some()),
+            None => None,
+        };
+        let target_key = key.unwrap_or(target);
+        if let Err(code) = holepunch::relay_check(from, target_key, supports) {
+            tracing::debug!(peer = %from, target = %target, code, "hole punch rendezvous refused");
+            self.send_holepunch(from, from_id, holepunch::Msg::error(target, code));
+            return;
+        }
+        let Some(target_id) = self.holepunch_id(target_key).await else { return };
+        let (to_from, to_target) = (self.punch_addr(target_key).await, self.punch_addr(from).await);
+        tracing::debug!(peer = %from, target = %target, "relaying hole punch");
+        self.send_holepunch(from, from_id, holepunch::Msg::new(holepunch::Kind::Connect, to_from));
+        self.send_holepunch(target_key, target_id, holepunch::Msg::new(holepunch::Kind::Connect, to_target));
+    }
+
+    /// A relay told us to connect to `addr` now: open a uTP connection to it,
+    /// which is what makes both NATs expect the other's packets.
+    fn punch_connect(&mut self, relay: SocketAddr, addr: SocketAddr) {
+        if self.transport.utp.is_none()
+            || !pex::dialable(&addr)
+            || self.peers.contains_key(&addr)
+            || self.dial_gen.contains_key(&addr)
+        {
+            tracing::debug!(peer = %relay, target = %addr, "ignoring hole punch connect");
+            return;
+        }
+        tracing::debug!(peer = %relay, target = %addr, "hole punching");
+        let transport = Transport { utp_only: true, ..self.transport.clone() };
+        self.dial_via(&[addr], transport);
+    }
 
     /// Whether a new connection to `addr` should replace one we already have.
     /// When both sides dial each other at once (LSD announces are symmetric,
@@ -785,7 +910,9 @@ pub fn dial(&mut self, addrs: &[SocketAddr]) {
                 let source = self.known.get(&addr).map_or(Source::Tracker, |k| k.source);
                 self.remember(addr, source, Instant::now(), wait, Some(failures));
                 tracing::debug!(peer = %addr, error = %why, "connect failed");
+                self.request_punch(addr).await;
             }
+            FromPeer::Holepunch(msg) => self.on_holepunch(addr, msg).await,
             FromPeer::Bitfield(bf) => {
                 tracing::debug!(peer = %addr, pieces = bf.count(), "peer sent bitfield");
                 self.availability.union(&bf);
@@ -1678,6 +1805,73 @@ mod tests {
             Ok(ToPeer::Extended { ext_id, payload }) => Some((ext_id, pex::decode(&payload))),
             _ => None,
         }
+    }
+
+    fn punch_peer(pool: &mut PeerPool, addr: &str, id: Option<u8>) -> mpsc::UnboundedReceiver<ToPeer> {
+        let (h, rx) = fake_handle_with_rx(Bitfield::with_pieces(16), true, 0);
+        h.state.try_lock().unwrap().holepunch_id = id;
+        pool.peers.insert(addr.parse().unwrap(), h);
+        rx
+    }
+
+    fn sent_punch(rx: &mut mpsc::UnboundedReceiver<ToPeer>) -> Option<(u8, holepunch::Msg)> {
+        match rx.try_recv() {
+            Ok(ToPeer::Extended { ext_id, payload }) => Some((ext_id, holepunch::Msg::decode(&payload)?)),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_connects_both_sides_or_reports_why_not() {
+        use holepunch::{Kind, Msg};
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = PeerPool::new(small_meta(16), None, 6881, tx, Limits::default(), MAX_PEERS, true);
+        let (a_addr, b_addr, c_addr): (SocketAddr, SocketAddr, SocketAddr) =
+            ("11.0.0.1:1000".parse().unwrap(), "11.0.0.2:2000".parse().unwrap(), "11.0.0.3:3000".parse().unwrap());
+        let mut a = punch_peer(&mut pool, "11.0.0.1:1000", Some(7));
+        let mut b = punch_peer(&mut pool, "11.0.0.2:2000", Some(8));
+        let mut c = punch_peer(&mut pool, "11.0.0.3:3000", None);
+        for p in pool.peers.values_mut() {
+            p.utp = true;
+        }
+
+        pool.on_holepunch(a_addr, Msg::new(Kind::Rendezvous, b_addr)).await;
+        assert_eq!(sent_punch(&mut a), Some((7, Msg::new(Kind::Connect, b_addr))));
+        assert_eq!(sent_punch(&mut b), Some((8, Msg::new(Kind::Connect, a_addr))));
+
+        let err = |addr, code| Some((7, Msg::error(addr, code)));
+        pool.on_holepunch(a_addr, Msg::new(Kind::Rendezvous, a_addr)).await;
+        assert_eq!(sent_punch(&mut a), err(a_addr, holepunch::ERR_NO_SELF));
+        let gone: SocketAddr = "11.0.0.9:9".parse().unwrap();
+        pool.on_holepunch(a_addr, Msg::new(Kind::Rendezvous, gone)).await;
+        assert_eq!(sent_punch(&mut a), err(gone, holepunch::ERR_NOT_CONNECTED));
+        pool.on_holepunch(a_addr, Msg::new(Kind::Rendezvous, c_addr)).await;
+        assert_eq!(sent_punch(&mut a), err(c_addr, holepunch::ERR_NO_SUPPORT));
+        assert!(sent_punch(&mut b).is_none() && sent_punch(&mut c).is_none());
+
+        pool.on_holepunch(c_addr, Msg::new(Kind::Rendezvous, b_addr)).await;
+        assert!(sent_punch(&mut c).is_none() && sent_punch(&mut b).is_none(), "requester without ut_holepunch is ignored");
+    }
+
+    #[tokio::test]
+    async fn failed_pex_dial_asks_the_source_once_per_cooldown() {
+        use holepunch::{Kind, Msg};
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = PeerPool::new(small_meta(16), None, 6881, tx, Limits::default(), MAX_PEERS, true);
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        pool.set_transport(EncryptionMode::Disabled, Some(Arc::new(UtpSocket::bind(udp))));
+        let mut relay = punch_peer(&mut pool, "11.0.0.1:1000", Some(7));
+        let mut other = punch_peer(&mut pool, "11.0.0.2:2000", Some(8));
+        let target: SocketAddr = "12.0.0.1:5000".parse().unwrap();
+        pool.note_pex_source("11.0.0.1:1000".parse().unwrap(), &[target]);
+
+        pool.on_event(target, FromPeer::ConnectFailed(target, "timeout".into())).await;
+        assert_eq!(sent_punch(&mut relay), Some((7, Msg::new(Kind::Rendezvous, target))));
+        pool.on_event(target, FromPeer::ConnectFailed(target, "timeout".into())).await;
+        assert!(sent_punch(&mut relay).is_none(), "cooldown");
+        let unknown: SocketAddr = "12.0.0.2:5000".parse().unwrap();
+        pool.on_event(unknown, FromPeer::ConnectFailed(unknown, "timeout".into())).await;
+        assert!(sent_punch(&mut relay).is_none() && sent_punch(&mut other).is_none(), "no recorded source");
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use tokio::io::{split, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex, Notify};
 
-use super::{mse, pex, PeerStream};
+use super::{holepunch, mse, pex, PeerStream};
 use super::wire::{self, Bitfield, Message};
 use crate::metainfo::InfoHash;
 use crate::ratelimit::Limits;
@@ -119,6 +119,9 @@ pub enum FromPeer {
     Disconnected(String),
     /// Addresses a peer told us about through peer exchange (BEP 11).
     PexPeers(Vec<SocketAddr>),
+    /// A hole punching message (BEP 55) that passed validation and the
+    /// per-peer rate limit.
+    Holepunch(holepunch::Msg),
 }
 
 /// Mutable state shared between the engine and the connection's reader task.
@@ -158,6 +161,10 @@ pub struct PeerState {
     pub super_seeded: bool,
     /// The id this peer wants `ut_metadata` replies under.
     pub metadata_id: Option<u8>,
+    /// The id this peer wants `ut_holepunch` messages under (BEP 55).
+    pub holepunch_id: Option<u8>,
+    /// Start of the current minute and the holepunch messages seen in it.
+    pub holepunch_window: (Instant, u32),
     /// Start of the current minute and the metadata requests seen in it.
     pub metadata_window: (Instant, u32),
     /// Blocks the peer asked for that are waiting to be read and written.
@@ -188,6 +195,8 @@ impl PeerState {
             allowed_fast: HashSet::new(),
             super_seeded: false,
             metadata_id: None,
+            holepunch_id: None,
+            holepunch_window: (Instant::now(), 0),
             metadata_window: (Instant::now(), 0),
             serve_queue: VecDeque::new(),
         }
@@ -341,6 +350,8 @@ pub struct Transport {
     pub utp: Option<Arc<UtpSocket>>,
     /// Peers whose uTP connect failed, so later dials go straight to TCP.
     pub utp_failed: Arc<StdMutex<HashSet<SocketAddr>>>,
+    /// Never fall back to TCP: a hole punch only works over uTP.
+    pub utp_only: bool,
 }
 
 impl Default for Transport {
@@ -349,6 +360,7 @@ impl Default for Transport {
             encryption: EncryptionMode::Disabled,
             utp: None,
             utp_failed: Arc::default(),
+            utp_only: false,
         }
     }
 }
@@ -482,7 +494,7 @@ pub async fn connect_with(
     let mut dialled = None;
 
     if let Some(utp) = &transport.utp {
-        let skip = transport.utp_failed.lock().unwrap().contains(&addr);
+        let skip = !transport.utp_only && transport.utp_failed.lock().unwrap().contains(&addr);
         if !skip {
             let reached = std::sync::atomic::AtomicBool::new(false);
             let r = dial_crypto(
@@ -516,6 +528,9 @@ pub async fn connect_with(
         }
     }
 
+    if dialled.is_none() && transport.utp_only {
+        return Err(anyhow!("uTP connect to {addr} failed"));
+    }
     let (stream, hs, encrypted) = match dialled {
         Some(d) => d,
         None => dial_crypto(|| open_tcp(addr), addr, infohash, mode, pex).await?,
@@ -822,6 +837,7 @@ where
                                         st.pex_id = h.pex_id;
                                         st.listen_port = h.port;
                                         st.metadata_id = h.metadata_id;
+                                        st.holepunch_id = h.holepunch_id;
                                     }
                                 } else if ext_id == pex::OUR_METADATA_ID {
                                     if let (Some(info), Some(reply_id), Some(piece)) =
@@ -837,6 +853,14 @@ where
                                             ext_id: reply_id,
                                             payload: pex::metadata_reply(served, piece),
                                         });
+                                    }
+                                } else if ext_id == holepunch::OUR_HOLEPUNCH_ID {
+                                    if st.holepunch_window.0.elapsed() >= Duration::from_secs(60) {
+                                        st.holepunch_window = (Instant::now(), 0);
+                                    }
+                                    st.holepunch_window.1 += 1;
+                                    if st.holepunch_window.1 <= holepunch::MAX_PER_MINUTE {
+                                        forward = holepunch::Msg::decode(&payload).map(FromPeer::Holepunch);
                                     }
                                 } else if ext_id == pex::OUR_PEX_ID
                                     && st
