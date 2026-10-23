@@ -634,7 +634,7 @@ fn state_json(st: &SessionState) -> String {
             let leechers = swarm.map_or("null".to_string(), |s| s.leecher_known.to_string());
             let queue = t.queue_position.map_or("null".to_string(), |q| q.to_string());
             format!(
-                "{{\"id\":{},\"name\":{},\"state\":{},\"progress\":{},\"download_rate\":{},\
+                "{{\"id\":{},\"name\":{},\"state\":{},\"dasdsadsad\":{},\"download_rate\":{},\
                  \"upload_rate\":{},\"eta_secs\":{},\"ratio\":{},\"size\":{},\"peers\":{},\"seeds\":{},\"leechers\":{},\
                  \"downloaded\":{},\"uploaded\":{},\"label\":{},\"queue_position\":{},\"warning\":{}}}",
                 json_str(&t.id),

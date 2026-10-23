@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>torrentide</title>
 <style>
-:root { color-scheme: light dark; --bg:#fafafa; --fg:#1d1d1f; --mut:#6e6e73; --line:#d2d2d7; --acc:#0a64d8; --bar:#e5e5ea; --err:#c62828; }
-@media (prefers-color-scheme: dark) { :root { --bg:#161618; --fg:#f2f2f5; --mut:#9a9aa2; --line:#3a3a40; --acc:#4c9aff; --bar:#2c2c30; --err:#ff6b6b; } }
+:root { color-scheme: light dark; --bg:#fafafa; --fg:#1d1d1f; --mut:#6e6e73; --line:#d2d2d7; --acc:#0a64d8; --bar:#e5e5ea; --err:#c62828; --warn:#a15c00; }
+@media (prefers-color-scheme: dark) { :root { --bg:#161618; --fg:#f2f2f5; --mut:#9a9aa2; --line:#3a3a40; --acc:#4c9aff; --bar:#2c2c30; --err:#ff6b6b; --warn:#ffb74d; } }
 * { box-sizing: border-box; }
 body { margin:0; padding:12px; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, sans-serif; }
 h1 { font-size:18px; margin:0 0 4px; }
@@ -35,7 +35,9 @@ td.num, th.num { text-align:right; }
 .empty { color:var(--mut); padding:12px 8px; }
 .feed { padding:6px 0; border-bottom:1px solid var(--line); word-break:break-word; }
 .feed small { color:var(--mut); display:block; }
-td small.err { display:block; margin:2px 0 0; min-height:0; white-space:normal; }
+td small.err, td small.warn { display:block; margin:2px 0 0; min-height:0; white-space:normal; }
+.warn { color:var(--warn); }
+td.failed { color:var(--err); }
 #log { list-style:none; margin:0; padding:0; font-size:13px; }
 #log li { padding:3px 0; border-bottom:1px solid var(--line); word-break:break-word; color:var(--mut); }
 #log li.error, #log li.warn { color:var(--err); }
@@ -142,8 +144,8 @@ function row(t) {
   var tdb = el("td");
   tdb.appendChild(bar);
   tr.appendChild(tdb);
-  var st = el("td", null, t.state);
-  if (t.warning) st.appendChild(el("small", "err", t.warning));
+  var st = el("td", t.state === "error" ? "failed" : null, t.state);
+  if (t.warning) st.appendChild(el("small", "warn", t.warning));
   tr.appendChild(st);
   tr.appendChild(el("td", "num", rate(t.download_rate)));
   tr.appendChild(el("td", "num", rate(t.upload_rate)));
